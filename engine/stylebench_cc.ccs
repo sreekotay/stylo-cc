@@ -366,8 +366,8 @@ static CCSlice CssNode_span(CssNode* nd) {
 }
 
 static int slice_has_gt(CCSlice s) {
-    for (size_t i = 0; i < s.len; i++)
-        if (s.ptr[i] == '>') return 1;
+    for (ch in s)
+        if (ch == '>') return 1;
     return 0;
 }
 
@@ -378,7 +378,7 @@ static int split_commas(CCSlice cell, CCSlice* out, int cap) {
         size_t j = i;
         while (j < cell.len && cell.ptr[j] != ',') j++;
         if (j > i) {
-            out[n] = cc_slice_from_buffer(cell.ptr + i, j - i);
+            out[n] = cell.sub(i, j);
             n++;
         }
         i = j < cell.len ? j + 1 : j;
@@ -551,23 +551,16 @@ static int take_color(CssNode* rgb, Rule* r) {
 }
 
 static CCSlice trim_slice(CCSlice s) {
-    while (s.len && (s.ptr[0] == ' ' || s.ptr[0] == '\t' || s.ptr[0] == '\n' || s.ptr[0] == '\r')) {
-        s.ptr++;
-        s.len--;
-    }
-    while (s.len && (s.ptr[s.len - 1] == ' ' || s.ptr[s.len - 1] == '\t' ||
-                     s.ptr[s.len - 1] == '\n' || s.ptr[s.len - 1] == '\r'))
-        s.len--;
-    return s;
+    return s.trim();
 }
 
 static int parse_px_or_kw(CCSlice s, int* out) {
     s = trim_slice(s);
-    if (s.len == 4 && s.ptr && memcmp(s.ptr, "auto", 4) == 0) {
+    if (s.eq_cstr("auto")) {
         *out = PX_AUTO;
         return 1;
     }
-    if (s.len == 6 && s.ptr && memcmp(s.ptr, "normal", 6) == 0) {
+    if (s.eq_cstr("normal")) {
         *out = PX_NORMAL;
         return 1;
     }
@@ -657,11 +650,11 @@ static int parse_hex_rgb(CCSlice s, int* r, int* g, int* b) {
 
 static int parse_fw(CCSlice s, int* out) {
     s = trim_slice(s);
-    if (s.len == 6 && s.ptr && memcmp(s.ptr, "normal", 6) == 0) {
+    if (s.eq_cstr("normal")) {
         *out = 400;
         return 1;
     }
-    if (s.len == 4 && s.ptr && memcmp(s.ptr, "bold", 4) == 0) {
+    if (s.eq_cstr("bold")) {
         *out = 700;
         return 1;
     }
@@ -794,8 +787,8 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
 
 static int count_char(char[:] s, char c) {
     int n = 0;
-    for (size_t i = 0; i < s.len; i++)
-        if (s.ptr[i] == c) n++;
+    for (ch in s)
+        if (ch == c) n++;
     return n;
 }
 
@@ -831,7 +824,7 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
     memset(nd, 0, sizeof(*nd));
     nd->parent = parent;
     nd->tag = e->intern(tag);
-    if (!(dom_id.len == 1 && dom_id.ptr && dom_id.ptr[0] == '-'))
+    if (!(dom_id.len == 1 && dom_id.eq_cstr("-")))
         nd->dom_id = e->intern(dom_id);
     CCSlice class_buf[MAX_CLASS];
     int nc = split_commas(classes, class_buf, MAX_CLASS);
@@ -851,9 +844,9 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
             CCSlice a = attr_buf[i];
             size_t eq = 0;
             while (eq < a.len && a.ptr[eq] != '=') eq++;
-            nd->attrs[i].name = e->intern(cc_slice_from_buffer(a.ptr, eq));
+            nd->attrs[i].name = e->intern(a.sub(0, eq));
             if (eq < a.len)
-                nd->attrs[i].value = e->intern(cc_slice_from_buffer(a.ptr + eq + 1, a.len - eq - 1));
+                nd->attrs[i].value = e->intern(a.sub(eq + 1, a.len));
             else
                 nd->attrs[i].value = cc_slice_empty();
             nd->nattr++;
@@ -1044,8 +1037,8 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     if (mut) mut->slice(&mut_s);
 
     size_t nlines = 1;
-    for (size_t i = 0; i < tree_s.len; i++)
-        if (tree_s.ptr[i] == '\n') nlines++;
+    for (ch in tree_s)
+        if (ch == '\n') nlines++;
     int extra = 0;
     for (size_t i = 0; i + 5 < mut_s.len; i++)
         if ((i == 0 || mut_s.ptr[i - 1] == '\n') && mut_s.ptr[i] == '+' &&
@@ -1066,8 +1059,8 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->desc_pairs = map_new::[AtomPair, Vec::[int]](e->store);
     e->universal = vec_new::[int](e->store);
     size_t mut_lines = 1;
-    for (size_t i = 0; i < mut_s.len; i++)
-        if (mut_s.ptr[i] == '\n') mut_lines++;
+    for (ch in mut_s)
+        if (ch == '\n') mut_lines++;
     e->cap_muts = (int)mut_lines + 8;
     e->muts = e->store.allocT::[MutOp](e->cap_muts);
     e->level_ids = e->store.allocT::[int](e->cap_nodes);
@@ -1298,8 +1291,9 @@ static void Engine_apply_bucket(Engine* e, int i, Node* n, Map::[CCSlice, Vec::[
     if (!m || !key.len) return;
     Vec::[int]* b = m->get_ptr(key);
     if (!b || !b->data) return;
-    for (size_t j = 0; j < b->len; j++)
-        e->apply_rule(i, n, b->data[j]);
+    Vec::[int] rules = *b;
+    for (rule_idx in rules)
+        e->apply_rule(i, n, rule_idx);
 }
 
 static void Engine_apply_pair(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[int]] m, CCSlice subj, CCSlice left) {
@@ -1309,8 +1303,9 @@ static void Engine_apply_pair(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[i
     key.left = left.ptr;
     Vec::[int]* b = m->get_ptr(key);
     if (!b || !b->data) return;
-    for (size_t j = 0; j < b->len; j++)
-        e->apply_rule(i, n, b->data[j]);
+    Vec::[int] rules = *b;
+    for (rule_idx in rules)
+        e->apply_rule(i, n, rule_idx);
 }
 
 static void Engine_apply_pairs_other(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[int]] m, CCSlice subj, Node* other) {
@@ -1355,8 +1350,9 @@ static void Engine_style_one(Engine* e, int i) {
     }
     Vec::[int]* u = &e->universal;
     if (u->data) {
-        for (size_t j = 0; j < u->len; j++)
-            e->apply_rule(i, n, u->data[j]);
+        Vec::[int] rules = *u;
+        for (rule_idx in rules)
+            e->apply_rule(i, n, rule_idx);
     }
     e->seal_box(n, i);
 }
@@ -1590,7 +1586,7 @@ static int split_tabs(CCSlice line, CCSlice* out, int cap) {
     while (n < cap) {
         size_t j = i;
         while (j < line.len && line.ptr[j] != '\t') j++;
-        out[n] = cc_slice_from_buffer(line.ptr + i, j - i);
+        out[n] = line.sub(i, j);
         n++;
         if (j >= line.len) break;
         i = j + 1;
@@ -1599,8 +1595,7 @@ static int split_tabs(CCSlice line, CCSlice* out, int cap) {
 }
 
 static int slice_eq_lit(CCSlice s, const char* lit) {
-    size_t n = strlen(lit);
-    return s.len == n && s.ptr && memcmp(s.ptr, lit, n) == 0;
+    return s.eq_cstr(lit);
 }
 
 static int parse_int_slice(CCSlice s) {
@@ -1620,7 +1615,7 @@ static void !>(CCError) Engine_ingest_muts(Engine* e, char[:] text) {
         if (pos >= text.len) break;
         size_t start = pos;
         while (pos < text.len && text.ptr[pos] != '\n') pos++;
-        CCSlice line = cc_slice_from_buffer(text.ptr + start, pos - start);
+        CCSlice line = text.sub(start, pos);
         if (!line.len) continue;
         if (e->nmuts >= e->cap_muts)
             return cc_err(CC_ERR_INVALID_ARG, "too many muts");
@@ -1645,9 +1640,9 @@ static void !>(CCError) Engine_ingest_muts(Engine* e, char[:] text) {
             m->id = parse_int_slice(cols[1]);
             size_t eq = 0;
             while (eq < cols[2].len && cols[2].ptr[eq] != '=') eq++;
-            m->a = cc_slice_from_buffer(cols[2].ptr, eq);
+            m->a = cols[2].sub(0, eq);
             m->b = eq < cols[2].len
-                ? cc_slice_from_buffer(cols[2].ptr + eq + 1, cols[2].len - eq - 1)
+                ? cols[2].sub(eq + 1, cols[2].len)
                 : cc_slice_empty();
         } else if (slice_eq_lit(cols[0], "-attr") && nc >= 3) {
             m->kind = MUT_REMOVE_ATTR;
@@ -1753,7 +1748,7 @@ static size_t unique_node_shards(CCShardMask mask, const int* ids, int nids,
                                 uint64_t* names, size_t cap) {
     size_t n = 0;
     for (int i = 0; i < nids; i++) {
-        uint64_t si = (uint64_t)cc_shard_mask_index(&mask, (uint64_t)(uint32_t)ids[i]);
+        uint64_t si = (uint64_t)mask.index((uint64_t)(uint32_t)ids[i]);
         int seen = 0;
         for (size_t j = 0; j < n; j++)
             if (names[j] == si) { seen = 1; break; }

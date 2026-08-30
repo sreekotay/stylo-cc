@@ -30,6 +30,7 @@
 #define INIT_FW    400
 #define UNIT_PX    0
 #define UNIT_EM    1
+#define UNIT_PCT   2
 
 /* Specified values live on the rule. Used on the node is proto pointers
  * (initial / parent / this node's slot). Miss: inherit → parent struct,
@@ -223,6 +224,7 @@ typedef struct {
     int win_rank[NPROP];
     int fs_spec;
     int fs_unit;
+    int bg_current;
     Used used;
     CCSlice tag;
     CCSlice dom_id;
@@ -279,6 +281,7 @@ typedef struct {
     unsigned props;
     unsigned imp;
     int fs_unit;
+    int bg_current;
     Specified spec;
     Compound* c;
     Comb* comb;
@@ -596,7 +599,17 @@ static int parse_fs(CCSlice s, int* out, int* unit) {
         *unit = UNIT_EM;
         return 1;
     }
+    if (i < (int)s.len && s.ptr[i] == 37) {
+        *out = v * sign;
+        *unit = UNIT_PCT;
+        return 1;
+    }
     return 0;
+}
+
+static int is_current_color(CCSlice s) {
+    s = trim_slice(s);
+    return s.eq_cstr("currentColor") || s.eq_cstr("currentcolor");
 }
 
 static int hex_digit(char c) {
@@ -686,23 +699,29 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
                     unsigned bit = 0;
                     if (name.eq_cstr("background-color")) {
                         int hr = 0, hg = 0, hb = 0;
+                        CCSlice raw = trim_slice(val->span());
                         if (val->is_list() && val->id() == Css_KEEP_rgb) {
                             take_rgb(val, r);
                             bit = 1u << P_bg;
-                        } else if (parse_hex_rgb(trim_slice(val->span()), &hr, &hg, &hb)) {
+                        } else if (parse_hex_rgb(raw, &hr, &hg, &hb)) {
                             r->spec.bg.bg.r = hr;
                             r->spec.bg.bg.g = hg;
                             r->spec.bg.bg.b = hb;
                             r->spec.bg.bg.a = 255;
                             bit = 1u << P_bg;
                             r->props |= bit;
+                        } else if (is_current_color(raw)) {
+                            r->bg_current = 1;
+                            bit = 1u << P_bg;
+                            r->props |= bit;
                         }
                     } else if (name.eq_cstr("color")) {
                         int hr = 0, hg = 0, hb = 0;
+                        CCSlice raw = trim_slice(val->span());
                         if (val->is_list() && val->id() == Css_KEEP_rgb) {
                             take_color(val, r);
                             bit = 1u << P_color;
-                        } else if (parse_hex_rgb(trim_slice(val->span()), &hr, &hg, &hb)) {
+                        } else if (parse_hex_rgb(raw, &hr, &hg, &hb)) {
                             r->spec.font.color.r = hr;
                             r->spec.font.color.g = hg;
                             r->spec.font.color.b = hb;
@@ -1157,6 +1176,8 @@ static void Node_win_prop(Node* n, const Rule* r, int p) {
         n->fs_spec = r->spec.font.fs_px;
         n->fs_unit = r->fs_unit;
     }
+    if (p == P_bg)
+        n->bg_current = r->bg_current;
 }
 
 /* Smallest fact: this node owns a unique slot. Do not copy the proto —
@@ -1340,6 +1361,8 @@ static void Engine_inherit_one(Engine* e, int i) {
             n->used.font->fs_px = src->fs_px;
         else if (n->fs_unit == UNIT_EM)
             n->used.font->fs_px = src->fs_px * n->fs_spec;
+        else if (n->fs_unit == UNIT_PCT)
+            n->used.font->fs_px = src->fs_px * n->fs_spec / 100;
         if (!(n->specified & (1u << P_lh_px)))
             n->used.font->lh_px = src->lh_px;
         if (!(n->specified & (1u << P_fw)))
@@ -1348,6 +1371,12 @@ static void Engine_inherit_one(Engine* e, int i) {
             n->used.font->visibility = src->visibility;
         if (!(n->specified & (1u << P_color)))
             n->used.font->color = src->color;
+    }
+    if ((n->specified & (1u << P_bg)) && n->bg_current) {
+        n->used.bg->bg.r = n->used.font->color.r;
+        n->used.bg->bg.g = n->used.font->color.g;
+        n->used.bg->bg.b = n->used.font->color.b;
+        n->used.bg->bg.a = 255;
     }
 }
 
@@ -1435,6 +1464,7 @@ static void Engine_copy_specified(Engine* e, int dst, int src) {
     e->nodes[dst].specified = e->nodes[src].specified;
     e->nodes[dst].fs_spec = e->nodes[src].fs_spec;
     e->nodes[dst].fs_unit = e->nodes[src].fs_unit;
+    e->nodes[dst].bg_current = e->nodes[src].bg_current;
 }
 
 static double now_ms(void) {
@@ -1663,6 +1693,7 @@ static void Engine_reset_styles(Engine* e) {
         n->specified = 0;
         n->fs_spec = 0;
         n->fs_unit = 0;
+        n->bg_current = 0;
         n->used.bg = &e->bg_init;
         n->used.box = &e->box_init;
         n->used.font = &e->font_init;

@@ -109,12 +109,8 @@ fn parse_sheet(css: &str, lock: style::shared_lock::SharedRwLock) -> Stylesheet 
 }
 
 fn bg_rgba(style: &ComputedValues) -> (u8, u8, u8, u8) {
-    use style::color::{AbsoluteColor, ColorSpace};
-    let color = &style.get_background().background_color;
-    let abs: AbsoluteColor = color
-        .as_absolute()
-        .cloned()
-        .unwrap_or(AbsoluteColor::TRANSPARENT_BLACK);
+    use style::color::ColorSpace;
+    let abs = style.resolve_color(&style.get_background().background_color);
     let srgb = abs.to_color_space(ColorSpace::Srgb);
     let r = (srgb.components.0 * 255.0).round().clamp(0.0, 255.0) as u8;
     let g = (srgb.components.1 * 255.0).round().clamp(0.0, 255.0) as u8;

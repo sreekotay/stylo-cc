@@ -77,7 +77,7 @@ Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, chil
 
 - **Selectors:** sibling (`+` / `~`), `:nth-*`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
-- **Values:** `%`, `rem`, `calc()`, `var()`, `currentColor`, hsl. Integer `em` on `font-size` and `#rgb` / `#rrggbb` are in; see `fixtures/local/` (`make compare-local`).
+- **Values:** `rem`, `calc()`, `var()`, hsl, `%` on box lengths. Integer `em` / `%` on `font-size`, `#rgb` / `#rrggbb`, and `currentColor` on `background-color` are in; see `fixtures/local/` (`make compare-local`).
 
 Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We use the same cut: `StyBg*` / `StyBox*` / `StyFont*` — initial or parent proto, unique slot on first specified write (no memcpy of the proto). The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid we skipped.
 
@@ -131,4 +131,4 @@ make bench-style      # default 20k/5k + mutations, release Stylo + CC -O, cmp t
 
 `make test` is **upstream Stylo crate tests** (`cargo test --workspace` in `stylo/`). We did not write those. The race fixtures are a frozen [WebKit StyleBench](https://perftest.netlify.app/stylebench/) port (`harness/` = `stylebench-gen`, same LCG / seeds). Stylo is the other runner, not the source of tiny/default.
 
-Add more CSS locally by dropping a `.stylebench` file under `fixtures/local/` (same `---base---` / `---css---` / `---tree---` / `---mut---` text; both runners already eat it). Do not change tiny/default seeds — that is the race. `fixtures/*.stylebench` is gitignored so generated races stay out of git; `fixtures/local/` is not. Wire a new file into `compare-local` in the Makefile (or add a loop there).
+Add more CSS locally by dropping a `.stylebench` file under `fixtures/local/` (same `---base---` / `---css---` / `---tree---` / `---mut---` text; both runners already eat it). `make compare-local` loops that directory. Do not change tiny/default seeds — that is the race. `fixtures/*.stylebench` is gitignored so generated races stay out of git; `fixtures/local/` is not.

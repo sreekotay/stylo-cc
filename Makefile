@@ -11,8 +11,8 @@ CCC ?= ccc
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
 	@echo "fixture-default StyleBench default (20k / 5k)"
-	@echo "compare         tiny + local cascade: cmp styles"
-	@echo "compare-local   hand fixtures in fixtures/local (em, hex, important)"
+	@echo "compare         tiny + fixtures/local: cmp styles"
+	@echo "compare-local   every fixtures/local/*.stylebench vs Stylo"
 	@echo "bench-style     default suite, release Stylo + CC -O, cmp then times"
 	@echo "test            upstream cargo test --workspace"
 
@@ -43,17 +43,20 @@ compare: stylo-run cc-run compare-local
 	@grep '^# TIME' $(RECEIPTS)/tiny.stylo.txt $(RECEIPTS)/tiny.cc.txt
 
 # Hand-written CSS (not the StyleBench generator). Same dump / cmp vs Stylo.
-# Add more under fixtures/local/; they are not gitignored (tiny/default are).
+# Add a .stylebench under fixtures/local/; they are not gitignored (tiny/default are).
+LOCAL_FIXTURES := $(sort $(wildcard $(FIXTURES)/local/*.stylebench))
 compare-local:
 	mkdir -p $(RECEIPTS)
-	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- \
-		$(FIXTURES)/local/cascade.stylebench > $(RECEIPTS)/cascade.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- \
-		$(FIXTURES)/local/cascade.stylebench > $(RECEIPTS)/cascade.cc.txt
-	@grep -v '^#' $(RECEIPTS)/cascade.stylo.txt > /tmp/stylo.cascade
-	@grep -v '^#' $(RECEIPTS)/cascade.cc.txt > /tmp/cc.cascade
-	cmp /tmp/stylo.cascade /tmp/cc.cascade
-	@echo OK cascade
+	@set -e; for f in $(LOCAL_FIXTURES); do \
+		name=$$(basename $$f .stylebench); \
+		echo "== $$name =="; \
+		$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $$f > $(RECEIPTS)/$$name.stylo.txt; \
+		$(CCC) run engine/stylebench_cc.ccs -- $$f > $(RECEIPTS)/$$name.cc.txt; \
+		grep -v '^#' $(RECEIPTS)/$$name.stylo.txt > /tmp/stylo.local; \
+		grep -v '^#' $(RECEIPTS)/$$name.cc.txt > /tmp/cc.local; \
+		cmp /tmp/stylo.local /tmp/cc.local; \
+		echo OK $$name; \
+	done
 
 # First restyle + StyleBench mutation steps (class / attr / leaf), then cmp.
 bench-style: fixture-default

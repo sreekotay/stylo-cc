@@ -1,0 +1,27 @@
+# stylebench-fixture 1
+# name=computed-pct-currentcolor
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #c00;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#pct { font-size: 200%; }
+#half { font-size: 50%; }
+#cc { color: #00f; background-color: currentColor; }
+#inh { background-color: currentColor; }
+#curcol { color: currentColor; }
+---tree---
+0	-1	div	testroot		
+1	0	span	pct		
+2	1	span	half		
+3	0	span	cc		
+4	0	span	inh		
+5	0	span	curcol		
+---mut---

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 
 #define MAX_CLASS   32
@@ -27,6 +28,8 @@
 #define PX_NORMAL (-2)
 #define INIT_FS_PX 16
 #define INIT_FW    400
+#define UNIT_PX    0
+#define UNIT_EM    1
 
 /* Specified values live on the rule. Used on the node is proto pointers
  * (initial / parent / this node's slot). Miss: inherit → parent struct,
@@ -145,12 +148,13 @@ static const Specified SPEC_INIT = {
     selector:   collect [compound any [combinator compound]]
 
     prop:      keep ident
-    other_val: keep [some complement charset [#';' #'}']]
+    other_val: keep [some complement charset [#';' #'}' #'!']]
     rgb:       collect ["rgb" ws #'(' ws number ws #',' ws number ws #',' ws number ws #')']
     decl_val:  [rgb | other_val]
+    important: collect [#'!' ws "important"]
     ; pad lives on decls — a leading ws on decl is hoisted out of FIRST,
     ; so `any decl` would miss a space after `{`.
-    decl:      collect [prop ws #':' ws decl_val ws opt #';']
+    decl:      collect [prop ws #':' ws decl_val ws opt important ws opt #';']
     decls:     collect [ws any [decl ws]]
     rule:      collect [selector ws #'{' decls #'}']
 ~~~~}
@@ -216,6 +220,9 @@ typedef struct {
     int spec_b[NPROP];
     int spec_c[NPROP];
     int win_order[NPROP];
+    int win_rank[NPROP];
+    int fs_spec;
+    int fs_unit;
     Used used;
     CCSlice tag;
     CCSlice dom_id;
@@ -265,9 +272,13 @@ static int cc_map_key_eq_AtomPair(AtomPair a, AtomPair b) {
     return a.subj == b.subj && a.left == b.left;
 }
 
+enum { ORIGIN_UA = 0, ORIGIN_AUTHOR = 1 };
+
 typedef struct {
-    int n, sa, sb, sc, order;
+    int n, sa, sb, sc, order, origin;
     unsigned props;
+    unsigned imp;
+    int fs_unit;
     Specified spec;
     Compound* c;
     Comb* comb;
@@ -568,6 +579,62 @@ static int parse_px_or_kw(CCSlice s, int* out) {
     return 0;
 }
 
+static int parse_fs(CCSlice s, int* out, int* unit) {
+    s = trim_slice(s);
+    int v = 0, i = 0, sign = 1;
+    if (s.len && s.ptr[0] == '-') { sign = -1; i = 1; }
+    if (i >= (int)s.len || s.ptr[i] < '0' || s.ptr[i] > '9') return 0;
+    for (; i < (int)s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9'; i++)
+        v = v * 10 + (s.ptr[i] - '0');
+    if (i + 2 <= (int)s.len && s.ptr[i] == 'p' && s.ptr[i + 1] == 'x') {
+        *out = v * sign;
+        *unit = UNIT_PX;
+        return 1;
+    }
+    if (i + 2 <= (int)s.len && s.ptr[i] == 'e' && s.ptr[i + 1] == 'm') {
+        *out = v * sign;
+        *unit = UNIT_EM;
+        return 1;
+    }
+    return 0;
+}
+
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_hex_rgb(CCSlice s, int* r, int* g, int* b) {
+    s = trim_slice(s);
+    if (!s.len || !s.ptr || s.ptr[0] != '#') return 0;
+    if (s.len == 4) {
+        int r1 = hex_digit(s.ptr[1]);
+        int g1 = hex_digit(s.ptr[2]);
+        int b1 = hex_digit(s.ptr[3]);
+        if (r1 < 0 || g1 < 0 || b1 < 0) return 0;
+        *r = r1 * 16 + r1;
+        *g = g1 * 16 + g1;
+        *b = b1 * 16 + b1;
+        return 1;
+    }
+    if (s.len == 7) {
+        int r1 = hex_digit(s.ptr[1]);
+        int r2 = hex_digit(s.ptr[2]);
+        int g1 = hex_digit(s.ptr[3]);
+        int g2 = hex_digit(s.ptr[4]);
+        int b1 = hex_digit(s.ptr[5]);
+        int b2 = hex_digit(s.ptr[6]);
+        if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return 0;
+        *r = r1 * 16 + r2;
+        *g = g1 * 16 + g2;
+        *b = b1 * 16 + b2;
+        return 1;
+    }
+    return 0;
+}
+
 static int parse_fw(CCSlice s, int* out) {
     s = trim_slice(s);
     if (s.len == 6 && s.ptr && memcmp(s.ptr, "normal", 6) == 0) {
@@ -587,6 +654,19 @@ static int parse_fw(CCSlice s, int* out) {
     return 1;
 }
 
+static int cascade_rank(int origin, int imp) {
+    if (imp) return origin == ORIGIN_UA ? 3 : 2;
+    return origin == ORIGIN_UA ? 0 : 1;
+}
+
+static int decl_important(CssNode* d, CssNode* val) {
+    CssNode* n = val ? val->next(d) : 0;
+    if (!n) return 0;
+    if (n->is_list() && n->id() == Css_KEEP_important) return 1;
+    CCSlice s = trim_slice(n->span());
+    return s.eq_cstr("important") || s.eq_cstr("!important");
+}
+
 static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
     memset(r, 0, sizeof(*r));
     r->spec = SPEC_INIT;
@@ -601,45 +681,77 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
                 CssNode* prop = d->first();
                 CssNode* val = prop ? prop->next(d) : 0;
                 if (prop && val) {
+                    int imp = decl_important(d, val);
                     CCSlice name = trim_slice(prop->span());
-                    if (name.eq_cstr("background-color") &&
-                        val->is_list() && val->id() == Css_KEEP_rgb)
-                        take_rgb(val, r);
-                    else if (name.eq_cstr("color") &&
-                             val->is_list() && val->id() == Css_KEEP_rgb)
-                        take_color(val, r);
-                    else {
+                    unsigned bit = 0;
+                    if (name.eq_cstr("background-color")) {
+                        int hr = 0, hg = 0, hb = 0;
+                        if (val->is_list() && val->id() == Css_KEEP_rgb) {
+                            take_rgb(val, r);
+                            bit = 1u << P_bg;
+                        } else if (parse_hex_rgb(trim_slice(val->span()), &hr, &hg, &hb)) {
+                            r->spec.bg.bg.r = hr;
+                            r->spec.bg.bg.g = hg;
+                            r->spec.bg.bg.b = hb;
+                            r->spec.bg.bg.a = 255;
+                            bit = 1u << P_bg;
+                            r->props |= bit;
+                        }
+                    } else if (name.eq_cstr("color")) {
+                        int hr = 0, hg = 0, hb = 0;
+                        if (val->is_list() && val->id() == Css_KEEP_rgb) {
+                            take_color(val, r);
+                            bit = 1u << P_color;
+                        } else if (parse_hex_rgb(trim_slice(val->span()), &hr, &hg, &hb)) {
+                            r->spec.font.color.r = hr;
+                            r->spec.font.color.g = hg;
+                            r->spec.font.color.b = hb;
+                            bit = 1u << P_color;
+                            r->props |= bit;
+                        }
+                    } else {
                         CCSlice raw = trim_slice(val->span());
-                        int px = 0, fw = 0;
+                        int px = 0, fw = 0, unit = UNIT_PX;
                         if (name.eq_cstr("display")) {
                             r->spec.box.display = e->intern(raw);
-                            r->props |= (1u << P_display);
+                            bit = 1u << P_display;
+                            r->props |= bit;
                         } else if (name.eq_cstr("position")) {
                             r->spec.box.position = e->intern(raw);
-                            r->props |= (1u << P_position);
+                            bit = 1u << P_position;
+                            r->props |= bit;
                         } else if (name.eq_cstr("visibility")) {
                             r->spec.font.visibility = e->intern(raw);
-                            r->props |= (1u << P_visibility);
+                            bit = 1u << P_visibility;
+                            r->props |= bit;
                         } else if (name.eq_cstr("height") && parse_px_or_kw(raw, &px)) {
                             r->spec.box.height_px = px;
-                            r->props |= (1u << P_height_px);
+                            bit = 1u << P_height_px;
+                            r->props |= bit;
                         } else if (name.eq_cstr("width") && parse_px_or_kw(raw, &px)) {
                             r->spec.box.width_px = px;
-                            r->props |= (1u << P_width_px);
+                            bit = 1u << P_width_px;
+                            r->props |= bit;
                         } else if (name.eq_cstr("min-width") && parse_px_or_kw(raw, &px)) {
                             r->spec.box.minw_px = px;
-                            r->props |= (1u << P_minw_px);
-                        } else if (name.eq_cstr("font-size") && parse_px_or_kw(raw, &px)) {
+                            bit = 1u << P_minw_px;
+                            r->props |= bit;
+                        } else if (name.eq_cstr("font-size") && parse_fs(raw, &px, &unit)) {
                             r->spec.font.fs_px = px;
-                            r->props |= (1u << P_fs_px);
+                            r->fs_unit = unit;
+                            bit = 1u << P_fs_px;
+                            r->props |= bit;
                         } else if (name.eq_cstr("line-height") && parse_px_or_kw(raw, &px)) {
                             r->spec.font.lh_px = px;
-                            r->props |= (1u << P_lh_px);
+                            bit = 1u << P_lh_px;
+                            r->props |= bit;
                         } else if (name.eq_cstr("font-weight") && parse_fw(raw, &fw)) {
                             r->spec.font.fw = fw;
-                            r->props |= (1u << P_fw);
+                            bit = 1u << P_fw;
+                            r->props |= bit;
                         }
                     }
+                    if (bit && imp) r->imp |= bit;
                 }
             }
             d = d->next(decls);
@@ -655,7 +767,7 @@ static int count_char(char[:] s, char c) {
     return n;
 }
 
-static void !>(CCError) Engine_ingest_css(Engine* e, char[:] css) {
+static void !>(CCError) Engine_ingest_css(Engine* e, char[:] css, int origin) {
     if (!css.len) return cc_ok();
     CssNode* root = Css.parse(css.ptr, css.len, e->store);
     if (!root) {
@@ -672,6 +784,7 @@ static void !>(CCError) Engine_ingest_css(Engine* e, char[:] css) {
                 return cc_err(CC_ERR_INVALID_ARG, "too many rules");
             Rule* r = &e->rules[e->nrules];
             if (fill_rule(e, ch, r)) {
+                r->origin = origin;
                 r->order = e->nrules;
                 e->nrules++;
             }
@@ -721,6 +834,7 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
     for (int p = 0; p < NPROP; p++) {
         nd->spec_a[p] = nd->spec_b[p] = nd->spec_c[p] = -1;
         nd->win_order[p] = -1;
+        nd->win_rank[p] = -1;
     }
     return 1;
 }
@@ -952,8 +1066,8 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->box_inline.position = e->ident_static;
     e->font_init.visibility = e->ident_visible;
 
-    e->ingest_css(base_s) !>(err) { return cc_err(err); };
-    e->ingest_css(css_s) !>(err) { return cc_err(err); };
+    e->ingest_css(base_s, ORIGIN_UA) !>(err) { return cc_err(err); };
+    e->ingest_css(css_s, ORIGIN_AUTHOR) !>(err) { return cc_err(err); };
     e->index_rules() !>(err) { return cc_err(err); };
     e->ingest_tree(tree_s) !>(err) { return cc_err(err); };
     if (mut_s.len) e->ingest_muts(mut_s) !>(err) { return cc_err(err); };
@@ -1024,6 +1138,8 @@ static int Engine_match_from(Engine* e, int idx, const Rule* r, int ci) {
 
 static int better_prop(const Rule* r, const Node* n, int p) {
     if (n->spec_a[p] < 0) return 1;
+    int nr = cascade_rank(r->origin, (int)((r->imp >> p) & 1u));
+    if (nr != n->win_rank[p]) return nr > n->win_rank[p];
     if (r->sa != n->spec_a[p]) return r->sa > n->spec_a[p];
     if (r->sb != n->spec_b[p]) return r->sb > n->spec_b[p];
     if (r->sc != n->spec_c[p]) return r->sc > n->spec_c[p];
@@ -1035,7 +1151,12 @@ static void Node_win_prop(Node* n, const Rule* r, int p) {
     n->spec_b[p] = r->sb;
     n->spec_c[p] = r->sc;
     n->win_order[p] = r->order;
+    n->win_rank[p] = cascade_rank(r->origin, (int)((r->imp >> p) & 1u));
     n->specified |= (1u << p);
+    if (p == P_fs_px) {
+        n->fs_spec = r->spec.font.fs_px;
+        n->fs_unit = r->fs_unit;
+    }
 }
 
 /* Smallest fact: this node owns a unique slot. Do not copy the proto —
@@ -1217,6 +1338,8 @@ static void Engine_inherit_one(Engine* e, int i) {
     else {
         if (!(n->specified & (1u << P_fs_px)))
             n->used.font->fs_px = src->fs_px;
+        else if (n->fs_unit == UNIT_EM)
+            n->used.font->fs_px = src->fs_px * n->fs_spec;
         if (!(n->specified & (1u << P_lh_px)))
             n->used.font->lh_px = src->lh_px;
         if (!(n->specified & (1u << P_fw)))
@@ -1310,6 +1433,8 @@ static void Engine_copy_specified(Engine* e, int dst, int src) {
     e->nodes[dst].used.box = e->nodes[src].used.box;
     e->nodes[dst].used.font = e->nodes[src].used.font;
     e->nodes[dst].specified = e->nodes[src].specified;
+    e->nodes[dst].fs_spec = e->nodes[src].fs_spec;
+    e->nodes[dst].fs_unit = e->nodes[src].fs_unit;
 }
 
 static double now_ms(void) {
@@ -1345,10 +1470,13 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     return cc_ok();
 }
 
-static CCSlice fmt_px(int v, CCSlice auto_s) {
+static CCSlice fmt_px(int v, CCSlice auto_s, char* buf, size_t cap) {
     if (v == PX_AUTO) return auto_s;
     if (v == PX_NORMAL) return @slice("normal");
-    return @string(`${v}px`, @scratch).as_slice();
+    int n = snprintf(buf, cap, "%dpx", v);
+    if (n < 0) n = 0;
+    if ((size_t)n >= cap) n = (int)cap - 1;
+    return cc_slice_from_buffer(buf, (size_t)n);
 }
 
 static int split_tabs(CCSlice line, CCSlice* out, int cap) {
@@ -1533,12 +1661,15 @@ static void Engine_reset_styles(Engine* e) {
     for (int i = 0; i < e->nnodes; i++) {
         Node* n = &e->nodes[i];
         n->specified = 0;
+        n->fs_spec = 0;
+        n->fs_unit = 0;
         n->used.bg = &e->bg_init;
         n->used.box = &e->box_init;
         n->used.font = &e->font_init;
         for (int p = 0; p < NPROP; p++) {
             n->spec_a[p] = n->spec_b[p] = n->spec_c[p] = -1;
             n->win_order[p] = -1;
+            n->win_rank[p] = -1;
         }
     }
 }
@@ -1632,11 +1763,12 @@ int main(int argc, char** argv) {
         CCSlice disp = n->used.box->display.len ? n->used.box->display : @slice("inline");
         CCSlice pos = n->used.box->position.len ? n->used.box->position : @slice("static");
         CCSlice vis = n->used.font->visibility.len ? n->used.font->visibility : @slice("visible");
-        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"));
-        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"));
-        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"));
-        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"));
-        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"));
+        char wbuf[16], hbuf[16], minwbuf[16], fsbuf[16], lhbuf[16];
+        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
+        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
+        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
+        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
+        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
         io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch)) !>;
     }
     return 0;

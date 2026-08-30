@@ -1,0 +1,25 @@
+# stylebench-fixture 1
+# name=cascade-em-hex
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#a { font-size: 2em; color: #c00; }
+#b { font-size: 1em; background-color: #00ff00; }
+.kid { color: #00f !important; }
+.em2 { font-size: 2em; }
+---tree---
+0	-1	div	testroot		
+1	0	span	a		
+2	1	span	b	kid	
+3	0	span	-	em2	
+4	0	span	-	em2	
+---mut---

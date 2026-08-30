@@ -6,12 +6,13 @@ RECEIPTS ?= receipts
 FIXTURES ?= fixtures
 CCC ?= ccc
 
-.PHONY: setup fixture fixture-default stylo-run cc-run compare bench-style test build release bench help
+.PHONY: setup fixture fixture-default stylo-run cc-run compare compare-local bench-style test build release bench help
 
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
 	@echo "fixture-default StyleBench default (20k / 5k)"
-	@echo "compare         tiny: cmp styles"
+	@echo "compare         tiny + local cascade: cmp styles"
+	@echo "compare-local   hand fixtures in fixtures/local (em, hex, important)"
 	@echo "bench-style     default suite, release Stylo + CC -O, cmp then times"
 	@echo "test            upstream cargo test --workspace"
 
@@ -34,12 +35,25 @@ fixture-default: $(STYLO)/Cargo.toml
 	mkdir -p $(FIXTURES)
 	$(CARGO) run -q -p stylebench-gen --release > $(FIXTURES)/default.stylebench
 
-compare: stylo-run cc-run
+compare: stylo-run cc-run compare-local
 	@grep -v '^#' $(RECEIPTS)/tiny.stylo.txt > /tmp/stylo.styles
 	@grep -v '^#' $(RECEIPTS)/tiny.cc.txt > /tmp/cc.styles
 	cmp /tmp/stylo.styles /tmp/cc.styles
-	@echo OK
+	@echo OK tiny
 	@grep '^# TIME' $(RECEIPTS)/tiny.stylo.txt $(RECEIPTS)/tiny.cc.txt
+
+# Hand-written CSS (not the StyleBench generator). Same dump / cmp vs Stylo.
+# Add more under fixtures/local/; they are not gitignored (tiny/default are).
+compare-local:
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- \
+		$(FIXTURES)/local/cascade.stylebench > $(RECEIPTS)/cascade.stylo.txt
+	$(CCC) run engine/stylebench_cc.ccs -- \
+		$(FIXTURES)/local/cascade.stylebench > $(RECEIPTS)/cascade.cc.txt
+	@grep -v '^#' $(RECEIPTS)/cascade.stylo.txt > /tmp/stylo.cascade
+	@grep -v '^#' $(RECEIPTS)/cascade.cc.txt > /tmp/cc.cascade
+	cmp /tmp/stylo.cascade /tmp/cc.cascade
+	@echo OK cascade
 
 # First restyle + StyleBench mutation steps (class / attr / leaf), then cmp.
 bench-style: fixture-default

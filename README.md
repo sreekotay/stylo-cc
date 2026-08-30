@@ -3,10 +3,12 @@
 A Concurrent-C styling engine raced against [Stylo](https://github.com/servo/stylo) on a frozen [StyleBench](https://perftest.netlify.app/stylebench/) workload.
 
 ```
-fixtures/       StyleBench trees + sheets + mutation script (same LCG / seeds as WebKit)
-stylo-runner/   real Stylo on a TElement host
-engine/         idiomatic Concurrent-C engine
-stylo/          git submodule — servo/stylo (oracle crate + unit tests)
+fixtures/           generated StyleBench races (tiny / default; gitignored)
+fixtures/local/     hand CSS we own (em, hex, !important, …) — still cmp vs Stylo
+stylo-runner/       real Stylo on a TElement host
+engine/             idiomatic Concurrent-C engine
+stylo/              git submodule — servo/stylo (oracle crate + unit tests)
+harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
 ```
 
 Style only. No layout. No paint. No browser.
@@ -75,7 +77,7 @@ Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, chil
 
 - **Selectors:** sibling (`+` / `~`), `:nth-*`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
-- **Values:** `%`, `em` / `rem`, `calc()`, `var()`, `currentColor`, hex / hsl (only `rgb()` and a few keywords).
+- **Values:** `%`, `rem`, `calc()`, `var()`, `currentColor`, hsl. Integer `em` on `font-size` and `#rgb` / `#rrggbb` are in; see `fixtures/local/` (`make compare-local`).
 
 Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We use the same cut: `StyBg*` / `StyBox*` / `StyFont*` — initial or parent proto, unique slot on first specified write (no memcpy of the proto). The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid we skipped.
 
@@ -89,7 +91,7 @@ Default suite, release, wall clock, Apple M5, 2026-08-29. Live after mutations: 
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
 | CC (`ccc -O`, sibling canons + used protos) | 19.3 ms | 301 ms |
 
-See `receipts/default_2026_08_29.txt`. Tiny (81/81) is `make compare`; that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
+See `receipts/default_2026_08_29.txt`. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
 
 ## Fairness
 
@@ -122,8 +124,11 @@ git submodule update --init --depth 1
 
 ```bash
 make fixture          # tiny suite (compile / cmp loop)
-make compare          # tiny: both runners, cmp styles
+make compare          # tiny + local cascade: both runners, cmp styles
+make compare-local    # only fixtures/local (no StyleBench regenerate)
 make bench-style      # default 20k/5k + mutations, release Stylo + CC -O, cmp then times
 ```
 
-Upstream Stylo crate tests: `make test` (or `./scripts/upstream.sh test`).
+`make test` is **upstream Stylo crate tests** (`cargo test --workspace` in `stylo/`). We did not write those. The race fixtures are a frozen [WebKit StyleBench](https://perftest.netlify.app/stylebench/) port (`harness/` = `stylebench-gen`, same LCG / seeds). Stylo is the other runner, not the source of tiny/default.
+
+Add more CSS locally by dropping a `.stylebench` file under `fixtures/local/` (same `---base---` / `---css---` / `---tree---` / `---mut---` text; both runners already eat it). Do not change tiny/default seeds — that is the race. `fixtures/*.stylebench` is gitignored so generated races stay out of git; `fixtures/local/` is not. Wire a new file into `compare-local` in the Makefile (or add a loop there).

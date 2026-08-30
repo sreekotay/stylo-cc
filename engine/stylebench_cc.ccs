@@ -11,7 +11,7 @@
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/cc_instantiate.cch>
-#include <ccc/script/stdio.cch>
+#include <ccc/stdio.cch>
 #include <ccc/script/file.cch>
 #include <ccc/cc_exclusive.cch>
 #include <stdint.h>
@@ -1574,10 +1574,12 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
 static CCSlice fmt_px(int v, CCSlice auto_s, char* buf, size_t cap) {
     if (v == PX_AUTO) return auto_s;
     if (v == PX_NORMAL) return @slice("normal");
-    int n = snprintf(buf, cap, "%dpx", v);
-    if (n < 0) n = 0;
-    if ((size_t)n >= cap) n = (int)cap - 1;
-    return cc_slice_from_buffer(buf, (size_t)n);
+    CCString s = @string(`${v}px`, @scratch);
+    CCSlice sl = cc_string_as_slice(&s);
+    if (sl.len >= cap) sl.len = cap - 1;
+    memcpy(buf, sl.ptr, sl.len);
+    buf[sl.len] = '\0';
+    return cc_slice_from_buffer(buf, sl.len);
 }
 
 static int split_tabs(CCSlice line, CCSlice* out, int cap) {

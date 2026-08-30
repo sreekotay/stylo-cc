@@ -77,7 +77,7 @@ Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, chil
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
 - **Values:** `%`, `em` / `rem`, `calc()`, `var()`, `currentColor`, hex / hsl (only `rgb()` and a few keywords).
 
-Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We write the same live fields as scalars. The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid work we skipped.
+Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We use the same cut: `StyBg*` / `StyBox*` / `StyFont*` — initial or parent proto, unique slot on first specified write (no memcpy of the proto). The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid we skipped.
 
 ## Recorded times
 
@@ -87,7 +87,7 @@ Default suite, release, wall clock, Apple M5, 2026-08-29. Live after mutations: 
 |---|---|---|
 | Stylo (6 threads, sharing LRU on) | 30.7 ms | 673 ms |
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
-| CC (`ccc -O`, sibling canons) | 22.8 ms | 300 ms |
+| CC (`ccc -O`, sibling canons + used protos) | 19.3 ms | 301 ms |
 
 See `receipts/default_2026_08_29.txt`. Tiny (81/81) is `make compare`; that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
 
@@ -102,7 +102,7 @@ Corrected relative to the first receipts (RGB-only dump, Stylo sharing off, CC d
 
 Still not the same program (Stylo the engine, not our host):
 
-- Stylo’s proto is `Arc` style structs (atomic refcount to skip unused longhands). We store eleven scalars. That is a real tax they pay and we do not.
+- Stylo’s proto is `Arc` style structs (atomic refcount). Ours is a pointer to initial / parent / this node’s slot. Same inherit-vs-reset cut; we do not pay atomics.
 - Sharing algorithms differ (LRU + revalidation vs exact sibling key).
 - Stylo walks in tree order; we match canons then hop inherit.
 - `TIME_*` is `traverse_dom` / `recalc_style_at` vs our restyle. Building the slab / parsing the fixture is outside the clock.

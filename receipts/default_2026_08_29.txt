@@ -7,10 +7,10 @@ Live after mutations: 20 002. Wall clock. Machine: Apple M5.
          TIME_MS=30.685  TIME_MUT_MS=673.291
   stylo  release, STYLE_THREAD_POOL (6), sharing off
          TIME_MS=45.341  TIME_MUT_MS=1098.548
-  cc     ccc -O, sibling canons + specified @parallel + serial inherit
-         TIME_MS=22.793  TIME_MUT_MS=299.924
-         TIME_LEVELS=0.308  TIME_SHARE=2.334  TIME_MATCH=19.978
-         TIME_INHERIT=0.173  LAST_MATCH=10.797  canons=12854
+  cc     ccc -O, sibling canons + used protos (own slot, no proto memcpy)
+         TIME_MS=19.346  TIME_MUT_MS=301.412
+         TIME_LEVELS=0.401  TIME_SHARE=2.482  TIME_MATCH=16.202
+         TIME_INHERIT=0.260  LAST_MATCH=10.375  canons=12854
 
 TIME_MS is first restyle. TIME_MUT_MS is the 25 restyles after each
 mutation batch (no Stylo snapshot invalidation).

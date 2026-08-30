@@ -28,8 +28,9 @@
 #define INIT_FS_PX 16
 #define INIT_FW    400
 
-/* Named used values. Copy / apply / NPROP unroll from type_of(Computed).fields.
- * fill_rule, inherit_one, and the dump stay handwritten (CSS names, policy). */
+/* Specified values live on the rule. Used on the node is proto pointers
+ * (initial / parent / this node's slot). Miss: inherit → parent struct,
+ * reset → initial. fill_rule / inherit_one / dump stay handwritten. */
 typedef struct {
     int r;
     int g;
@@ -45,43 +46,60 @@ typedef struct {
 
 typedef struct {
     CssRgba bg;
-    CssRgb color;
+} StyBg;
+
+typedef struct {
     int height_px;
     int minw_px;
     int width_px;
+    CCSlice display;
+    CCSlice position;
+} StyBox;
+
+typedef struct {
     int fs_px;
     int lh_px;
     int fw;
-    CCSlice display;
-    CCSlice position;
+    CssRgb color;
     CCSlice visibility;
-} Computed;
+} StyFont;
 
-/* Host reflection (string name) — type_of(Computed) is not a C expr in the
- * comptime evaluator. AFTER_PRELUDE so NPROP exists before Node. */
+typedef struct {
+    StyBg bg;
+    StyBox box;
+    StyFont font;
+} Specified;
+
+typedef struct {
+    StyBg* bg;
+    StyBox* box;
+    StyFont* font;
+} Used;
+
+/* P_* by group so N_BG / N_BOX / N_FONT are counts. String reflect —
+ * type_of in @comptime { } still fails in this TU. */
 @comptime {
-    int n = cc_reflect_field_count("Computed");
+    const char* groups[3] = { "StyBg", "StyBox", "StyFont" };
+    const char* nnames[3] = { "N_BG", "N_BOX", "N_FONT" };
+    int idx = 0;
     cc_emit_format(CC_EMIT_AFTER_PRELUDE, "enum {\n");
-    for (int i = 0; i < n; i++) {
-        char nm[128];
-        cc_reflect_field_name("Computed", i, nm, sizeof(nm));
-        cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    P_%s = %d,\n", nm, i);
+    for (int g = 0; g < 3; g++) {
+        int n = cc_reflect_field_count(groups[g]);
+        for (int i = 0; i < n; i++) {
+            char nm[128];
+            cc_reflect_field_name(groups[g], i, nm, sizeof(nm));
+            cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    P_%s = %d,\n", nm, idx);
+            idx++;
+        }
+        cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    %s = %d,\n", nnames[g], n);
     }
-    cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    NPROP\n};\n");
+    cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    NPROP = %d\n};\n", idx);
 }
 
-static const Computed COMPUTED_INIT = {
-    .bg = {0, 0, 0, 0},
-    .color = {0, 0, 0},
-    .height_px = PX_AUTO,
-    .minw_px = PX_AUTO,
-    .width_px = PX_AUTO,
-    .fs_px = INIT_FS_PX,
-    .lh_px = PX_NORMAL,
-    .fw = INIT_FW,
-    .display = {0},
-    .position = {0},
-    .visibility = {0},
+static const Specified SPEC_INIT = {
+    .bg = {{0, 0, 0, 0}},
+    .box = {PX_AUTO, PX_AUTO, PX_AUTO, {0}, {0}},
+    .font = {INIT_FS_PX, PX_NORMAL, INIT_FW, {0, 0, 0}, {0}},
 };
 
 @grammar(rules) Css {~~~~
@@ -198,7 +216,7 @@ typedef struct {
     int spec_b[NPROP];
     int spec_c[NPROP];
     int win_order[NPROP];
-    Computed used;
+    Used used;
     CCSlice tag;
     CCSlice dom_id;
     CCSlice* classes;
@@ -250,7 +268,7 @@ static int cc_map_key_eq_AtomPair(AtomPair a, AtomPair b) {
 typedef struct {
     int n, sa, sb, sc, order;
     unsigned props;
-    Computed spec;
+    Specified spec;
     Compound* c;
     Comb* comb;
 } Rule;
@@ -285,6 +303,12 @@ typedef struct {
     ShareEnt* share_ents;
     int ncanon;
     CCSlice ident_inline, ident_block, ident_div, ident_static, ident_visible;
+    StyBg bg_init;
+    StyBox box_init, box_block, box_inline;
+    StyFont font_init;
+    StyBg* bg_pool;
+    StyBox* box_pool;
+    StyFont* font_pool;
     double t_levels, t_share, t_match, t_inherit;
     double t0_levels, t0_share, t0_match, t0_inherit;
 } Engine;
@@ -295,8 +319,10 @@ typedef struct {
 @typeview Match on Engine {
     r: intern, match_from, apply_rule, apply_bucket, apply_pair,
        apply_pairs, apply_pairs_other, style_one, inherit_one, paint_levels,
-       paint_blooms, copy_specified, ident_inline, ident_block, ident_div,
-       ident_static, ident_visible,
+       paint_blooms, copy_specified, own_bg, own_box, own_font, seal_box,
+       ident_inline, ident_block, ident_div, ident_static, ident_visible,
+       bg_init, box_init, font_init, box_block, box_inline,
+       bg_pool, box_pool, font_pool,
        nnodes, nrules, rules, share_of,
        by_id, by_class, by_type, by_parent_id, by_parent_class, by_parent_type,
        child_pairs, desc_pairs, universal, level_ids, level_off, max_depth;
@@ -486,10 +512,10 @@ static int take_rgb(CssNode* rgb, Rule* r) {
     CCSlice sa = a->span();
     CCSlice sg = b->span();
     CCSlice sb = c->span();
-    r->spec.bg.r = (int)(sa.to_i64() ?> 0);
-    r->spec.bg.g = (int)(sg.to_i64() ?> 0);
-    r->spec.bg.b = (int)(sb.to_i64() ?> 0);
-    r->spec.bg.a = 255;
+    r->spec.bg.bg.r = (int)(sa.to_i64() ?> 0);
+    r->spec.bg.bg.g = (int)(sg.to_i64() ?> 0);
+    r->spec.bg.bg.b = (int)(sb.to_i64() ?> 0);
+    r->spec.bg.bg.a = 255;
     r->props |= (1u << P_bg);
     return 1;
 }
@@ -502,9 +528,9 @@ static int take_color(CssNode* rgb, Rule* r) {
     CCSlice sa = a->span();
     CCSlice sg = b->span();
     CCSlice sb = c->span();
-    r->spec.color.r = (int)(sa.to_i64() ?> 0);
-    r->spec.color.g = (int)(sg.to_i64() ?> 0);
-    r->spec.color.b = (int)(sb.to_i64() ?> 0);
+    r->spec.font.color.r = (int)(sa.to_i64() ?> 0);
+    r->spec.font.color.g = (int)(sg.to_i64() ?> 0);
+    r->spec.font.color.b = (int)(sb.to_i64() ?> 0);
     r->props |= (1u << P_color);
     return 1;
 }
@@ -563,7 +589,7 @@ static int parse_fw(CCSlice s, int* out) {
 
 static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
     memset(r, 0, sizeof(*r));
-    r->spec = COMPUTED_INIT;
+    r->spec = SPEC_INIT;
     if (!nd || !nd->is_list()) return 0;
     CssNode* sel = nd->first();
     CssNode* decls = sel ? sel->next(nd) : 0;
@@ -586,31 +612,31 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
                         CCSlice raw = trim_slice(val->span());
                         int px = 0, fw = 0;
                         if (name.eq_cstr("display")) {
-                            r->spec.display = e->intern(raw);
+                            r->spec.box.display = e->intern(raw);
                             r->props |= (1u << P_display);
                         } else if (name.eq_cstr("position")) {
-                            r->spec.position = e->intern(raw);
+                            r->spec.box.position = e->intern(raw);
                             r->props |= (1u << P_position);
                         } else if (name.eq_cstr("visibility")) {
-                            r->spec.visibility = e->intern(raw);
+                            r->spec.font.visibility = e->intern(raw);
                             r->props |= (1u << P_visibility);
                         } else if (name.eq_cstr("height") && parse_px_or_kw(raw, &px)) {
-                            r->spec.height_px = px;
+                            r->spec.box.height_px = px;
                             r->props |= (1u << P_height_px);
                         } else if (name.eq_cstr("width") && parse_px_or_kw(raw, &px)) {
-                            r->spec.width_px = px;
+                            r->spec.box.width_px = px;
                             r->props |= (1u << P_width_px);
                         } else if (name.eq_cstr("min-width") && parse_px_or_kw(raw, &px)) {
-                            r->spec.minw_px = px;
+                            r->spec.box.minw_px = px;
                             r->props |= (1u << P_minw_px);
                         } else if (name.eq_cstr("font-size") && parse_px_or_kw(raw, &px)) {
-                            r->spec.fs_px = px;
+                            r->spec.font.fs_px = px;
                             r->props |= (1u << P_fs_px);
                         } else if (name.eq_cstr("line-height") && parse_px_or_kw(raw, &px)) {
-                            r->spec.lh_px = px;
+                            r->spec.font.lh_px = px;
                             r->props |= (1u << P_lh_px);
                         } else if (name.eq_cstr("font-weight") && parse_fw(raw, &fw)) {
-                            r->spec.fw = fw;
+                            r->spec.font.fw = fw;
                             r->props |= (1u << P_fw);
                         }
                     }
@@ -689,7 +715,9 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
         }
     }
     nd->specified = 0;
-    nd->used = COMPUTED_INIT;
+    nd->used.bg = &e->bg_init;
+    nd->used.box = &e->box_init;
+    nd->used.font = &e->font_init;
     for (int p = 0; p < NPROP; p++) {
         nd->spec_a[p] = nd->spec_b[p] = nd->spec_c[p] = -1;
         nd->win_order[p] = -1;
@@ -900,16 +928,29 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->level_off = e->store.allocT::[int](64);
     e->share_of = e->store.allocT::[int](e->cap_nodes);
     e->share_ents = e->store.allocT::[ShareEnt](e->cap_nodes);
+    e->bg_pool = e->store.allocT::[StyBg](e->cap_nodes);
+    e->box_pool = e->store.allocT::[StyBox](e->cap_nodes);
+    e->font_pool = e->store.allocT::[StyFont](e->cap_nodes);
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
         !e->child_pairs || !e->desc_pairs || !e->muts || !e->level_ids || !e->level_off ||
-        !e->share_of || !e->share_ents)
+        !e->share_of || !e->share_ents || !e->bg_pool || !e->box_pool || !e->font_pool)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "engine tables");
+    e->bg_init = SPEC_INIT.bg;
+    e->box_init = SPEC_INIT.box;
+    e->font_init = SPEC_INIT.font;
     e->ident_inline = e->intern(@slice("inline"));
     e->ident_block = e->intern(@slice("block"));
     e->ident_div = e->intern(@slice("div"));
     e->ident_static = e->intern(@slice("static"));
     e->ident_visible = e->intern(@slice("visible"));
+    e->box_block = e->box_init;
+    e->box_block.display = e->ident_block;
+    e->box_block.position = e->ident_static;
+    e->box_inline = e->box_init;
+    e->box_inline.display = e->ident_inline;
+    e->box_inline.position = e->ident_static;
+    e->font_init.visibility = e->ident_visible;
 
     e->ingest_css(base_s) !>(err) { return cc_err(err); };
     e->ingest_css(css_s) !>(err) { return cc_err(err); };
@@ -997,14 +1038,58 @@ static void Node_win_prop(Node* n, const Rule* r, int p) {
     n->specified |= (1u << p);
 }
 
+/* Smallest fact: this node owns a unique slot. Do not copy the proto —
+ * specified fields are written here; holes are sealed from initial. */
+static void Engine_own_bg(Engine* e, Node* n, int i) {
+    if (n->used.bg != &e->bg_pool[i])
+        n->used.bg = &e->bg_pool[i];
+}
+
+static void Engine_own_box(Engine* e, Node* n, int i) {
+    if (n->used.box != &e->box_pool[i])
+        n->used.box = &e->box_pool[i];
+}
+
+static void Engine_own_font(Engine* e, Node* n, int i) {
+    if (n->used.font != &e->font_pool[i])
+        n->used.font = &e->font_pool[i];
+}
+
+static void Engine_seal_box(Engine* e, Node* n, int i) {
+    if (n->used.box != &e->box_pool[i]) return;
+    StyBox* b = n->used.box;
+    if (!(n->specified & (1u << P_height_px))) b->height_px = PX_AUTO;
+    if (!(n->specified & (1u << P_minw_px))) b->minw_px = PX_AUTO;
+    if (!(n->specified & (1u << P_width_px))) b->width_px = PX_AUTO;
+    if (!(n->specified & (1u << P_display))) b->display = cc_slice_empty();
+    if (!(n->specified & (1u << P_position))) b->position = cc_slice_empty();
+}
+
 static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
     Rule* r = &e->rules[k];
     if (!r->n || !r->props || !e->match_from(i, r, r->n - 1))
         return;
-    @comptime for (f in type_of(Computed).fields) {
+    @comptime for (f in type_of(StyBg).fields) {
         if ((r->props & (1u << f.index)) && better_prop(r, n, (int)f.index)) {
-            n->used.f = r->spec.f;
+            e->own_bg(n, i);
+            n->used.bg->f = r->spec.bg.f;
             n->win_prop(r, (int)f.index);
+        }
+    }
+    @comptime for (f in type_of(StyBox).fields) {
+        if ((r->props & (1u << (N_BG + (int)f.index))) &&
+            better_prop(r, n, N_BG + (int)f.index)) {
+            e->own_box(n, i);
+            n->used.box->f = r->spec.box.f;
+            n->win_prop(r, N_BG + (int)f.index);
+        }
+    }
+    @comptime for (f in type_of(StyFont).fields) {
+        if ((r->props & (1u << (N_BG + N_BOX + (int)f.index))) &&
+            better_prop(r, n, N_BG + N_BOX + (int)f.index)) {
+            e->own_font(n, i);
+            n->used.font->f = r->spec.font.f;
+            n->win_prop(r, N_BG + N_BOX + (int)f.index);
         }
     }
 }
@@ -1073,6 +1158,7 @@ static void Engine_style_one(Engine* e, int i) {
         for (size_t j = 0; j < u->len; j++)
             e->apply_rule(i, n, u->data[j]);
     }
+    e->seal_box(n, i);
 }
 
 static void Engine_paint_levels(Engine* e) {
@@ -1112,24 +1198,34 @@ static void Engine_paint_levels(Engine* e) {
 static void Engine_inherit_one(Engine* e, int i) {
     Node* n = &e->nodes[i];
     if (n->dead) return;
-    if (!(n->specified & (1u << P_display)) || !n->used.display.len)
-        n->used.display = slices_eq(&n->tag, &e->ident_div) ? e->ident_block : e->ident_inline;
-    if (!(n->specified & (1u << P_position)) || !n->used.position.len)
-        n->used.position = e->ident_static;
-    if (!(n->specified & (1u << P_visibility)) || !n->used.visibility.len)
-        n->used.visibility = e->ident_visible;
-    if (n->parent < 0) return;
-    Node* p = &e->nodes[n->parent];
-    if (!(n->specified & (1u << P_fs_px)))
-        n->used.fs_px = p->used.fs_px;
-    if (!(n->specified & (1u << P_lh_px)))
-        n->used.lh_px = p->used.lh_px;
-    if (!(n->specified & (1u << P_fw)))
-        n->used.fw = p->used.fw;
-    if (!(n->specified & (1u << P_visibility)))
-        n->used.visibility = p->used.visibility;
-    if (!(n->specified & (1u << P_color)))
-        n->used.color = p->used.color;
+    unsigned box_bits = ((1u << N_BOX) - 1u) << N_BG;
+    unsigned font_bits = ((1u << N_FONT) - 1u) << (N_BG + N_BOX);
+    if (!(n->specified & (1u << P_display)) || !n->used.box->display.len) {
+        if (!(n->specified & box_bits)) {
+            n->used.box = slices_eq(&n->tag, &e->ident_div) ? &e->box_block : &e->box_inline;
+        } else {
+            n->used.box->display = slices_eq(&n->tag, &e->ident_div) ? e->ident_block : e->ident_inline;
+        }
+    }
+    if ((!(n->specified & (1u << P_position)) || !n->used.box->position.len) &&
+        n->used.box != &e->box_init && n->used.box != &e->box_block &&
+        n->used.box != &e->box_inline)
+        n->used.box->position = e->ident_static;
+    StyFont* src = n->parent >= 0 ? e->nodes[n->parent].used.font : &e->font_init;
+    if (!(n->specified & font_bits))
+        n->used.font = src;
+    else {
+        if (!(n->specified & (1u << P_fs_px)))
+            n->used.font->fs_px = src->fs_px;
+        if (!(n->specified & (1u << P_lh_px)))
+            n->used.font->lh_px = src->lh_px;
+        if (!(n->specified & (1u << P_fw)))
+            n->used.font->fw = src->fw;
+        if (!(n->specified & (1u << P_visibility)))
+            n->used.font->visibility = src->visibility;
+        if (!(n->specified & (1u << P_color)))
+            n->used.font->color = src->color;
+    }
 }
 
 static uint64_t node_share_hash(const Node* n) {
@@ -1210,7 +1306,9 @@ static void Engine_build_share(Engine* e) {
 }
 
 static void Engine_copy_specified(Engine* e, int dst, int src) {
-    e->nodes[dst].used = e->nodes[src].used;
+    e->nodes[dst].used.bg = e->nodes[src].used.bg;
+    e->nodes[dst].used.box = e->nodes[src].used.box;
+    e->nodes[dst].used.font = e->nodes[src].used.font;
     e->nodes[dst].specified = e->nodes[src].specified;
 }
 
@@ -1435,7 +1533,9 @@ static void Engine_reset_styles(Engine* e) {
     for (int i = 0; i < e->nnodes; i++) {
         Node* n = &e->nodes[i];
         n->specified = 0;
-        n->used = COMPUTED_INIT;
+        n->used.bg = &e->bg_init;
+        n->used.box = &e->box_init;
+        n->used.font = &e->font_init;
         for (int p = 0; p < NPROP; p++) {
             n->spec_a[p] = n->spec_b[p] = n->spec_c[p] = -1;
             n->win_order[p] = -1;
@@ -1529,15 +1629,15 @@ int main(int argc, char** argv) {
         if (n->dead) continue;
         CCSlice tag = n->tag;
         CCSlice id = n->dom_id.len ? n->dom_id : @slice("-");
-        CCSlice disp = n->used.display.len ? n->used.display : @slice("inline");
-        CCSlice pos = n->used.position.len ? n->used.position : @slice("static");
-        CCSlice vis = n->used.visibility.len ? n->used.visibility : @slice("visible");
-        CCSlice w = fmt_px(n->used.width_px, @slice("auto"));
-        CCSlice h = fmt_px(n->used.height_px, @slice("auto"));
-        CCSlice minw = fmt_px(n->used.minw_px, @slice("auto"));
-        CCSlice fs = fmt_px(n->used.fs_px, @slice("16px"));
-        CCSlice lh = fmt_px(n->used.lh_px, @slice("normal"));
-        io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.fw}\tvis=${vis}\tcolor=rgb(${n->used.color.r}, ${n->used.color.g}, ${n->used.color.b})\tbg=${n->used.bg.r},${n->used.bg.g},${n->used.bg.b},${n->used.bg.a}`, @scratch)) !>;
+        CCSlice disp = n->used.box->display.len ? n->used.box->display : @slice("inline");
+        CCSlice pos = n->used.box->position.len ? n->used.box->position : @slice("static");
+        CCSlice vis = n->used.font->visibility.len ? n->used.font->visibility : @slice("visible");
+        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"));
+        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"));
+        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"));
+        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"));
+        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"));
+        io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch)) !>;
     }
     return 0;
 }

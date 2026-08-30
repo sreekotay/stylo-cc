@@ -16,7 +16,7 @@ StyleBench workload generator / fixtures
 
 No Firefox. No Gecko. No Servo patch. No wrapping Stylo’s Rayon walk.
 
-Stylo is the competitor: real matching, cascade, `RuleTree`, `recalc_style_at`, hosted on a slab tree that implements `TElement` / `TNode`.
+The competitor is **Stylo itself** (`style`: match, cascade, `RuleTree`, `recalc_style_at`, proto / COW, sharing LRU). The `TElement` / `TNode` slab is our host — glue, like the CC fixture load. Do not score host.rs against the CC engine.
 
 The CC runner is a styling engine (tree, match, cascade, computed values, walk) written the [CC way](https://github.com/sreekotay/concurrent-c/blob/main/docs/the-cc-way.md). Sequential first; parallel once the relations are nameable. Mutation writes use Redis-shaped shard holds.
 

@@ -100,11 +100,12 @@ Corrected relative to the first receipts (RGB-only dump, Stylo sharing off, CC d
 - **Inherit is a parent hop.** Specified match stays `@parallel for` over canons. Inherited props copy in one serial depth walk — not one `@parallel for` per level.
 - **Same mutation script.** Full rematch after each batch. No incremental invalidation on either side.
 
-Still not the same program:
+Still not the same program (Stylo the engine, not our host):
 
 - Stylo’s proto is `Arc` style structs (atomic refcount to skip unused longhands). We store eleven scalars. That is a real tax they pay and we do not.
 - Sharing algorithms differ (LRU + revalidation vs exact sibling key).
 - Stylo walks in tree order; we match canons then hop inherit.
+- `TIME_*` is `traverse_dom` / `recalc_style_at` vs our restyle. Building the slab / parsing the fixture is outside the clock.
 
 A win on this receipt is not “a faster Stylo.”
 

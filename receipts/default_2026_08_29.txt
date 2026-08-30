@@ -1,8 +1,18 @@
-StyleBench default generator (20 001 elements, 5 000 rules).
-Initial restyle only. Sequential both sides. Styles cmp clean.
+StyleBench default generator (20 001 elements, 5 000 rules), then
+official mutation steps (5 × 100 class / attr / leaf). Styles cmp clean
+(disp / pos / w / h / minw / fs / lh / fw / vis / color / bg).
+Live after mutations: 20 002. Wall clock. Machine: Apple M5.
 
-  stylo  release, pool=None     72.108 ms
-  cc     ccc -O, nested match  999.070 ms
+  stylo  release, STYLE_THREAD_POOL (6), sharing on
+         TIME_MS=30.685  TIME_MUT_MS=673.291
+  stylo  release, STYLE_THREAD_POOL (6), sharing off
+         TIME_MS=45.341  TIME_MUT_MS=1098.548
+  cc     ccc -O, sibling canons + specified @parallel + serial inherit
+         TIME_MS=22.793  TIME_MUT_MS=299.924
+         TIME_LEVELS=0.308  TIME_SHARE=2.334  TIME_MATCH=19.978
+         TIME_INHERIT=0.173  LAST_MATCH=10.797  canons=12854
 
-Not StyleBench-in-a-browser (no layout, no mutations).
-Not Stylo+Rayon. Not a CC parallel walk.
+TIME_MS is first restyle. TIME_MUT_MS is the 25 restyles after each
+mutation batch (no Stylo snapshot invalidation).
+
+Not StyleBench-in-a-browser (no layout). README “Fairness.”

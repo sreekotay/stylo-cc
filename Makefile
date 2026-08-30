@@ -41,7 +41,7 @@ compare: stylo-run cc-run
 	@echo OK
 	@grep '^# TIME' $(RECEIPTS)/tiny.stylo.txt $(RECEIPTS)/tiny.cc.txt
 
-# Initial restyle only (no class/leaf mutations yet). Sequential both sides.
+# First restyle + StyleBench mutation steps (class / attr / leaf), then cmp.
 bench-style: fixture-default
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --release --manifest-path stylo-runner/Cargo.toml -- \

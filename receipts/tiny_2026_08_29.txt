@@ -1,9 +1,13 @@
 tiny StyleBench suite (81 elements, 40 rules), 2026-08-29
 
-  stylo  TIME_MS ~ debug build, not a number
-  cc     sequential
+  1 × 8 class / attr / leaf mutations, restyle after each batch.
+  Computed background-color: 81/81 match after mutations.
 
-Computed background-color: 81/81 match.
+  stylo  release, STYLE_THREAD_POOL (6)    TIME_MS=0.478  TIME_MUT_MS=0.729
+  cc     ccc run (not -O)                  TIME_MS=0.367  TIME_MUT_MS=0.874
+
+`make compare` uses a debug Stylo build; those TIME_* lines are not
+the recorded numbers.
 
 Earlier 80/81 miss was the fixture parser treating `#testroot` / `#id0`
 as comments (`#` + ident is CSS). Comments are only `# ` (hash + space).

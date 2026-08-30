@@ -29,7 +29,7 @@ use style::values::computed::Display;
 use style::values::{AtomIdent, AtomString};
 use style::{Atom, LocalName, Namespace};
 use style::servo_arc::{Arc, ArcBorrow};
-use stylebench_fixture::Fixture;
+use stylebench_fixture::{Fixture, Mut};
 use web_atoms::{ns, LocalName as WebLocalName, Namespace as WebNs};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,6 +77,7 @@ struct Slot {
     children_to_process: AtomicIsize,
     selector_flags: Cell<ElementSelectorFlags>,
     handled_snapshot: Cell<bool>,
+    dead: Cell<bool>,
 }
 
 pub struct HostDoc {
@@ -87,7 +88,7 @@ pub struct HostDoc {
 impl HostDoc {
     pub fn from_fixture(fix: &Fixture) -> Box<Self> {
         let html_ns: WebNs = ns!(html);
-        let mut slots = Vec::with_capacity(fix.nodes.len() + 1);
+        let mut slots = Vec::with_capacity(fix.nodes.len() + 1 + fix.leaf_adds());
         slots.push(Slot {
             doc: std::ptr::null(),
             id: 0,
@@ -107,6 +108,7 @@ impl HostDoc {
             children_to_process: AtomicIsize::new(0),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
             handled_snapshot: Cell::new(true),
+            dead: Cell::new(false),
         });
         for n in &fix.nodes {
             let parent = if n.parent < 0 {
@@ -139,6 +141,7 @@ impl HostDoc {
                 children_to_process: AtomicIsize::new(0),
                 selector_flags: Cell::new(ElementSelectorFlags::empty()),
                 handled_snapshot: Cell::new(true),
+                dead: Cell::new(false),
             });
         }
         for i in 1..slots.len() {
@@ -172,8 +175,192 @@ impl HostDoc {
 
     pub fn each_element(&self, mut f: impl FnMut(Elem)) {
         for id in 1..self.slots.len() {
+            if self.slots[id].dead.get() {
+                continue;
+            }
             f(Elem(Node(&self.slots[id])));
         }
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.slots[1..].iter().filter(|s| !s.dead.get()).count()
+    }
+
+    fn fixture_slot(&mut self, id: i32) -> Option<&mut Slot> {
+        let i = (id as u32).checked_add(1)? as usize;
+        self.slots.get_mut(i)
+    }
+
+    pub fn dirty_all(&self) {
+        for s in &self.slots[1..] {
+            if s.dead.get() {
+                continue;
+            }
+            s.data.borrow_mut().hint = RestyleHint::restyle_subtree();
+            s.dirty_descendants.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn apply_mut(&mut self, m: &Mut) {
+        match m {
+            Mut::AddClass { id, class } => {
+                if let Some(s) = self.fixture_slot(*id) {
+                    let atom = AtomIdent::from(&**class);
+                    if !s.classes.iter().any(|c| c == &atom) {
+                        s.classes.push(atom);
+                    }
+                }
+            }
+            Mut::RemoveClass { id } => {
+                if let Some(s) = self.fixture_slot(*id) {
+                    if !s.classes.is_empty() {
+                        s.classes.remove(0);
+                    }
+                }
+            }
+            Mut::SetAttr { id, name, value } => {
+                if let Some(s) = self.fixture_slot(*id) {
+                    let ln = WebLocalName::from(&**name);
+                    if let Some(a) = s.attrs.iter_mut().find(|(n, _)| n == &ln) {
+                        a.1 = value.clone();
+                    } else {
+                        s.attrs.push((ln, value.clone()));
+                    }
+                }
+            }
+            Mut::RemoveAttr { id, name } => {
+                if let Some(s) = self.fixture_slot(*id) {
+                    let ln = WebLocalName::from(&**name);
+                    s.attrs.retain(|(n, _)| n != &ln);
+                }
+            }
+            Mut::AddLeaf {
+                id,
+                parent,
+                at,
+                tag,
+                dom_id,
+                classes,
+                attrs,
+            } => {
+                self.add_leaf(*id, *parent, *at, tag, dom_id.as_deref(), classes, attrs);
+            }
+            Mut::RemoveLeaf { id } => self.remove_leaf(*id),
+            Mut::Restyle => {}
+        }
+    }
+
+    fn add_leaf(
+        &mut self,
+        id: i32,
+        parent: i32,
+        at: i32,
+        tag: &str,
+        dom_id: Option<&str>,
+        classes: &[String],
+        attrs: &[stylebench_fixture::Attr],
+    ) {
+        let html_ns: WebNs = ns!(html);
+        let parent_slot = (parent as u32) + 1;
+        let new_id = (id as u32) + 1;
+        if new_id as usize != self.slots.len() {
+            return;
+        }
+        let data = ElementDataWrapper::default();
+        data.borrow_mut().hint = RestyleHint::restyle_subtree();
+        self.slots.push(Slot {
+            doc: std::ptr::null(),
+            id: new_id,
+            kind: Kind::Element,
+            parent: Some(parent_slot),
+            first_child: None,
+            last_child: None,
+            next: None,
+            prev: None,
+            tag: WebLocalName::from(tag),
+            ns: html_ns,
+            dom_id: dom_id.map(Atom::from),
+            classes: classes.iter().map(|c| AtomIdent::from(&**c)).collect(),
+            attrs: attrs
+                .iter()
+                .map(|a| (WebLocalName::from(&*a.name), a.value.clone()))
+                .collect(),
+            data,
+            dirty_descendants: AtomicBool::new(true),
+            children_to_process: AtomicIsize::new(0),
+            selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            handled_snapshot: Cell::new(true),
+            dead: Cell::new(false),
+        });
+        let doc_ptr = &*self as *const HostDoc;
+        self.slots[new_id as usize].doc = doc_ptr;
+        self.insert_child(parent_slot, at as usize, new_id);
+    }
+
+    fn live_kids(&self, parent: u32) -> Vec<u32> {
+        let mut kids = Vec::new();
+        let mut n = self.slots[parent as usize].first_child;
+        while let Some(id) = n {
+            if !self.slots[id as usize].dead.get() {
+                kids.push(id);
+            }
+            n = self.slots[id as usize].next;
+        }
+        kids
+    }
+
+    fn insert_child(&mut self, parent: u32, at: usize, child: u32) {
+        let kids = self.live_kids(parent);
+        if let Some(&before) = kids.get(at) {
+            let prev = self.slots[before as usize].prev;
+            self.slots[child as usize].parent = Some(parent);
+            self.slots[child as usize].next = Some(before);
+            self.slots[child as usize].prev = prev;
+            self.slots[before as usize].prev = Some(child);
+            if let Some(p) = prev {
+                self.slots[p as usize].next = Some(child);
+            } else {
+                self.slots[parent as usize].first_child = Some(child);
+            }
+        } else {
+            let last = self.slots[parent as usize].last_child;
+            self.slots[child as usize].parent = Some(parent);
+            self.slots[child as usize].prev = last;
+            self.slots[child as usize].next = None;
+            if let Some(l) = last {
+                self.slots[l as usize].next = Some(child);
+            } else {
+                self.slots[parent as usize].first_child = Some(child);
+            }
+            self.slots[parent as usize].last_child = Some(child);
+        }
+    }
+
+    fn remove_leaf(&mut self, id: i32) {
+        let slot_id = (id as u32) + 1;
+        if slot_id as usize >= self.slots.len() {
+            return;
+        }
+        let parent = self.slots[slot_id as usize].parent;
+        let prev = self.slots[slot_id as usize].prev;
+        let next = self.slots[slot_id as usize].next;
+        if let Some(p) = prev {
+            self.slots[p as usize].next = next;
+        } else if let Some(par) = parent {
+            self.slots[par as usize].first_child = next;
+        }
+        if let Some(n) = next {
+            self.slots[n as usize].prev = prev;
+        } else if let Some(par) = parent {
+            self.slots[par as usize].last_child = prev;
+        }
+        let s = &mut self.slots[slot_id as usize];
+        s.dead.set(true);
+        s.parent = None;
+        s.prev = None;
+        s.next = None;
+        s.first_child = None;
+        s.last_child = None;
     }
 }
 
@@ -244,7 +431,7 @@ impl TNode for Node {
         Doc(self.at(0))
     }
     fn is_in_document(&self) -> bool {
-        true
+        !self.slot().dead.get()
     }
     fn traversal_parent(&self) -> Option<Elem> {
         self.parent_element()

@@ -33,7 +33,8 @@ use style::values::computed::font::GenericFontFamily;
 use style::values::specified::font::QueryFontMetricsFlags;
 use style::Atom;
 use style::servo_arc::Arc;
-use stylebench_fixture::Fixture;
+use style_traits::ToCss;
+use stylebench_fixture::{Fixture, Mut};
 
 #[derive(Debug)]
 struct DummyFonts;
@@ -130,7 +131,7 @@ fn main() {
     let text = fs::read_to_string(&path).expect("read fixture");
     let fix = Fixture::parse(&text).expect("parse fixture");
 
-    let doc = HostDoc::from_fixture(&fix);
+    let mut doc = HostDoc::from_fixture(&fix);
     let lock = doc.lock().clone();
 
     let defaults = ComputedValues::initial_values_with_font_override(
@@ -163,10 +164,7 @@ fn main() {
     let shared = SharedStyleContext {
         stylist: &stylist,
         visited_styles_enabled: false,
-        options: StyleSystemOptions {
-            disable_style_sharing_cache: true,
-            ..StyleSystemOptions::default()
-        },
+        options: StyleSystemOptions::default(),
         guards: StylesheetGuards::same(&guard),
         current_time_for_animations: 0.0,
         traversal_flags: TraversalFlags::empty(),
@@ -186,8 +184,31 @@ fn main() {
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    let mut mut_ms = 0.0;
+    let mut pending = false;
+    for m in &fix.mutations {
+        if matches!(m, Mut::Restyle) {
+            if pending {
+                doc.dirty_all();
+                let token = Recalc::pre_traverse(doc.root_elem(), traversal.shared_context());
+                let t1 = Instant::now();
+                if token.should_traverse() {
+                    driver::traverse_dom(&traversal, token, pool.as_ref());
+                }
+                mut_ms += t1.elapsed().as_secs_f64() * 1000.0;
+                pending = false;
+            }
+        } else {
+            doc.apply_mut(m);
+            pending = true;
+        }
+    }
+
     println!("# runner=stylo fixture={path} threads={threads}");
-    println!("# TIME_MS={ms:.3} elements={}", fix.nodes.len());
+    println!(
+        "# TIME_MS={ms:.3} TIME_MUT_MS={mut_ms:.3} elements={}",
+        doc.live_count()
+    );
     doc.each_element(|el| {
         let data = el.borrow_data().expect("styled");
         let Some(style) = data.styles.get_primary() else {
@@ -200,10 +221,20 @@ fn main() {
             .map(|a| a.as_ref())
             .unwrap_or("-");
         println!(
-            "{}\t{}\tid={}\tbg={r},{g},{b},{a}",
+            "{}\t{}\tid={}\tdisp={}\tpos={}\tw={}\th={}\tminw={}\tfs={}\tlh={}\tfw={}\tvis={}\tcolor={}\tbg={r},{g},{b},{a}",
             el.0.debug_id() - 1,
             el.local_name(),
-            id
+            id,
+            style.clone_display().to_css_string(),
+            style.clone_position().to_css_string(),
+            style.clone_width().to_css_string(),
+            style.clone_height().to_css_string(),
+            style.clone_min_width().to_css_string(),
+            style.clone_font_size().to_css_string(),
+            style.clone_line_height().to_css_string(),
+            style.clone_font_weight().to_css_string(),
+            style.clone_visibility().to_css_string(),
+            style.clone_color().to_css_string(),
         );
     });
 }

@@ -80,6 +80,9 @@ pub struct Config {
     pub repeating_sequence_maximum_length: i32,
     pub style_seed: i32,
     pub dom_seed: i32,
+    pub leaf_mutation_chance: f64,
+    pub step_count: i32,
+    pub mutations_per_step: i32,
 }
 
 impl Config {
@@ -111,6 +114,9 @@ impl Config {
             repeating_sequence_maximum_length: 3,
             style_seed: 1,
             dom_seed: 2,
+            leaf_mutation_chance: 0.1,
+            step_count: 5,
+            mutations_per_step: 100,
         }
     }
 
@@ -126,6 +132,8 @@ impl Config {
         c.element_count = 80;
         c.maximum_tree_depth = 4;
         c.maximum_tree_width = 8;
+        c.step_count = 1;
+        c.mutations_per_step = 8;
         c
     }
 }
@@ -146,11 +154,31 @@ pub struct Node {
 }
 
 #[derive(Clone, Debug)]
+pub enum Mut {
+    AddClass { id: i32, class: String },
+    RemoveClass { id: i32 },
+    SetAttr { id: i32, name: String, value: String },
+    RemoveAttr { id: i32, name: String },
+    AddLeaf {
+        id: i32,
+        parent: i32,
+        at: i32,
+        tag: String,
+        dom_id: Option<String>,
+        classes: Vec<String>,
+        attrs: Vec<Attr>,
+    },
+    RemoveLeaf { id: i32 },
+    Restyle,
+}
+
+#[derive(Clone, Debug)]
 pub struct Fixture {
     pub config: Config,
     pub base_css: String,
     pub css: String,
     pub nodes: Vec<Node>,
+    pub mutations: Vec<Mut>,
 }
 
 pub const BASE_CSS: &str = "\
@@ -170,15 +198,15 @@ pub fn generate(config: Config) -> Fixture {
         let mut rng = Random::new(config.style_seed);
         make_stylesheet(&config, &mut rng, config.rule_count)
     };
-    let nodes = {
-        let mut rng = Random::new(config.dom_seed);
-        make_tree(&config, &mut rng)
-    };
+    let mut rng = Random::new(config.dom_seed);
+    let nodes = make_tree(&config, &mut rng);
+    let mutations = generate_mutations(&config, &mut rng, &nodes);
     Fixture {
         config,
         base_css: BASE_CSS.to_string(),
         css,
         nodes,
+        mutations,
     }
 }
 
@@ -456,7 +484,239 @@ fn make_tree_with_depth(
     }
 }
 
+fn next_dom_id_count(nodes: &[Node]) -> i32 {
+    let mut max = -1i32;
+    for n in nodes {
+        if let Some(id) = &n.dom_id {
+            if let Some(rest) = id.strip_prefix("id") {
+                if let Ok(v) = rest.parse::<i32>() {
+                    max = max.max(v);
+                }
+            }
+        }
+    }
+    max + 1
+}
+
+fn live_child(children: &[Vec<usize>], dead: &[bool], i: usize) -> bool {
+    children[i].iter().any(|&c| !dead[c])
+}
+
+fn tree_order(children: &[Vec<usize>], dead: &[bool]) -> Vec<usize> {
+    let mut out = Vec::new();
+    fn walk(i: usize, children: &[Vec<usize>], dead: &[bool], out: &mut Vec<usize>) {
+        if i != 0 && !dead[i] {
+            out.push(i);
+        }
+        for &c in &children[i] {
+            if !dead[c] {
+                walk(c, children, dead, out);
+            }
+        }
+    }
+    walk(0, children, dead, &mut out);
+    out
+}
+
+/// StyleBench `makeSteps`: same LCG as the tree, same skip rules.
+fn generate_mutations(cfg: &Config, rng: &mut Random, initial: &[Node]) -> Vec<Mut> {
+    let mut nodes = initial.to_vec();
+    let mut dead = vec![false; nodes.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, n) in nodes.iter().enumerate() {
+        if n.parent >= 0 {
+            children[n.parent as usize].push(i);
+        }
+    }
+    let mut id_count = next_dom_id_count(&nodes);
+    let mut live = tree_order(&children, &dead);
+    let mut out = Vec::new();
+
+    let pick = |rng: &mut Random, live: &[usize]| -> Option<usize> {
+        if live.is_empty() {
+            return None;
+        }
+        Some(live[rng.number(live.len() as i32) as usize])
+    };
+
+    for _ in 0..cfg.step_count {
+        let mut n = 0;
+        while n < cfg.mutations_per_step {
+            let Some(i) = pick(rng, &live) else { break };
+            if !live_child(&children, &dead, i) && !rng.chance(cfg.leaf_mutation_chance) {
+                continue;
+            }
+            let class = random_class_name(cfg, rng);
+            if !nodes[i].classes.iter().any(|c| c == &class) {
+                nodes[i].classes.push(class.clone());
+            }
+            out.push(Mut::AddClass {
+                id: i as i32,
+                class,
+            });
+            n += 1;
+        }
+        out.push(Mut::Restyle);
+
+        n = 0;
+        while n < cfg.mutations_per_step {
+            let Some(i) = pick(rng, &live) else { break };
+            if !live_child(&children, &dead, i) && !rng.chance(cfg.leaf_mutation_chance) {
+                continue;
+            }
+            if nodes[i].classes.is_empty() {
+                continue;
+            }
+            nodes[i].classes.remove(0);
+            out.push(Mut::RemoveClass { id: i as i32 });
+            n += 1;
+        }
+        out.push(Mut::Restyle);
+
+        n = 0;
+        while n < cfg.mutations_per_step {
+            let Some(i) = pick(rng, &live) else { break };
+            if !live_child(&children, &dead, i) && !rng.chance(cfg.leaf_mutation_chance) {
+                continue;
+            }
+            let mut names: Vec<String> = Vec::new();
+            if !nodes[i].classes.is_empty() {
+                names.push("class".into());
+            }
+            for a in &nodes[i].attrs {
+                names.push(a.name.clone());
+            }
+            if nodes[i].dom_id.is_some() {
+                names.push("id".into());
+            }
+            let mut mutated = false;
+            for name in names {
+                if name == "class" || name == "id" {
+                    continue;
+                }
+                if rng.chance(0.5) {
+                    nodes[i].attrs.retain(|a| a.name != name);
+                    out.push(Mut::RemoveAttr {
+                        id: i as i32,
+                        name,
+                    });
+                } else {
+                    let value = random_attribute_value(cfg, rng);
+                    if let Some(a) = nodes[i].attrs.iter_mut().find(|a| a.name == name) {
+                        a.value = value.clone();
+                    }
+                    out.push(Mut::SetAttr {
+                        id: i as i32,
+                        name,
+                        value,
+                    });
+                }
+                mutated = true;
+            }
+            if !mutated {
+                let count = rng.number(cfg.element_maximum_attributes) + 1;
+                for _ in 0..count {
+                    let name = random_attribute_name(cfg, rng);
+                    let value = random_attribute_value(cfg, rng);
+                    if let Some(a) = nodes[i].attrs.iter_mut().find(|a| a.name == name) {
+                        a.value = value.clone();
+                    } else {
+                        nodes[i].attrs.push(Attr {
+                            name: name.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                    out.push(Mut::SetAttr {
+                        id: i as i32,
+                        name,
+                        value,
+                    });
+                }
+            }
+            n += 1;
+        }
+        out.push(Mut::Restyle);
+
+        n = 0;
+        while n < cfg.mutations_per_step {
+            let Some(p) = pick(rng, &live) else { break };
+            if !live_child(&children, &dead, p) {
+                continue;
+            }
+            let at = rng.number(children[p].iter().filter(|&&c| !dead[c]).count() as i32 + 1);
+            let mut el = make_element(cfg, rng, &mut id_count);
+            el.parent = p as i32;
+            let id = nodes.len() as i32;
+            nodes.push(el.clone());
+            dead.push(false);
+            children.push(Vec::new());
+            let live_kids: Vec<usize> = children[p].iter().copied().filter(|&c| !dead[c]).collect();
+            let insert_at = at as usize;
+            if insert_at >= live_kids.len() {
+                children[p].push(id as usize);
+            } else {
+                let before = live_kids[insert_at];
+                let pos = children[p].iter().position(|&c| c == before).unwrap();
+                children[p].insert(pos, id as usize);
+            }
+            out.push(Mut::AddLeaf {
+                id,
+                parent: p as i32,
+                at,
+                tag: el.tag,
+                dom_id: el.dom_id,
+                classes: el.classes,
+                attrs: el.attrs,
+            });
+            n += 1;
+        }
+        live = tree_order(&children, &dead);
+        out.push(Mut::Restyle);
+
+        n = 0;
+        while n < cfg.mutations_per_step {
+            let Some(i) = pick(rng, &live) else { break };
+            if live_child(&children, &dead, i) {
+                continue;
+            }
+            if nodes[i].parent < 0 {
+                continue;
+            }
+            let p = nodes[i].parent as usize;
+            children[p].retain(|&c| c != i);
+            dead[i] = true;
+            out.push(Mut::RemoveLeaf { id: i as i32 });
+            n += 1;
+        }
+        live = tree_order(&children, &dead);
+        out.push(Mut::Restyle);
+    }
+    out
+}
+
+fn fmt_classes(classes: &[String]) -> String {
+    classes.join(",")
+}
+
+fn fmt_attrs(attrs: &[Attr]) -> String {
+    let mut s = String::new();
+    for (k, a) in attrs.iter().enumerate() {
+        if k > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{}={}", a.name, a.value);
+    }
+    s
+}
+
 impl Fixture {
+    pub fn leaf_adds(&self) -> usize {
+        self.mutations
+            .iter()
+            .filter(|m| matches!(m, Mut::AddLeaf { .. }))
+            .count()
+    }
+
     pub fn write(&self, mut out: impl Write) -> io::Result<()> {
         writeln!(out, "# stylebench-fixture 1")?;
         writeln!(
@@ -478,20 +738,6 @@ impl Fixture {
         }
         writeln!(out, "---tree---")?;
         for (i, n) in self.nodes.iter().enumerate() {
-            let mut classes = String::new();
-            for (k, c) in n.classes.iter().enumerate() {
-                if k > 0 {
-                    classes.push(',');
-                }
-                classes.push_str(c);
-            }
-            let mut attrs = String::new();
-            for (k, a) in n.attrs.iter().enumerate() {
-                if k > 0 {
-                    attrs.push(',');
-                }
-                let _ = write!(attrs, "{}={}", a.name, a.value);
-            }
             writeln!(
                 out,
                 "{}\t{}\t{}\t{}\t{}\t{}",
@@ -499,9 +745,37 @@ impl Fixture {
                 n.parent,
                 n.tag,
                 n.dom_id.as_deref().unwrap_or("-"),
-                classes,
-                attrs
+                fmt_classes(&n.classes),
+                fmt_attrs(&n.attrs)
             )?;
+        }
+        writeln!(out, "---mut---")?;
+        for m in &self.mutations {
+            match m {
+                Mut::AddClass { id, class } => writeln!(out, "+class\t{id}\t{class}")?,
+                Mut::RemoveClass { id } => writeln!(out, "-class\t{id}")?,
+                Mut::SetAttr { id, name, value } => {
+                    writeln!(out, "+attr\t{id}\t{name}={value}")?
+                }
+                Mut::RemoveAttr { id, name } => writeln!(out, "-attr\t{id}\t{name}")?,
+                Mut::AddLeaf {
+                    id,
+                    parent,
+                    at,
+                    tag,
+                    dom_id,
+                    classes,
+                    attrs,
+                } => writeln!(
+                    out,
+                    "+leaf\t{id}\t{parent}\t{at}\t{tag}\t{}\t{}\t{}",
+                    dom_id.as_deref().unwrap_or("-"),
+                    fmt_classes(classes),
+                    fmt_attrs(attrs)
+                )?,
+                Mut::RemoveLeaf { id } => writeln!(out, "-leaf\t{id}")?,
+                Mut::Restyle => writeln!(out, "restyle")?,
+            }
         }
         Ok(())
     }
@@ -511,6 +785,7 @@ impl Fixture {
         let mut base = String::new();
         let mut css = String::new();
         let mut nodes = Vec::new();
+        let mut mutations = Vec::new();
         let mut name = "parsed".to_string();
         for line in text.lines() {
             // Fixture comments are `# …` (hash + space). `#testroot` / `#id0` are CSS.
@@ -531,6 +806,10 @@ impl Fixture {
                 }
                 "---tree---" => {
                     section = "tree";
+                    continue;
+                }
+                "---mut---" => {
+                    section = "mut";
                     continue;
                 }
                 _ => {}
@@ -578,6 +857,12 @@ impl Fixture {
                         attrs,
                     });
                 }
+                "mut" => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    mutations.push(parse_mut_line(line)?);
+                }
                 _ => {}
             }
         }
@@ -592,6 +877,83 @@ impl Fixture {
             base_css: base,
             css,
             nodes,
+            mutations,
         })
+    }
+}
+
+fn parse_classes(cell: &str) -> Vec<String> {
+    if cell.is_empty() {
+        Vec::new()
+    } else {
+        cell.split(',').map(|s| s.to_string()).collect()
+    }
+}
+
+fn parse_attrs(cell: &str) -> Vec<Attr> {
+    let mut attrs = Vec::new();
+    if cell.is_empty() {
+        return attrs;
+    }
+    for pair in cell.split(',') {
+        let (n, v) = pair.split_once('=').unwrap_or((pair, ""));
+        attrs.push(Attr {
+            name: n.to_string(),
+            value: v.to_string(),
+        });
+    }
+    attrs
+}
+
+fn parse_mut_line(line: &str) -> Result<Mut, String> {
+    if line == "restyle" {
+        return Ok(Mut::Restyle);
+    }
+    let cols: Vec<&str> = line.split('\t').collect();
+    match cols[0] {
+        "+class" if cols.len() >= 3 => Ok(Mut::AddClass {
+            id: cols[1].parse().map_err(|_| "id")?,
+            class: cols[2].to_string(),
+        }),
+        "-class" if cols.len() >= 2 => Ok(Mut::RemoveClass {
+            id: cols[1].parse().map_err(|_| "id")?,
+        }),
+        "+attr" if cols.len() >= 3 => {
+            let (name, value) = cols[2].split_once('=').unwrap_or((cols[2], ""));
+            Ok(Mut::SetAttr {
+                id: cols[1].parse().map_err(|_| "id")?,
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+        }
+        "-attr" if cols.len() >= 3 => Ok(Mut::RemoveAttr {
+            id: cols[1].parse().map_err(|_| "id")?,
+            name: cols[2].to_string(),
+        }),
+        "+leaf" if cols.len() >= 6 => Ok(Mut::AddLeaf {
+            id: cols[1].parse().map_err(|_| "id")?,
+            parent: cols[2].parse().map_err(|_| "parent")?,
+            at: cols[3].parse().map_err(|_| "at")?,
+            tag: cols[4].to_string(),
+            dom_id: if cols[5] == "-" {
+                None
+            } else {
+                Some(cols[5].to_string())
+            },
+            classes: if cols.len() > 6 {
+                parse_classes(cols[6])
+            } else {
+                Vec::new()
+            },
+            attrs: if cols.len() > 7 {
+                parse_attrs(cols[7])
+            } else {
+                Vec::new()
+            },
+        }),
+        "-leaf" if cols.len() >= 2 => Ok(Mut::RemoveLeaf {
+            id: cols[1].parse().map_err(|_| "id")?,
+        }),
+        _ => Err(format!("bad mut line: {line}")),
     }
 }

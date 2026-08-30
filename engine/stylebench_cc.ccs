@@ -1,9 +1,10 @@
 #!ccc ccs
 /*
- * Sequential StyleBench restyle. Same fixture as stylo-runner.
+ * StyleBench restyle. Same fixture as stylo-runner.
  * Frame: @grammar + arena views. Packed compounds; subject maps;
  * tokens interned at fill (owned pool, pointer eq); ancestor bloom +
  * inverted parent>* and (subject, left) pair maps; match_from on the join.
+ * Nodes are independent — @parallel for over the node index.
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/script/stdio.cch>
@@ -766,35 +767,47 @@ static void Engine_apply_pairs(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[
     e->apply_pairs_other(i, n, m, n->tag, other);
 }
 
-static void Engine_style_all(Engine* e) {
-    for (int i = 0; i < e->nnodes; i++) {
-        Node* n = &e->nodes[i];
-        if (n->dom_id.len)
-            e->apply_bucket(i, n, e->by_id, n->dom_id);
-        for (int c = 0; c < n->nclass; c++)
-            e->apply_bucket(i, n, e->by_class, n->classes[c]);
-        e->apply_bucket(i, n, e->by_type, n->tag);
-        if (n->parent >= 0) {
-            Node* par = &e->nodes[n->parent];
-            if (par->dom_id.len)
-                e->apply_bucket(i, n, e->by_parent_id, par->dom_id);
-            for (int c = 0; c < par->nclass; c++)
-                e->apply_bucket(i, n, e->by_parent_class, par->classes[c]);
-            e->apply_bucket(i, n, e->by_parent_type, par->tag);
-            e->apply_pairs(i, n, e->child_pairs, par);
-            int p = par->parent;
-            while (p >= 0) {
-                e->apply_pairs(i, n, e->desc_pairs, &e->nodes[p]);
-                p = e->nodes[p].parent;
-            }
-            e->apply_pairs(i, n, e->desc_pairs, par);
+static void Engine_style_one(Engine* e, int i) {
+    Node* n = &e->nodes[i];
+    if (n->dom_id.len)
+        e->apply_bucket(i, n, e->by_id, n->dom_id);
+    for (int c = 0; c < n->nclass; c++)
+        e->apply_bucket(i, n, e->by_class, n->classes[c]);
+    e->apply_bucket(i, n, e->by_type, n->tag);
+    if (n->parent >= 0) {
+        Node* par = &e->nodes[n->parent];
+        if (par->dom_id.len)
+            e->apply_bucket(i, n, e->by_parent_id, par->dom_id);
+        for (int c = 0; c < par->nclass; c++)
+            e->apply_bucket(i, n, e->by_parent_class, par->classes[c]);
+        e->apply_bucket(i, n, e->by_parent_type, par->tag);
+        e->apply_pairs(i, n, e->child_pairs, par);
+        int p = par->parent;
+        while (p >= 0) {
+            e->apply_pairs(i, n, e->desc_pairs, &e->nodes[p]);
+            p = e->nodes[p].parent;
         }
-        Vec::[int]* u = &e->universal;
-        if (u->data) {
-            for (size_t j = 0; j < u->len; j++)
-                e->apply_rule(i, n, u->data[j]);
-        }
+        e->apply_pairs(i, n, e->desc_pairs, par);
     }
+    Vec::[int]* u = &e->universal;
+    if (u->data) {
+        for (size_t j = 0; j < u->len; j++)
+            e->apply_rule(i, n, u->data[j]);
+    }
+}
+
+static void !>(CCError) Engine_style_all(Engine* eng) {
+    int n = eng->nnodes;
+    @parallel for (i in 0..n) {
+        eng->style_one(i);
+    } !>.wait()!>;
+    return cc_ok();
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
 int main(int argc, char** argv) {
@@ -811,9 +824,9 @@ int main(int argc, char** argv) {
     eng.store = store;
     eng.load_fixture(text) !>;
 
-    clock_t t0 = clock();
-    eng.style_all();
-    double ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
+    double t0 = now_ms();
+    eng.style_all() !>;
+    double ms = now_ms() - t0;
 
     io.println(@string(`# runner=cc fixture=${path}`, @scratch)) !>;
     io.println(@string(`# TIME_MS=${ms} elements=${eng.nnodes}`, @scratch)) !>;

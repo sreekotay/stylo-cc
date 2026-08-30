@@ -14,6 +14,7 @@ use style::context::{
 use style::device::Device;
 use style::driver;
 use style::font_metrics::FontMetrics;
+use style::global_style_data::STYLE_THREAD_POOL;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::queries::values::PrefersColorScheme;
@@ -177,13 +178,15 @@ fn main() {
     let root = doc.root_elem();
     let token = Recalc::pre_traverse(root, traversal.shared_context());
 
+    let threads = STYLE_THREAD_POOL.num_threads.unwrap_or(1);
+    let pool = STYLE_THREAD_POOL.pool();
     let t0 = Instant::now();
     if token.should_traverse() {
-        driver::traverse_dom(&traversal, token, None);
+        driver::traverse_dom(&traversal, token, pool.as_ref());
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    println!("# runner=stylo fixture={path}");
+    println!("# runner=stylo fixture={path} threads={threads}");
     println!("# TIME_MS={ms:.3} elements={}", fix.nodes.len());
     doc.each_element(|el| {
         let data = el.borrow_data().expect("styled");

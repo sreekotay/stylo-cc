@@ -1,0 +1,18 @@
+# servo/stylo cargo test --release --workspace
+# Date: 2026-08-29
+# Machine: Apple M5
+# rustc: rustc 1.98.0 (88d9e12ae 2026-08-18)
+# stylo: b3e6425 (Enable `touch-action` (#439))
+# Method: first release-test after `cargo build --release --features servo`
+#         (includes some crate rebuild for the test profile)
+
+result: 25 unit tests passed (selectors 13, style 8, servo_arc 3, prefs 1)
+        0 failed; 3 doctests ignored
+
+real 16.08
+user 32.43
+sys  1.80
+
+Note: this repo has no [[bench]] targets. The number is "does CI's
+test suite still pass in release," not a restyle benchmark. A parse /
+cascade harness comes next.

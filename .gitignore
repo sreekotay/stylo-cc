@@ -1,0 +1,9 @@
+target/
+stylo/target/
+out/
+bin/
+.DS_Store
+*.swp
+receipts/*.tmp
+fixtures/*.stylebench
+engine/.cc-lsp-*

@@ -1,0 +1,3 @@
+[submodule "stylo"]
+	path = stylo
+	url = https://github.com/servo/stylo.git

@@ -1,0 +1,10 @@
+; Frozen StyleBench fixture. `# ` is a file comment; `#ident` is CSS (inside a section).
+; Entry: top. Three kept section bodies, borrowed.
+
+top: collect [preamble base_sec css_sec tree_sec]
+preamble: any [file_comment | blank]
+file_comment: [#'#' charset [#' ' #'\t'] any complement charset [#'\n'] #'\n']
+blank: [any charset [#' ' #'\t'] #'\n']
+base_sec: ["---base---" opt #'\n' keep [any [not "---" skip]]]
+css_sec:  ["---css---"  opt #'\n' keep [any [not "---" skip]]]
+tree_sec: ["---tree---" opt #'\n' keep [any skip]]

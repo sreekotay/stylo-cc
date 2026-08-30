@@ -1,0 +1,71 @@
+# StyleBench fixture + two runners. Upstream crate tests stay under stylo/.
+
+STYLO ?= stylo
+CARGO ?= cargo
+RECEIPTS ?= receipts
+FIXTURES ?= fixtures
+CCC ?= ccc
+
+.PHONY: setup fixture fixture-default stylo-run cc-run compare bench-style test build release bench help
+
+help:
+	@echo "fixture         tiny suite (81 / 40) for the compile loop"
+	@echo "fixture-default StyleBench default (20k / 5k)"
+	@echo "compare         tiny: cmp styles"
+	@echo "bench-style     default suite, release Stylo + CC -O, cmp then times"
+	@echo "test            upstream cargo test --workspace"
+
+setup:
+	git submodule update --init --depth 1
+
+fixture: $(STYLO)/Cargo.toml
+	mkdir -p $(FIXTURES)
+	$(CARGO) run -q -p stylebench-gen -- --tiny > $(FIXTURES)/tiny.stylebench
+
+stylo-run: fixture
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny.stylebench > $(RECEIPTS)/tiny.stylo.txt
+
+cc-run: fixture
+	mkdir -p $(RECEIPTS)
+	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny.stylebench > $(RECEIPTS)/tiny.cc.txt
+
+fixture-default: $(STYLO)/Cargo.toml
+	mkdir -p $(FIXTURES)
+	$(CARGO) run -q -p stylebench-gen --release > $(FIXTURES)/default.stylebench
+
+compare: stylo-run cc-run
+	@grep -v '^#' $(RECEIPTS)/tiny.stylo.txt > /tmp/stylo.styles
+	@grep -v '^#' $(RECEIPTS)/tiny.cc.txt > /tmp/cc.styles
+	cmp /tmp/stylo.styles /tmp/cc.styles
+	@echo OK
+	@grep '^# TIME' $(RECEIPTS)/tiny.stylo.txt $(RECEIPTS)/tiny.cc.txt
+
+# Initial restyle only (no class/leaf mutations yet). Sequential both sides.
+bench-style: fixture-default
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --release --manifest-path stylo-runner/Cargo.toml -- \
+		$(FIXTURES)/default.stylebench > $(RECEIPTS)/default.stylo.txt
+	$(CCC) build run -O engine/stylebench_cc.ccs -- \
+		$(FIXTURES)/default.stylebench > $(RECEIPTS)/default.cc.txt
+	@grep -v '^#' $(RECEIPTS)/default.stylo.txt > /tmp/stylo.styles
+	@grep -v '^#' $(RECEIPTS)/default.cc.txt > /tmp/cc.styles
+	cmp /tmp/stylo.styles /tmp/cc.styles
+	@echo OK
+	@grep '^# TIME' $(RECEIPTS)/default.stylo.txt $(RECEIPTS)/default.cc.txt
+
+build: $(STYLO)/Cargo.toml
+	cd $(STYLO) && $(CARGO) build --workspace
+
+test: $(STYLO)/Cargo.toml
+	cd $(STYLO) && $(CARGO) test --workspace
+
+release: $(STYLO)/Cargo.toml
+	cd $(STYLO) && $(CARGO) build --release --features servo
+
+bench: $(STYLO)/Cargo.toml
+	./scripts/upstream.sh bench
+
+$(STYLO)/Cargo.toml:
+	@echo "stylo/ missing — run: git submodule update --init --depth 1" >&2
+	@exit 1

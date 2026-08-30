@@ -1,0 +1,8 @@
+StyleBench default generator (20 001 elements, 5 000 rules).
+Initial restyle only. Sequential both sides. Styles cmp clean.
+
+  stylo  release, pool=None     72.108 ms
+  cc     ccc -O, nested match  999.070 ms
+
+Not StyleBench-in-a-browser (no layout, no mutations).
+Not Stylo+Rayon. Not a CC parallel walk.

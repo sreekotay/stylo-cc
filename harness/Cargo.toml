@@ -1,0 +1,14 @@
+[package]
+name = "stylebench-gen"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "stylebench_fixture"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stylebench-gen"
+path = "src/main.rs"

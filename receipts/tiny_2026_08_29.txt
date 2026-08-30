@@ -1,0 +1,9 @@
+tiny StyleBench suite (81 elements, 40 rules), 2026-08-29
+
+  stylo  TIME_MS ~ debug build, not a number
+  cc     sequential
+
+Computed background-color: 81/81 match.
+
+Earlier 80/81 miss was the fixture parser treating `#testroot` / `#id0`
+as comments (`#` + ident is CSS). Comments are only `# ` (hash + space).

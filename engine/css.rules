@@ -1,0 +1,51 @@
+; StyleBench CSS: Rebol-CSS tokenizer (Oldes) plus a closed sheet.
+; Entry: top. collect interiors / keep leaves — borrowed spans into the source.
+
+top: stylesheet
+stylesheet: collect [any [comment | some wschar | rule]]
+
+wschar: charset [#' ' #'\t' #'\r' #'\n' #'\x0C']
+ws:     any wschar
+
+hexa:     charset [#'0' - #'9' #'a' - #'f' #'A' - #'F']
+notesc:   complement charset [#'0' - #'9' #'a' - #'f' #'A' - #'F' #'\t' #'\n' #'\r' #'\x0C']
+escape:   [#'\\' [notesc | hexa opt hexa opt hexa opt hexa opt hexa opt hexa]]
+nonascii: complement charset [#'\0' - #'\x7F']
+
+nmstart: charset [#'_' #'a' - #'z' #'A' - #'Z']
+nmchar:  charset [#'_' #'a' - #'z' #'A' - #'Z' #'0' - #'9' #'-']
+ident:   [opt #'-' nmstart any [nmchar | nonascii | escape]]
+name:    some [nmchar | nonascii | escape]
+digit:   charset [#'0' - #'9']
+number:  keep [opt [#'+' | #'-'] some digit]
+
+comment: [block_comment | html_comment]
+block_comment: ["/*" any [not "*/" skip] "*/"]
+html_comment:  ["<!--" any [not "-->" skip] "-->"]
+
+dstr: complement charset [#'"' #'\n' #'\r']
+sstr: complement charset [#'\'' #'\n' #'\r']
+string: [[#'"' keep [any [dstr | nonascii | escape]] #'"']
+        | [#'\'' keep [any [sstr | nonascii | escape]] #'\'']]
+
+type_sel:   keep ident
+universal:  keep #'*'
+hash:       [#'#' keep name]
+class:      [#'.' keep ident]
+attr:       collect [#'[' ws keep ident ws opt [#'=' ws attr_val] ws #']']
+attr_val:   [string | keep ident]
+
+compound: collect [
+      [type_sel | universal] any [hash | class | attr]
+    | some [hash | class | attr]
+]
+combinator: keep [any wschar #'>' any wschar | some wschar]
+selector:   collect [compound any [combinator compound]]
+
+prop:      keep ident
+other_val: keep [some complement charset [#';' #'}']]
+rgb:       collect ["rgb" ws #'(' ws number ws #',' ws number ws #',' ws number ws #')']
+decl_val:  [rgb | other_val]
+decl:      collect [prop ws #':' ws decl_val ws opt #';']
+decls:     collect [ws any [decl ws]]
+rule:      collect [selector ws #'{' decls #'}']

@@ -1,0 +1,25 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "stylo-runner"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "stylo-runner"
+path = "src/main.rs"
+
+[dependencies]
+app_units = "0.7"
+euclid = "0.22"
+selectors = { path = "../stylo/selectors" }
+style = { path = "../stylo/style", package = "stylo" }
+style_traits = { path = "../stylo/style_traits", package = "stylo_traits" }
+stylebench_fixture = { path = "../harness", package = "stylebench-gen" }
+stylo_dom = { path = "../stylo/stylo_dom" }
+url = "2"
+web_atoms = "0.2"

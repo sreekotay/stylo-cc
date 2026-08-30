@@ -31,6 +31,7 @@
 #define UNIT_PX    0
 #define UNIT_EM    1
 #define UNIT_PCT   2
+#define UNIT_REM   3
 
 /* Specified values live on the rule. Used on the node is proto pointers
  * (initial / parent / this node's slot). Miss: inherit → parent struct,
@@ -274,7 +275,7 @@ static int cc_map_key_eq_AtomPair(AtomPair a, AtomPair b) {
     return a.subj == b.subj && a.left == b.left;
 }
 
-enum { ORIGIN_UA = 0, ORIGIN_AUTHOR = 1 };
+enum { ORIGIN_UA = 0, ORIGIN_AUTHOR = 1, ORIGIN_STYLE = 2 };
 
 typedef struct {
     int n, sa, sb, sc, order, origin;
@@ -331,7 +332,7 @@ typedef struct {
  * cannot restyle. Same object, narrower names.
  * https://github.com/sreekotay/concurrent-c/blob/main/docs/typehooks-typeviews.md */
 @typeview Match on Engine {
-    r: intern, match_from, apply_rule, apply_bucket, apply_pair,
+    r: intern, match_from, apply_rule, apply_specified, apply_bucket, apply_pair,
        apply_pairs, apply_pairs_other, style_one, inherit_one, paint_levels,
        paint_blooms, copy_specified, own_bg, own_box, own_font, seal_box,
        ident_inline, ident_block, ident_div, ident_static, ident_visible,
@@ -594,6 +595,12 @@ static int parse_fs(CCSlice s, int* out, int* unit) {
         *unit = UNIT_PX;
         return 1;
     }
+    if (i + 3 <= (int)s.len && s.ptr[i] == 'r' && s.ptr[i + 1] == 'e' &&
+        s.ptr[i + 2] == 'm') {
+        *out = v * sign;
+        *unit = UNIT_REM;
+        return 1;
+    }
     if (i + 2 <= (int)s.len && s.ptr[i] == 'e' && s.ptr[i + 1] == 'm') {
         *out = v * sign;
         *unit = UNIT_EM;
@@ -668,8 +675,14 @@ static int parse_fw(CCSlice s, int* out) {
 }
 
 static int cascade_rank(int origin, int imp) {
-    if (imp) return origin == ORIGIN_UA ? 3 : 2;
-    return origin == ORIGIN_UA ? 0 : 1;
+    if (imp) {
+        if (origin == ORIGIN_UA) return 5;
+        if (origin == ORIGIN_STYLE) return 4;
+        return 3;
+    }
+    if (origin == ORIGIN_UA) return 0;
+    if (origin == ORIGIN_STYLE) return 2;
+    return 1;
 }
 
 static int decl_important(CssNode* d, CssNode* val) {
@@ -688,8 +701,8 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
     CssNode* decls = sel ? sel->next(nd) : 0;
     if (!fill_selector(e, sel, r)) return 0;
     if (decls && decls->is_list()) {
-        CssNode* d = decls->first();
-        while (d) {
+    CssNode* d = decls->first();
+    while (d) {
             if (d->is_list()) {
                 CssNode* prop = d->first();
                 CssNode* val = prop ? prop->next(d) : 0;
@@ -1207,10 +1220,7 @@ static void Engine_seal_box(Engine* e, Node* n, int i) {
     if (!(n->specified & (1u << P_position))) b->position = cc_slice_empty();
 }
 
-static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
-    Rule* r = &e->rules[k];
-    if (!r->n || !r->props || !e->match_from(i, r, r->n - 1))
-        return;
+static void Engine_apply_specified(Engine* e, int i, Node* n, Rule* r) {
     @comptime for (f in type_of(StyBg).fields) {
         if ((r->props & (1u << f.index)) && better_prop(r, n, (int)f.index)) {
             e->own_bg(n, i);
@@ -1234,6 +1244,54 @@ static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
             n->win_prop(r, N_BG + N_BOX + (int)f.index);
         }
     }
+}
+
+static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
+    Rule* r = &e->rules[k];
+    if (!r->n || !r->props || !e->match_from(i, r, r->n - 1))
+        return;
+    e->apply_specified(i, n, r);
+}
+
+static int parse_style_decls(Engine* e, Node* n, Rule* r) {
+    const char* p = 0;
+    size_t nlen = 0;
+    for (int a = 0; a < n->nattr; a++) {
+        if (n->attrs[a].name.len == 5 && n->attrs[a].name.ptr &&
+            memcmp(n->attrs[a].name.ptr, "style", 5) == 0) {
+            p = n->attrs[a].value.ptr;
+            nlen = n->attrs[a].value.len;
+            break;
+        }
+    }
+    if (!p || !nlen) return 0;
+    char buf[256];
+    if (nlen + 3 > sizeof(buf)) return 0;
+    buf[0] = 'x';
+    buf[1] = '{';
+    memcpy(buf + 2, p, nlen);
+    buf[nlen + 2] = '}';
+    CssNode* root = Css.parse(buf, nlen + 3, e->store);
+    if (!root) return 0;
+    CssNode* sheet = root->first();
+    if (sheet && sheet->is_list() && sheet->id() == Css_KEEP_stylesheet)
+        root = sheet;
+    if (!root->is_list()) return 0;
+    CssNode* ch = root->first();
+    while (ch) {
+        if (ch->is_list() && ch->id() == Css_KEEP_rule) {
+            if (!fill_rule(e, ch, r)) return 0;
+            r->origin = ORIGIN_STYLE;
+            r->sa = 1;
+            r->sb = 0;
+            r->sc = 0;
+            r->n = 0;
+            r->order = 1 << 20;
+            return 1;
+        }
+        ch = ch->next(root);
+    }
+    return 0;
 }
 
 static void Engine_apply_bucket(Engine* e, int i, Node* n, Map::[CCSlice, Vec::[int]] m, CCSlice key) {
@@ -1363,6 +1421,16 @@ static void Engine_inherit_one(Engine* e, int i) {
             n->used.font->fs_px = src->fs_px * n->fs_spec;
         else if (n->fs_unit == UNIT_PCT)
             n->used.font->fs_px = src->fs_px * n->fs_spec / 100;
+        else if (n->fs_unit == UNIT_REM) {
+            int base = INIT_FS_PX;
+            if (n->parent >= 0) {
+                int ri = n->parent;
+                while (e->nodes[ri].parent >= 0)
+                    ri = e->nodes[ri].parent;
+                base = e->nodes[ri].used.font->fs_px;
+            }
+            n->used.font->fs_px = base * n->fs_spec;
+        }
         if (!(n->specified & (1u << P_lh_px)))
             n->used.font->lh_px = src->lh_px;
         if (!(n->specified & (1u << P_fw)))
@@ -1491,6 +1559,13 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
             m->copy_specified(i, eng->share_of[i]);
     }
     eng->t_match = now_ms() - t0;
+    for (int si = 0; si < eng->nnodes; si++) {
+        if (eng->nodes[si].dead) continue;
+        Rule sr;
+        if (parse_style_decls(eng, &eng->nodes[si], &sr))
+            m->apply_specified(si, &eng->nodes[si], &sr);
+        m->seal_box(&eng->nodes[si], si);
+    }
     t0 = now_ms();
     int maxd = eng->max_depth;
     int hi = (maxd + 1 < 64) ? eng->level_off[maxd + 1] : 0;

@@ -1,0 +1,26 @@
+# stylebench-fixture 1
+# name=style-attr-rem
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#sheet { color: #c00; font-size: 1em; }
+#imp { color: #0f0 !important; }
+#sheetimp { color: #0f0 !important; }
+---tree---
+0	-1	div	testroot		
+1	0	span	sheet		style=color:#00f;font-size:2rem
+2	0	span	imp		style=color:#00f
+3	0	span	rem		style=font-size:2rem
+4	1	span	kid		style=font-size:2rem
+5	1	span	emkid		style=font-size:2em
+6	0	span	sheetimp		style=color:#00f !important
+---mut---

@@ -21,16 +21,38 @@ use style::dom::{
     LayoutIterator, NodeInfo, OpaqueNode, TDocument, TElement, TNode, TShadowRoot,
 };
 use style::invalidation::element::restyle_hints::RestyleHint;
-use style::properties::PropertyDeclarationBlock;
+use style::properties::{parse_style_attribute, PropertyDeclarationBlock};
 use style::selector_parser::{AttrValue, Lang, PseudoElement, RestyleDamage};
 use style::shared_lock::{Locked, SharedRwLock};
+use style::stylesheets::{CssRuleType, UrlExtraData};
 use style::stylist::CascadeData;
 use style::values::computed::Display;
 use style::values::{AtomIdent, AtomString};
 use style::{Atom, LocalName, Namespace};
 use style::servo_arc::{Arc, ArcBorrow};
 use stylebench_fixture::{Fixture, Mut};
+use url::Url;
 use web_atoms::{ns, LocalName as WebLocalName, Namespace as WebNs};
+
+fn parse_inline_style(
+    attrs: &[(WebLocalName, String)],
+    lock: &SharedRwLock,
+) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
+    let style_name = WebLocalName::from("style");
+    let value = attrs.iter().find(|(n, _)| n == &style_name)?.1.as_str();
+    if value.is_empty() {
+        return None;
+    }
+    let url = UrlExtraData(Arc::new(Url::parse("about:blank").unwrap()));
+    let pdb = parse_style_attribute(
+        value,
+        &url,
+        None,
+        QuirksMode::NoQuirks,
+        CssRuleType::Style,
+    );
+    Some(Arc::new(lock.wrap(pdb)))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoShadow;
@@ -72,6 +94,7 @@ struct Slot {
     dom_id: Option<Atom>,
     classes: Vec<AtomIdent>,
     attrs: Vec<(WebLocalName, String)>,
+    style_attr: Option<Arc<Locked<PropertyDeclarationBlock>>>,
     data: ElementDataWrapper,
     dirty_descendants: AtomicBool,
     children_to_process: AtomicIsize,
@@ -88,6 +111,7 @@ pub struct HostDoc {
 impl HostDoc {
     pub fn from_fixture(fix: &Fixture) -> Box<Self> {
         let html_ns: WebNs = ns!(html);
+        let lock = SharedRwLock::new();
         let mut slots = Vec::with_capacity(fix.nodes.len() + 1 + fix.leaf_adds());
         slots.push(Slot {
             doc: std::ptr::null(),
@@ -103,6 +127,7 @@ impl HostDoc {
             dom_id: None,
             classes: Vec::new(),
             attrs: Vec::new(),
+            style_attr: None,
             data: ElementDataWrapper::default(),
             dirty_descendants: AtomicBool::new(false),
             children_to_process: AtomicIsize::new(0),
@@ -136,6 +161,7 @@ impl HostDoc {
                     .iter()
                     .map(|a| (WebLocalName::from(&*a.name), a.value.clone()))
                     .collect(),
+                style_attr: None,
                 data,
                 dirty_descendants: AtomicBool::new(true),
                 children_to_process: AtomicIsize::new(0),
@@ -154,10 +180,10 @@ impl HostDoc {
             }
             slots[p].last_child = Some(i as u32);
         }
-        let mut boxed = Box::new(HostDoc {
-            slots,
-            lock: SharedRwLock::new(),
-        });
+        for s in &mut slots {
+            s.style_attr = parse_inline_style(&s.attrs, &lock);
+        }
+        let mut boxed = Box::new(HostDoc { slots, lock });
         let doc_ptr = &*boxed as *const HostDoc;
         for s in &mut boxed.slots {
             s.doc = doc_ptr;
@@ -227,11 +253,23 @@ impl HostDoc {
                         s.attrs.push((ln, value.clone()));
                     }
                 }
+                if let Some(i) = (*id as u32).checked_add(1).map(|x| x as usize) {
+                    if i < self.slots.len() {
+                        let pdb = parse_inline_style(&self.slots[i].attrs, &self.lock);
+                        self.slots[i].style_attr = pdb;
+                    }
+                }
             }
             Mut::RemoveAttr { id, name } => {
                 if let Some(s) = self.fixture_slot(*id) {
                     let ln = WebLocalName::from(&**name);
                     s.attrs.retain(|(n, _)| n != &ln);
+                }
+                if let Some(i) = (*id as u32).checked_add(1).map(|x| x as usize) {
+                    if i < self.slots.len() {
+                        let pdb = parse_inline_style(&self.slots[i].attrs, &self.lock);
+                        self.slots[i].style_attr = pdb;
+                    }
                 }
             }
             Mut::AddLeaf {
@@ -285,6 +323,7 @@ impl HostDoc {
                 .iter()
                 .map(|a| (WebLocalName::from(&*a.name), a.value.clone()))
                 .collect(),
+            style_attr: None,
             data,
             dirty_descendants: AtomicBool::new(true),
             children_to_process: AtomicIsize::new(0),
@@ -294,6 +333,8 @@ impl HostDoc {
         });
         let doc_ptr = &*self as *const HostDoc;
         self.slots[new_id as usize].doc = doc_ptr;
+        let pdb = parse_inline_style(&self.slots[new_id as usize].attrs, &self.lock);
+        self.slots[new_id as usize].style_attr = pdb;
         self.insert_child(parent_slot, at as usize, new_id);
     }
 
@@ -701,7 +742,7 @@ impl TElement for Elem {
         false
     }
     fn style_attribute(&self) -> Option<ArcBorrow<'_, Locked<PropertyDeclarationBlock>>> {
-        None
+        self.slot().style_attr.as_ref().map(|a| a.borrow_arc())
     }
     fn animation_rule(
         &self,

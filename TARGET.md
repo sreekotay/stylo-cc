@@ -25,4 +25,5 @@ Same print format. `cmp` is the gate (dumped properties: display / position / wi
 Tiny: 81/81 after mutations (`receipts/tiny_2026_08_29.txt`).
 Default wall times: `receipts/default_2026_08_29.txt`.
 Local CSS (not StyleBench seeds): `fixtures/local/` — `make compare-local`.
+Style attribute is author-origin with its own cascade rank (beats author selectors; `!important` in the attribute beats author `!important`).
 Fixture comments are `# ` only — a leading `#ident` is a CSS id selector.

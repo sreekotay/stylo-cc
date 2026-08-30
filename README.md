@@ -77,7 +77,7 @@ Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, chil
 
 - **Selectors:** sibling (`+` / `~`), `:nth-*`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
-- **Values:** `rem`, `calc()`, `var()`, hsl, `%` on box lengths. Integer `em` / `%` on `font-size`, `#rgb` / `#rrggbb`, and `currentColor` on `background-color` are in; see `fixtures/local/` (`make compare-local`).
+- **Values:** `calc()`, `var()`, hsl, `%` on box lengths. Integer `em` / `rem` / `%` on `font-size`, `#rgb` / `#rrggbb`, `currentColor` on `background-color`, and the `style` attribute are in; see `fixtures/local/` (`make compare-local`).
 
 Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We use the same cut: `StyBg*` / `StyBox*` / `StyFont*` — initial or parent proto, unique slot on first specified write (no memcpy of the proto). The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid we skipped.
 

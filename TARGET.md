@@ -26,4 +26,5 @@ Tiny: 81/81 after mutations (`receipts/tiny_2026_08_29.txt`).
 Default wall times: `receipts/default_2026_08_29.txt`.
 Local CSS (not StyleBench seeds): `fixtures/local/` — `make compare-local`.
 Style attribute is author-origin with its own cascade rank (beats author selectors; `!important` in the attribute beats author `!important`).
+`background` is a shorthand for `background-color` (omitted color → transparent). Other background longhands are not dumped.
 Fixture comments are `# ` only — a leading `#ident` is a CSS id selector.

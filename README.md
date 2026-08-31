@@ -4,16 +4,18 @@ A Concurrent-C styling engine raced against [Stylo](https://github.com/servo/sty
 
 ```
 fixtures/           generated StyleBench races (tiny / default; gitignored)
-fixtures/local/     hand CSS we own (em, hex, !important, …) — still cmp vs Stylo
-stylo-runner/       real Stylo on a TElement host
+fixtures/local/     hand CSS we own — still cmp vs Stylo
+stylo-runner/       real Stylo (`style` crate) on a TElement host
 engine/             idiomatic Concurrent-C engine
-stylo/              git submodule — servo/stylo (oracle crate + unit tests)
+stylo/              git submodule — servo/stylo 0.20.0 (oracle crate + unit tests)
 harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
 ```
 
-Style only. No layout. No paint. No browser.
+Style only. No layout. No paint. No browser. Stylo submodule tracks `origin/main` (`b3e6425`).
 
 The gate is `cmp` of the style dump for every live element. Timings are wall clock after receipts match.
+
+This is a StyleBench race against Stylo the crate, not a Firefox hook. A win here is not “faster Firefox.”
 
 ## What is being tested
 
@@ -53,9 +55,22 @@ index<TAB>tag<TAB>id=…<TAB>disp=…<TAB>pos=…<TAB>w=…<TAB>h=…<TAB>minw=�
 
 for live elements (stable fixture ids; removed leaves omitted). `make compare` / `make bench-style` strip `#` lines and `cmp` the dumps.
 
+## Local CSS
+
+Hand fixtures under `fixtures/local/` (not gitignored). Same `---base---` / `---css---` / `---tree---` / `---mut---` text. `make compare-local` loops them. Do not change tiny/default seeds — that is the race.
+
+Fixture comments are `# ` only — a leading `#ident` is a CSS id selector. Tree rows need trailing tabs for empty class/attr cells.
+
+| file | what it gates |
+|---|---|
+| `cascade.stylebench` | `2em`, `#rgb` / `#rrggbb`, `!important`, sibling share + em |
+| `computed.stylebench` | `font-size` `%`, `currentColor` on bg, `color: currentColor` as inherit |
+| `attr.stylebench` | `style=` vs author / author important / style important; `2rem` vs nested `2em` |
+| `shorthand.stylebench` | `background` → `background-color` (omitted color → transparent), same-rule order, `style=background:…` |
+
 ## Properties
 
-**Cascaded and dumped** (fixture + a few unexercised initials, so the dump is not only `background-color`):
+**Cascaded and dumped** (StyleBench sheet + unexercised initials, so the dump is not only `background-color`):
 
 | property | inherit? | notes |
 |---|---|---|
@@ -64,12 +79,20 @@ for live elements (stable fixture ids; removed leaves omitted). `make compare` /
 | `width` | no | initial `auto` |
 | `height` | no | initial `auto`; base sheet `10px` |
 | `min-width` | no | initial `auto`; base sheet `10px` |
-| `font-size` | yes | initial `16px`; `#testroot` `10px` |
+| `font-size` | yes | initial `16px`; `#testroot` `10px`; `px` / `em` / `rem` / `%` |
 | `line-height` | yes | initial `normal`; `#testroot` `10px` |
 | `font-weight` | yes | initial `400` |
 | `visibility` | yes | initial `visible` |
-| `color` | yes | initial `rgb(0, 0, 0)` |
+| `color` | yes | initial `rgb(0, 0, 0)`; `rgb()` / `#rgb` / `#rrggbb` |
 | `background-color` | no | generated sheet; dumped as `r,g,b,a` |
+
+**Also computed** (local fixtures; Stylo already does these):
+
+- Cascade: UA / author / style-attribute origin, `!important` (style important beats author important; UA important wins).
+- `style=` is style origin (after share copy, serial apply).
+- `background` shorthand → `background-color` (no color token → transparent). Other background longhands are not dumped.
+- `currentColor` on `background-color` (resolved after inherit of `color`). On `color`, it inherits.
+- Hex `#rgb` / `#rrggbb` and `transparent` on color / background-color.
 
 Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, child.
 
@@ -77,21 +100,23 @@ Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, chil
 
 - **Selectors:** sibling (`+` / `~`), `:nth-*`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
-- **Values:** `calc()`, `var()`, hsl, `%` on box lengths. Integer `em` / `rem` / `%` on `font-size`, `#rgb` / `#rrggbb`, `currentColor` on `background-color`, and the `style` attribute are in; see `fixtures/local/` (`make compare-local`).
+- **Values:** `calc()`, `var()`, hsl, `%` on box lengths. Named colors beyond `transparent` / `currentColor`.
 
 Stylo does not walk every longhand. Unused properties stay on a **proto** (parent `Arc` if inherited, initial `Arc` if reset) and are only COW’d when a declaration hits that struct. StyleBench dirties Box + Background on almost every node; Font is specified on `#testroot` and borrowed by kids. We use the same cut: `StyBg*` / `StyBox*` / `StyFont*` — initial or parent proto, unique slot on first specified write (no memcpy of the proto). The leftover tilt is Stylo’s `Arc` bag (and rule tree), not flex/grid we skipped.
 
 ## Recorded times
 
-Default suite, release, wall clock, Apple M5, 2026-08-29. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial.
+Default suite, release, wall clock, Apple M5, 2026-08-30. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial. `ccc` 0.3.4-259 (`-O`). Stylo `0.20.0` (`b3e6425`). `cmp` clean.
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 30.7 ms | 673 ms |
+| Stylo (6 threads, sharing LRU on) | 30.6 ms | 669 ms |
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
-| CC (`ccc -O`, sibling canons + used protos) | 19.3 ms | 301 ms |
+| CC (`ccc -O`, sibling canons + used protos) | 18.3 ms | 313 ms |
 
-See `receipts/default_2026_08_29.txt`. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
+Sharing-off is from `receipts/default_2026_08_29.txt` (not re-run). Sharing-on / CC are this rebuild. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
+
+CC split (this run): match ~15.3, last match ~10.9, inherit ~0.12, **12854 canons / 20002**.
 
 ## Fairness
 
@@ -101,8 +126,9 @@ Corrected relative to the first receipts (RGB-only dump, Stylo sharing off, CC d
 - **Sharing on.** Stylo’s 32-entry LRU (sibling + cousin after revalidation). CC exact same-parent identity (12 854 canons of 20 002 on default).
 - **Inherit is a parent hop.** Specified match stays `@parallel for` over canons. Inherited props copy in one serial depth walk — not one `@parallel for` per level.
 - **Same mutation script.** Full rematch after each batch. No incremental invalidation on either side.
+- **Competitor is Stylo the crate**, not the `TElement` host (`host.rs` is glue, like the CC fixture load).
 
-Still not the same program (Stylo the engine, not our host):
+Still not the same program:
 
 - Stylo’s proto is `Arc` style structs (atomic refcount). Ours is a pointer to initial / parent / this node’s slot. Same inherit-vs-reset cut; we do not pay atomics.
 - Sharing algorithms differ (LRU + revalidation vs exact sibling key).
@@ -124,11 +150,11 @@ git submodule update --init --depth 1
 
 ```bash
 make fixture          # tiny suite (compile / cmp loop)
-make compare          # tiny + local cascade: both runners, cmp styles
+make compare          # tiny + fixtures/local: both runners, cmp styles
 make compare-local    # only fixtures/local (no StyleBench regenerate)
 make bench-style      # default 20k/5k + mutations, release Stylo + CC -O, cmp then times
 ```
 
 `make test` is **upstream Stylo crate tests** (`cargo test --workspace` in `stylo/`). We did not write those. The race fixtures are a frozen [WebKit StyleBench](https://perftest.netlify.app/stylebench/) port (`harness/` = `stylebench-gen`, same LCG / seeds). Stylo is the other runner, not the source of tiny/default.
 
-Add more CSS locally by dropping a `.stylebench` file under `fixtures/local/` (same `---base---` / `---css---` / `---tree---` / `---mut---` text; both runners already eat it). `make compare-local` loops that directory. Do not change tiny/default seeds — that is the race. `fixtures/*.stylebench` is gitignored so generated races stay out of git; `fixtures/local/` is not.
+Add more CSS locally by dropping a `.stylebench` file under `fixtures/local/` (same section markers; both runners already eat it). Do not change tiny/default seeds. `fixtures/*.stylebench` is gitignored; `fixtures/local/` is not.

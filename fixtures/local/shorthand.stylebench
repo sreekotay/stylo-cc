@@ -1,0 +1,45 @@
+# stylebench-fixture 1
+# name=shorthand-background
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#hex { background: #c00; }
+#rgbv { background: rgb(0, 255, 0); }
+#cc { color: #00f; background: currentColor; }
+#reset { background-color: #c00; }
+#reset { background: none; }
+#after { background: #c00; }
+#after { background-color: #00f; }
+#same { background-color: #c00; background: none; }
+#same2 { background: none; background-color: #c00; }
+#mix { background: none #0f0; }
+#rgbmix { background: rgb(0, 0, 255) none; }
+#onlynone { background: none; }
+#trans { background-color: transparent; }
+#impi { background-color: #c00 !important; }
+#impi { background: #00f; }
+---tree---
+0	-1	div	testroot		
+1	0	span	hex		
+2	0	span	rgbv		
+3	0	span	cc		
+4	0	span	reset		
+5	0	span	after		
+6	0	span	same		
+7	0	span	same2		
+8	0	span	mix		
+9	0	span	rgbmix		
+10	0	span	onlynone		
+11	0	span	trans		
+12	0	span	impi		
+13	0	span	attr		style=background:#00f
+---mut---

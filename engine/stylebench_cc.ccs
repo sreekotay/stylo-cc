@@ -1192,7 +1192,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     if (mut) mut->slice(&mut_s);
 
     size_t nlines = 1;
-    for (ch in tree_s)
+    @for (ch in tree_s)
         if (ch == '\n') nlines++;
     int extra = 0;
     for (size_t i = 0; i + 5 < mut_s.len; i++)
@@ -1214,7 +1214,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->desc_pairs = map_new::[AtomPair, Vec::[int]](e->store);
     e->universal = vec_new::[int](e->store);
     size_t mut_lines = 1;
-    for (ch in mut_s)
+    @for (ch in mut_s)
         if (ch == '\n') mut_lines++;
     e->cap_muts = (int)mut_lines + 8;
     e->muts = e->store.allocT::[MutOp](e->cap_muts);
@@ -1446,7 +1446,7 @@ static void Engine_apply_bucket(Engine* e, int i, Node* n, Map::[CCSlice, Vec::[
     Vec::[int]* b = m->get_ptr(key);
     if (!b || !b->data) return;
     Vec::[int] rules = *b;
-    for (rule_idx in rules)
+    @for (rule_idx in rules)
         e->apply_rule(i, n, rule_idx);
 }
 
@@ -1458,7 +1458,7 @@ static void Engine_apply_pair(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[i
     Vec::[int]* b = m->get_ptr(key);
     if (!b || !b->data) return;
     Vec::[int] rules = *b;
-    for (rule_idx in rules)
+    @for (rule_idx in rules)
         e->apply_rule(i, n, rule_idx);
 }
 
@@ -1505,7 +1505,7 @@ static void Engine_style_one(Engine* e, int i) {
     Vec::[int]* u = &e->universal;
     if (u->data) {
         Vec::[int] rules = *u;
-        for (rule_idx in rules)
+        @for (rule_idx in rules)
             e->apply_rule(i, n, rule_idx);
     }
     e->seal_box(n, i);

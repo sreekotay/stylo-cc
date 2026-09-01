@@ -106,17 +106,17 @@ Stylo does not walk every longhand. Unused properties stay on a **proto** (paren
 
 ## Recorded times
 
-Default suite, release, wall clock, Apple M5, 2026-08-30. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial. `ccc` 0.3.4-259 (`-O`). Stylo `0.20.0` (`b3e6425`). `cmp` clean.
+Default suite, release, wall clock, Apple M5, 2026-08-31. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial. `ccc` 0.3.4-279 (`-O`). Stylo `0.20.0` (`b3e6425`). `cmp` clean.
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 30.6 ms | 669 ms |
+| Stylo (6 threads, sharing LRU on) | 31.0 ms | 667 ms |
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
-| CC (`ccc -O`, sibling canons + used protos) | 18.3 ms | 313 ms |
+| CC (`ccc -O`, sibling canons + used protos) | 7.6 ms | 242 ms |
 
-Sharing-off is from `receipts/default_2026_08_29.txt` (not re-run). Sharing-on / CC are this rebuild. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
+Sharing-off is from `receipts/default_2026_08_29.txt` (not re-run). Sharing-on / CC are `make bench-style` this rebuild (`receipts/default.stylo.txt`, `receipts/default.cc.txt`). Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
 
-CC split (this run): match ~15.3, last match ~10.9, inherit ~0.12, **12854 canons / 20002**.
+CC split (this run): match ~6.2, last match ~7.5, inherit ~0.08, **12854 canons / 20002**.
 
 ## Fairness
 

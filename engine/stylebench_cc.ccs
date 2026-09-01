@@ -15,6 +15,7 @@
 #include <ccc/script/file.cch>
 #include <ccc/cc_exclusive.cch>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1722,11 +1723,13 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     return cc_ok();
 }
 
-static CCSlice fmt_px(int v, CCSlice auto_s) {
+static CCSlice fmt_px(int v, CCSlice auto_s, char* buf, size_t cap) {
     if (v == PX_AUTO) return auto_s;
     if (v == PX_NORMAL) return @slice("normal");
-    CCString s = @string(`${v}px`, @scratch);
-    return cc_string_as_slice(&s);
+    int n = snprintf(buf, cap, "%dpx", v);
+    if (n < 0) n = 0;
+    if ((size_t)n >= cap) n = (int)cap - 1;
+    return cc_slice_from_buffer(buf, (size_t)n);
 }
 
 static int split_tabs(CCSlice line, CCSlice* out, int cap) {
@@ -2008,11 +2011,12 @@ int main(int argc, char** argv) {
         CCSlice disp = n->used.box->display.len ? n->used.box->display : @slice("inline");
         CCSlice pos = n->used.box->position.len ? n->used.box->position : @slice("static");
         CCSlice vis = n->used.font->visibility.len ? n->used.font->visibility : @slice("visible");
-        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"));
-        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"));
-        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"));
-        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"));
-        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"));
+        char wbuf[16], hbuf[16], minwbuf[16], fsbuf[16], lhbuf[16];
+        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
+        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
+        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
+        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
+        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
         io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch)) !>;
     }
     return 0;

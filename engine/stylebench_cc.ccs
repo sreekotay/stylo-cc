@@ -4,7 +4,7 @@
  * Frame: @grammar + arena views. Packed compounds; subject maps;
  * tokens interned at fill (owned pool, pointer eq); ancestor bloom +
  * inverted parent>* and (subject, left) pair maps; match_from on the join.
- * Specified props match in @parallel @for on share canons (same parent +
+ * Specified props match in @parallel for on share canons (same parent +
  * interned tag / id / classes / attrs). Inherited font-size / line-height /
  * font-weight / visibility / color hop the parent in one serial depth walk.
  * Mutations: redis_idiomatic hold_sorted on node shards, then restyle.
@@ -1698,7 +1698,7 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     eng->t_share = now_ms() - t0;
     int nc = eng->ncanon;
     t0 = now_ms();
-    @parallel @for (k in 0..nc) {
+    @parallel for (k in 0..nc) {
         m->style_one(eng->share_ents[k].i);
     } !>.wait()!>;
     for (int i = 0; i < eng->nnodes; i++) {

@@ -17,7 +17,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <time.h>
 
 #define MAX_CLASS   32
@@ -390,9 +389,7 @@ static CCSlice Engine_intern(Engine* e, CCSlice src) {
     if (!src.len || !src.ptr) return cc_slice_empty();
     CCSlice* hit = e->pool->get_ptr(src);
     if (hit) return *hit;
-    CCSlice owned = e->store.alloc_slice_bytes(src.len);
-    if (!owned.ptr) return cc_slice_empty();
-    memcpy(owned.ptr, src.ptr, src.len);
+    CCSlice owned = src.clone_into(e->store) !>(err) { return cc_slice_empty(); };
     if (e->pool->insert(owned, owned) != 0) return cc_slice_empty();
     return owned;
 }
@@ -1402,23 +1399,23 @@ static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
 }
 
 static int parse_style_decls(Engine* e, Node* n, Rule* r) {
-    const char* p = 0;
-    size_t nlen = 0;
+    CCSlice style = cc_slice_empty();
     for (int a = 0; a < n->nattr; a++) {
         if (n->attrs[a].name.eq_cstr("style")) {
-            p = n->attrs[a].value.ptr;
-            nlen = n->attrs[a].value.len;
+            style = n->attrs[a].value;
             break;
         }
     }
-    if (!p || !nlen) return 0;
-    char buf[256];
-    if (nlen + 3 > sizeof(buf)) return 0;
-    buf[0] = 'x';
-    buf[1] = '{';
-    memcpy(buf + 2, p, nlen);
-    buf[nlen + 2] = '}';
-    CssNode* root = Css.parse(buf, nlen + 3, e->store);
+    if (!style.len) return 0;
+    CCSlice wrap = e->store.alloc_slice_bytes(style.len + 3);
+    if (!wrap.ptr) return 0;
+    CCSlice head = wrap.sub(0, 2);
+    CCSlice mid = wrap.sub(2, 2 + style.len);
+    CCSlice tail = wrap.sub(2 + style.len, wrap.len);
+    head.copy(@slice("x{")) !>(err) { return 0; };
+    mid.copy(style) !>(err) { return 0; };
+    tail.copy(@slice("}")) !>(err) { return 0; };
+    CssNode* root = Css.parse(wrap.ptr, wrap.len, e->store);
     if (!root) return 0;
     CssNode* sheet = root->first();
     if (sheet && sheet->is_list() && sheet->id() == Css_KEEP_stylesheet)
@@ -1725,15 +1722,11 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     return cc_ok();
 }
 
-static CCSlice fmt_px(int v, CCSlice auto_s, char* buf, size_t cap) {
+static CCSlice fmt_px(int v, CCSlice auto_s) {
     if (v == PX_AUTO) return auto_s;
     if (v == PX_NORMAL) return @slice("normal");
     CCString s = @string(`${v}px`, @scratch);
-    CCSlice sl = cc_string_as_slice(&s);
-    if (sl.len >= cap) sl.len = cap - 1;
-    memcpy(buf, sl.ptr, sl.len);
-    buf[sl.len] = '\0';
-    return cc_slice_from_buffer(buf, sl.len);
+    return cc_string_as_slice(&s);
 }
 
 static int split_tabs(CCSlice line, CCSlice* out, int cap) {
@@ -1755,12 +1748,7 @@ static int slice_eq_lit(CCSlice s, const char* lit) {
 }
 
 static int parse_int_slice(CCSlice s) {
-    int v = 0, sign = 1;
-    size_t i = 0;
-    if (s.len && s.ptr[0] == '-') { sign = -1; i = 1; }
-    for (; i < s.len; i++)
-        v = v * 10 + (s.ptr[i] - '0');
-    return v * sign;
+    return (int)(s.to_i64() ?> 0);
 }
 
 static void !>(CCError) Engine_ingest_muts(Engine* e, char[:] text) {
@@ -2020,12 +2008,11 @@ int main(int argc, char** argv) {
         CCSlice disp = n->used.box->display.len ? n->used.box->display : @slice("inline");
         CCSlice pos = n->used.box->position.len ? n->used.box->position : @slice("static");
         CCSlice vis = n->used.font->visibility.len ? n->used.font->visibility : @slice("visible");
-        char wbuf[16], hbuf[16], minwbuf[16], fsbuf[16], lhbuf[16];
-        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
-        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
-        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
-        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
-        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
+        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"));
+        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"));
+        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"));
+        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"));
+        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"));
         io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch)) !>;
     }
     return 0;

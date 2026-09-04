@@ -18,7 +18,7 @@ use style::global_style_data::STYLE_THREAD_POOL;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::queries::values::PrefersColorScheme;
-use style::selector_parser::SnapshotMap;
+use style::selector_parser::{PseudoElement, SnapshotMap};
 use style::servo::media_features::PointerCapabilities;
 use style::shared_lock::StylesheetGuards;
 use style::media_queries::MediaList;
@@ -130,22 +130,24 @@ fn main() {
     let mut doc = HostDoc::from_fixture(&fix);
     let lock = doc.lock().clone();
 
-    let defaults = ComputedValues::initial_values_with_font_override(
-        style::properties::style_structs::Font::initial_values(),
-    );
-    let device = Device::new(
-        MediaType::screen(),
-        QuirksMode::NoQuirks,
-        Size2D::new(800.0, 600.0),
-        Size2D::new(800.0, 600.0),
-        Scale::new(1.0),
-        Box::new(DummyFonts),
-        defaults,
-        PrefersColorScheme::Light,
-        PointerCapabilities::empty(),
-        PointerCapabilities::empty(),
-    );
-    let mut stylist = Stylist::new(device, QuirksMode::NoQuirks);
+    let make_device = |width: f32| {
+        let defaults = ComputedValues::initial_values_with_font_override(
+            style::properties::style_structs::Font::initial_values(),
+        );
+        Device::new(
+            MediaType::screen(),
+            QuirksMode::NoQuirks,
+            Size2D::new(width, 600.0),
+            Size2D::new(width, 600.0),
+            Scale::new(1.0),
+            Box::new(DummyFonts),
+            defaults,
+            PrefersColorScheme::Light,
+            PointerCapabilities::empty(),
+            PointerCapabilities::empty(),
+        )
+    };
+    let mut stylist = Stylist::new(make_device(800.0), QuirksMode::NoQuirks);
     let combined = format!("{}\n{}", fix.base_css, fix.css);
     let sheet = parse_sheet(&combined, lock.clone());
     {
@@ -160,9 +162,9 @@ fn main() {
     let threads = STYLE_THREAD_POOL.num_threads.unwrap_or(1);
     let pool = STYLE_THREAD_POOL.pool();
 
-    let restyle = |doc: &HostDoc, snapshots: &SnapshotMap| {
+    let restyle = |stylist: &Stylist, doc: &HostDoc, snapshots: &SnapshotMap| {
         let shared = SharedStyleContext {
-            stylist: &stylist,
+            stylist,
             visited_styles_enabled: false,
             options: StyleSystemOptions::default(),
             guards: StylesheetGuards::same(&guard),
@@ -180,7 +182,7 @@ fn main() {
     };
 
     let t0 = Instant::now();
-    restyle(&doc, &snapshots);
+    restyle(&stylist, &doc, &snapshots);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     snapshots.clear();
     doc.clear_restyle_bits();
@@ -188,18 +190,36 @@ fn main() {
     let mut mut_ms = 0.0;
     let mut pending = false;
     for m in &fix.mutations {
-        if matches!(m, Mut::Restyle) {
-            if pending {
-                let t1 = Instant::now();
-                restyle(&doc, &snapshots);
-                mut_ms += t1.elapsed().as_secs_f64() * 1000.0;
-                snapshots.clear();
-                doc.clear_restyle_bits();
-                pending = false;
+        match m {
+            Mut::Restyle => {
+                if pending {
+                    let t1 = Instant::now();
+                    restyle(&stylist, &doc, &snapshots);
+                    mut_ms += t1.elapsed().as_secs_f64() * 1000.0;
+                    snapshots.clear();
+                    doc.clear_restyle_bits();
+                    pending = false;
+                }
             }
-        } else {
-            doc.apply_mut(m, &mut snapshots);
-            pending = true;
+            Mut::Resize { width } => {
+                // Servo on a viewport change: swap the device, rebuild the
+                // origins whose media-affected rules moved, restyle the
+                // document from the root. All of it is the step's cost.
+                let t1 = Instant::now();
+                let guards = StylesheetGuards::same(&guard);
+                let origins = stylist.set_device(make_device(*width as f32), &guards);
+                if !origins.is_empty() {
+                    stylist.force_stylesheet_origins_dirty(origins);
+                    stylist.flush(&guards);
+                    doc.restyle_root();
+                }
+                mut_ms += t1.elapsed().as_secs_f64() * 1000.0;
+                pending = true;
+            }
+            _ => {
+                doc.apply_mut(m, &mut snapshots);
+                pending = true;
+            }
         }
     }
 
@@ -208,21 +228,12 @@ fn main() {
         "# TIME_MS={ms:.3} TIME_MUT_MS={mut_ms:.3} elements={}",
         doc.live_count()
     );
-    doc.each_element(|el| {
-        let data = el.borrow_data().expect("styled");
-        let Some(style) = data.styles.get_primary() else {
-            println!("{} unstyled", el.0.debug_id());
-            return;
-        };
+    let line = |idx: usize, tag: &str, id: &str, style: &ComputedValues| -> String {
         let (r, g, b, a) = bg_rgba(style);
-        let id = el
-            .id()
-            .map(|a| a.as_ref())
-            .unwrap_or("-");
-        println!(
+        format!(
             "{}\t{}\tid={}\tdisp={}\tpos={}\tw={}\th={}\tminw={}\tfs={}\tlh={}\tfw={}\tvis={}\tcolor={}\tbg={r},{g},{b},{a}",
-            el.0.debug_id() - 1,
-            el.local_name(),
+            idx,
+            tag,
             id,
             style.clone_display().to_css_string(),
             style.clone_position().to_css_string(),
@@ -234,7 +245,31 @@ fn main() {
             style.clone_font_weight().to_css_string(),
             style.clone_visibility().to_css_string(),
             style.clone_color().to_css_string(),
-        );
+        )
+    };
+    doc.each_element(|el| {
+        let data = el.borrow_data().expect("styled");
+        let Some(style) = data.styles.get_primary() else {
+            println!("{} unstyled", el.0.debug_id());
+            return;
+        };
+        let id = el
+            .id()
+            .map(|a| a.as_ref())
+            .unwrap_or("-");
+        let idx = el.0.debug_id() - 1;
+        println!("{}", line(idx, &el.local_name(), id, style));
+        // Eager pseudos Stylo kept (content not none / normal), in tree order.
+        for pseudo in [PseudoElement::Before, PseudoElement::After] {
+            if let Some(ps) = data.styles.pseudos.get(&pseudo) {
+                let tag = if pseudo == PseudoElement::Before { "::before" } else { "::after" };
+                println!(
+                    "{}\tcontent={}",
+                    line(idx, tag, id, ps),
+                    ps.clone_content().to_css_string()
+                );
+            }
+        }
     });
 }
 

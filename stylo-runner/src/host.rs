@@ -560,8 +560,13 @@ impl HostDoc {
                 }
                 self.remove_leaf(*id);
             }
-            Mut::Restyle => {}
+            Mut::Resize { .. } | Mut::Restyle => {}
         }
+    }
+
+    /// Whole-document restyle, as Servo posts after a device change.
+    pub fn restyle_root(&self) {
+        self.restyle_subtree_slot(1);
     }
 
     fn add_leaf(

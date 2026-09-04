@@ -64,6 +64,7 @@ typedef struct {
     int width_px;
     CCSlice display;
     CCSlice position;
+    CCSlice content;
 } StyBox;
 
 typedef struct {
@@ -108,13 +109,13 @@ typedef struct {
 
 static const Specified SPEC_INIT = {
     .bg = {{0, 0, 0, 0}},
-    .box = {PX_AUTO, PX_AUTO, PX_AUTO, {0}, {0}},
+    .box = {PX_AUTO, PX_AUTO, PX_AUTO, {0}, {0}, {0}},
     .font = {INIT_FS_PX, PX_NORMAL, INIT_FW, {0, 0, 0}, {0}},
 };
 
 @grammar(rules) Css {~~~~
     top: stylesheet
-    stylesheet: collect [any [comment | some wschar | rule]]
+    stylesheet: collect [any [comment | some wschar | media | rule]]
 
     wschar: charset [#' ' #'\t' #'\r' #'\n' #'\x0C']
     ws:     any wschar
@@ -148,10 +149,11 @@ static const Specified SPEC_INIT = {
     attr_val:   [string | keep ident]
     nth_arg:    keep [some complement charset [#')']]
     pseudo:     collect [#':' keep ident opt [#'(' nth_arg #')']]
+    pelem:      ["::" keep ident]
 
     compound: collect [
-          [type_sel | universal] any [hash | class | attr | pseudo]
-        | some [hash | class | attr | pseudo]
+          [type_sel | universal] any [hash | class | attr | pelem | pseudo]
+        | some [hash | class | attr | pelem | pseudo]
     ]
     combinator: keep [any wschar [#'>' | #'+' | #'~'] any wschar | some wschar]
     selector:   collect [compound any [combinator compound]]
@@ -166,6 +168,12 @@ static const Specified SPEC_INIT = {
     decl:      collect [prop ws #':' ws decl_val ws opt important ws opt #';']
     decls:     collect [ws any [decl ws]]
     rule:      collect [selector ws #'{' decls #'}']
+    ; @media (min-width: Npx) { rules } — the one form StyleBench emits.
+    ; The sheet may end inside a block; CSS closes it at EOF.
+    mq_feat:   keep ident
+    mq_px:     keep [some digit]
+    media:     collect ["@media" ws #'(' ws mq_feat ws #':' ws mq_px "px" ws #')' ws #'{'
+                        any [comment | some wschar | rule] opt #'}']
 ~~~~}
 
 @grammar(rules) Fixture {~~~~
@@ -208,6 +216,7 @@ typedef enum {
     MUT_REMOVE_ATTR,
     MUT_ADD_LEAF,
     MUT_REMOVE_LEAF,
+    MUT_RESIZE,
     MUT_RESTYLE
 } MutKind;
 
@@ -270,10 +279,14 @@ typedef struct {
 } PosPred;
 #define MAX_POS 32
 
+/* pelem: 0 none, PE_BEFORE / PE_AFTER — the compound is the subject and
+ * the rule's target is that pseudo box of the matched element. */
+enum { PE_NONE = 0, PE_BEFORE = 1, PE_AFTER = 2 };
 typedef struct {
     int star, nclass, nattr;
     int sa, sb, sc;
     unsigned pseudo;
+    int pelem;
     CCSlice type;
     CCSlice id;
     CCSlice* classes;
@@ -288,6 +301,7 @@ typedef struct {
     int star, nclass, nattr;
     int sa, sb, sc;
     unsigned pseudo;
+    int pelem;
     CCSlice type;
     CCSlice id;
     CCSlice classes[MAX_CLASS];
@@ -331,7 +345,20 @@ typedef struct {
      * subject's anc bloom rejects most non-matches before any walk. */
     Bloom anc_need;
     int anc_open;
+    /* Target: the element (PE_NONE) or one of its pseudo boxes. */
+    int pelem;
+    /* Media block the rule sits in (-1 none) and whether that block is
+     * currently false for the viewport: an off rule matches nothing. */
+    int mq;
+    int off;
 } Rule;
+
+/* One `@media (min|max-width: Npx)` condition; rules point at a row. */
+typedef struct {
+    int is_min;
+    int px;
+} MqCond;
+#define MAX_MQ 64
 
 typedef struct {
     uint64_t h;
@@ -385,6 +412,15 @@ typedef struct {
     Map::[CCSlice, Vec::[int]] left_rules;
     PosPred preds[MAX_POS];
     int npred;
+    MqCond mqs[MAX_MQ];
+    int nmq;
+    int viewport_w;
+    int resized;
+    /* Pseudo boxes: two Node records per element slot (2*i + pelem - 1),
+     * cascaded like a node, inheriting from the element, never matched
+     * as a subject themselves. Their pools sit after the elements' at
+     * cap_nodes + 2*i + p. */
+    Node* pnodes;
     Vec::[int] universal;
     Map::[CCSlice, Vec::[int]] sib_by_id;
     Map::[CCSlice, Vec::[int]] sib_by_class;
@@ -475,6 +511,8 @@ static int Engine_ensure_attr_cap(Engine* e, Node* n, int need);
 static void Engine_insert_child(Engine* e, int parent, int at, int id);
 static void Engine_dirty_desc(Engine* e, int src);
 static void Engine_dirty_following(Engine* e, int src);
+static void Engine_reset_pseudo(Engine* e, int i);
+static void Engine_inherit_pseudo(Engine* e, int i, int p);
 
 static CCSlice !>(CCError) CCSlice_read_path(CCSlice* path, CCArena arena) {
     return cc_file_read_path(*path, arena);
@@ -625,7 +663,12 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
         } else {
             CCSlice raw = ch->span();
             CCSlice s = e->intern(raw);
-            if (id == Css_KEEP_type_sel) {
+            if (id == Css_KEEP_pelem) {
+                if (raw.eq_cstr("before")) c->pelem = PE_BEFORE;
+                else if (raw.eq_cstr("after")) c->pelem = PE_AFTER;
+                else return 0;
+                c->sc++;
+            } else if (id == Css_KEEP_type_sel) {
                 c->type = s;
                 c->sc++;
             } else if (id == Css_KEEP_universal) {
@@ -641,7 +684,7 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
         }
         ch = ch->next(nd);
     }
-    return c->star || c->type.len || c->id.len || c->nclass || c->nattr || c->pseudo;
+    return c->star || c->type.len || c->id.len || c->nclass || c->nattr || c->pseudo || c->pelem;
 }
 
 /* Hash the bytes, not the interned pointer: arena addresses change per
@@ -701,6 +744,7 @@ static int pack_compound(CCArena store, CompoundScratch* s, Compound* d) {
     d->sb = s->sb;
     d->sc = s->sc;
     d->pseudo = s->pseudo;
+    d->pelem = s->pelem;
     d->type = s->type;
     d->id = s->id;
     d->classes = 0;
@@ -764,6 +808,9 @@ static int fill_selector(Engine* e, CssNode* nd, Rule* r) {
     }
     for (int i = 0; i < r->n; i++)
         if (!pack_compound(e->store, &tmpc[i], &r->c[i])) return 0;
+    for (int i = 0; i + 1 < r->n; i++)
+        if (r->c[i].pelem) return 0; /* a pseudo-element is always last */
+    r->pelem = r->c[r->n - 1].pelem;
     return 1;
 }
 
@@ -1076,6 +1123,7 @@ static int decl_important(CssNode* d, CssNode* val) {
 static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
     memset(r, 0, sizeof(*r));
     r->spec = SPEC_INIT;
+    r->mq = -1;
     if (!nd || !nd->is_list()) return 0;
     CssNode* sel = nd->first();
     CssNode* decls = sel ? sel->next(nd) : 0;
@@ -1144,6 +1192,10 @@ static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
                             r->spec.box.display = e->intern(raw);
                             bit = 1u << P_display;
                             r->props |= bit;
+                        } else if (name.eq_cstr("content")) {
+                            r->spec.box.content = e->intern(raw);
+                            bit = 1u << P_content;
+                            r->props |= bit;
                         } else if (name.eq_cstr("position")) {
                             r->spec.box.position = e->intern(raw);
                             bit = 1u << P_position;
@@ -1195,6 +1247,42 @@ static int count_char(char[:] s, char c) {
     return n;
 }
 
+/* Row of the media table for `(min|max-width: Npx)`, adding on first sight. */
+static int Engine_mq_row(Engine* e, CCSlice feat, CCSlice px) {
+    int is_min;
+    if (feat.eq_cstr("min-width")) is_min = 1;
+    else if (feat.eq_cstr("max-width")) is_min = 0;
+    else return -1;
+    int v = (int)(px.to_i64() ?> -1);
+    if (v < 0) return -1;
+    for (int m = 0; m < e->nmq; m++)
+        if (e->mqs[m].is_min == is_min && e->mqs[m].px == v) return m;
+    if (e->nmq >= MAX_MQ) return -1;
+    e->mqs[e->nmq].is_min = is_min;
+    e->mqs[e->nmq].px = v;
+    return e->nmq++;
+}
+
+/* Is media row m true for the current viewport? */
+static int Engine_mq_on(Engine* e, int m) {
+    if (m < 0) return 1;
+    return e->mqs[m].is_min ? e->viewport_w >= e->mqs[m].px : e->viewport_w <= e->mqs[m].px;
+}
+
+static void !>(CCError) Engine_take_rule(Engine* e, CssNode* nd, int origin, int mq) {
+    if (e->nrules >= e->cap_rules)
+        return cc_err(CC_ERR_INVALID_ARG, "too many rules");
+    Rule* r = &e->rules[e->nrules];
+    if (fill_rule(e, nd, r)) {
+        r->origin = origin;
+        r->order = e->nrules;
+        r->mq = mq;
+        r->off = !e->mq_on(mq);
+        e->nrules++;
+    }
+    return cc_ok();
+}
+
 static void !>(CCError) Engine_ingest_css(Engine* e, char[:] css, int origin) {
     if (!css.len) return cc_ok();
     CssNode* root = Css.parse(css.ptr, css.len, e->store);
@@ -1208,13 +1296,18 @@ static void !>(CCError) Engine_ingest_css(Engine* e, char[:] css, int origin) {
     CssNode* ch = root->first();
     while (ch) {
         if (ch->is_list() && ch->id() == Css_KEEP_rule) {
-            if (e->nrules >= e->cap_rules)
-                return cc_err(CC_ERR_INVALID_ARG, "too many rules");
-            Rule* r = &e->rules[e->nrules];
-            if (fill_rule(e, ch, r)) {
-                r->origin = origin;
-                r->order = e->nrules;
-                e->nrules++;
+            e->take_rule(ch, origin, -1) !>(err) { return cc_err(err); };
+        } else if (ch->is_list() && ch->id() == Css_KEEP_media) {
+            CssNode* feat = ch->first();
+            CssNode* px = feat ? feat->next(ch) : 0;
+            if (!feat || !px) return cc_err(CC_ERR_PARSE, "media condition");
+            int mq = e->mq_row(feat->span(), px->span());
+            if (mq < 0) return cc_err(CC_ERR_PARSE, "media feature");
+            CssNode* rr = px->next(ch);
+            while (rr) {
+                if (rr->is_list() && rr->id() == Css_KEEP_rule)
+                    e->take_rule(rr, origin, mq) !>(err) { return cc_err(err); };
+                rr = rr->next(ch);
             }
         }
         ch = ch->next(root);
@@ -1781,9 +1874,11 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->level_off = e->store.allocT::[int](64);
     e->share_of = e->store.allocT::[int](e->cap_nodes);
     e->share_ents = e->store.allocT::[ShareEnt](e->cap_nodes);
-    e->bg_pool = e->store.allocT::[StyBg](e->cap_nodes);
-    e->box_pool = e->store.allocT::[StyBox](e->cap_nodes);
-    e->font_pool = e->store.allocT::[StyFont](e->cap_nodes);
+    e->bg_pool = e->store.allocT::[StyBg](3 * e->cap_nodes);
+    e->box_pool = e->store.allocT::[StyBox](3 * e->cap_nodes);
+    e->font_pool = e->store.allocT::[StyFont](3 * e->cap_nodes);
+    e->pnodes = e->store.allocT::[Node](2 * e->cap_nodes);
+    e->viewport_w = 800;
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
         !e->child_pairs || !e->desc_pairs ||
@@ -1792,7 +1887,8 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
         !e->leaf_ops || !e->leaf_op_parent || !e->fo_ids || !e->fo_off ||
         !e->fo_job || !e->fo_sig || !e->fo_rules || !e->fo_jobs ||
         !e->level_ids || !e->level_off ||
-        !e->share_of || !e->share_ents || !e->bg_pool || !e->box_pool || !e->font_pool)
+        !e->share_of || !e->share_ents || !e->bg_pool || !e->box_pool || !e->font_pool ||
+        !e->pnodes)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "engine tables");
     e->bg_init = SPEC_INIT.bg;
     e->box_init = SPEC_INIT.box;
@@ -1817,6 +1913,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->ingest_tree(tree_s) !>(err) { return cc_err(err); };
     if (mut_s.len) e->ingest_muts(mut_s) !>(err) { return cc_err(err); };
     e->paint_blooms();
+    for (int i = 0; i < e->cap_nodes; i++) e->reset_pseudo(i);
     return cc_ok();
 }
 
@@ -1996,6 +2093,37 @@ static void Engine_seal_box(Engine* e, Node* n, int i) {
     if (!(n->specified & (1u << P_width_px))) b->width_px = PX_AUTO;
     if (!(n->specified & (1u << P_display))) b->display = cc_slice_empty();
     if (!(n->specified & (1u << P_position))) b->position = cc_slice_empty();
+    if (!(n->specified & (1u << P_content))) b->content = cc_slice_empty();
+}
+
+/* A ::before / ::after exists only with effective content (Stylo drops
+ * the box otherwise). Every generated pseudo rule sets `content: ''`. */
+static int content_effective(CCSlice c) {
+    return c.len && !c.eq_cstr("none") && !c.eq_cstr("normal");
+}
+
+static int Engine_pseudo_live(Engine* e, int i, int p) {
+    Node* pn = &e->pnodes[2 * i + p];
+    return (pn->specified & (1u << P_content)) && content_effective(pn->used.box->content);
+}
+
+/* Fresh cascade state for one pseudo box: nothing specified, protos. */
+static void Engine_reset_pseudo(Engine* e, int i) {
+    for (int p = 0; p < 2; p++) {
+        Node* pn = &e->pnodes[2 * i + p];
+        pn->specified = 0;
+        pn->fs_spec = 0;
+        pn->fs_unit = 0;
+        pn->bg_current = 0;
+        pn->used.bg = &e->bg_init;
+        pn->used.box = &e->box_init;
+        pn->used.font = &e->font_init;
+        for (int q = 0; q < NPROP; q++) {
+            pn->spec_a[q] = pn->spec_b[q] = pn->spec_c[q] = -1;
+            pn->win_order[q] = -1;
+            pn->win_rank[q] = -1;
+        }
+    }
 }
 
 static void Engine_apply_specified(Engine* e, int i, Node* n, Rule* r) {
@@ -2024,11 +2152,23 @@ static void Engine_apply_specified(Engine* e, int i, Node* n, Rule* r) {
     }
 }
 
+/* A rule's target: the element, or one of its two pseudo boxes. The
+ * pseudo box is a Node record cascaded with the same code; its pool slot
+ * follows the elements' (cap_nodes + 2*i + p). */
+static void Engine_apply_target(Engine* e, int i, Node* n, Rule* r) {
+    if (!r->pelem) {
+        e->apply_specified(i, n, r);
+        return;
+    }
+    int p = 2 * i + r->pelem - 1;
+    e->apply_specified(e->cap_nodes + p, &e->pnodes[p], r);
+}
+
 static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
     Rule* r = &e->rules[k];
-    if (!r->n || !r->props || !e->match_from(i, r, r->n - 1))
+    if (!r->n || !r->props || r->off || !e->match_from(i, r, r->n - 1))
         return;
-    e->apply_specified(i, n, r);
+    e->apply_target(i, n, r);
 }
 
 static int parse_style_decls(Engine* e, Node* n, Rule* r) {
@@ -2121,7 +2261,7 @@ static void Engine_sib_hits(Engine* e, int i, Node* n, Vec::[int]* b) {
     @for (k in rules) {
         if (n->sib_n < 0) return;
         Rule* r = &e->rules[k];
-        if (!r->n || !e->match_from(i, r, r->n - 1)) continue;
+        if (!r->n || r->off || !e->match_from(i, r, r->n - 1)) continue;
         if (n->sib_n >= SIB_SLOTS) {
             n->sib_n = -1;
             return;
@@ -2153,7 +2293,7 @@ static void Engine_apply_sib_bucket(Engine* e, int i, Node* n, Vec::[int]* b) {
 static void Engine_apply_sib(Engine* e, int i, Node* n) {
     if (n->sib_n >= 0) {
         for (int k = 0; k < n->sib_n; k++)
-            e->apply_specified(i, n, &e->rules[n->sib_hit[k]]);
+            e->apply_target(i, n, &e->rules[n->sib_hit[k]]);
         return;
     }
     if (n->dom_id.len)
@@ -2195,6 +2335,8 @@ static void Engine_style_one(Engine* e, int i) {
     }
     Engine_apply_sib(e, i, n);
     e->seal_box(n, i);
+    for (int p = 0; p < 2; p++)
+        e->seal_box(&e->pnodes[2 * i + p], e->cap_nodes + 2 * i + p);
 }
 
 static void Engine_paint_levels(Engine* e) {
@@ -2278,6 +2420,53 @@ static void Engine_inherit_one(Engine* e, int i) {
     }
     if ((n->specified & (1u << P_bg)) && n->bg_current) {
         e->own_bg(n, i);
+        n->used.bg->bg.r = n->used.font->color.r;
+        n->used.bg->bg.g = n->used.font->color.g;
+        n->used.bg->bg.b = n->used.font->color.b;
+        n->used.bg->bg.a = 255;
+    }
+    for (int p = 0; p < 2; p++)
+        if (e->pseudo_live(i, p)) e->inherit_pseudo(i, p);
+}
+
+/* A pseudo box inherits from its element, not the element's parent; its
+ * display defaults to inline and it never carries an inline style. */
+static void Engine_inherit_pseudo(Engine* e, int i, int p) {
+    Node* el = &e->nodes[i];
+    Node* n = &e->pnodes[2 * i + p];
+    int pi = e->cap_nodes + 2 * i + p;
+    unsigned box_bits = ((1u << N_BOX) - 1u) << N_BG;
+    unsigned font_bits = ((1u << N_FONT) - 1u) << (N_BG + N_BOX);
+    if (!(n->specified & (1u << P_display)) || !n->used.box->display.len) {
+        if (!(n->specified & box_bits)) n->used.box = &e->box_inline;
+        else n->used.box->display = e->ident_inline;
+    }
+    if ((!(n->specified & (1u << P_position)) || !n->used.box->position.len) &&
+        n->used.box != &e->box_init && n->used.box != &e->box_block &&
+        n->used.box != &e->box_inline)
+        n->used.box->position = e->ident_static;
+    StyFont* src = el->used.font;
+    if (!(n->specified & font_bits))
+        n->used.font = src;
+    else {
+        if (!(n->specified & (1u << P_fs_px)))
+            n->used.font->fs_px = src->fs_px;
+        else if (n->fs_unit == UNIT_EM)
+            n->used.font->fs_px = src->fs_px * n->fs_spec;
+        else if (n->fs_unit == UNIT_PCT)
+            n->used.font->fs_px = src->fs_px * n->fs_spec / 100;
+        else if (n->fs_unit == UNIT_REM) {
+            int ri = i;
+            while (e->nodes[ri].parent >= 0) ri = e->nodes[ri].parent;
+            n->used.font->fs_px = e->nodes[ri].used.font->fs_px * n->fs_spec;
+        }
+        if (!(n->specified & (1u << P_lh_px))) n->used.font->lh_px = src->lh_px;
+        if (!(n->specified & (1u << P_fw))) n->used.font->fw = src->fw;
+        if (!(n->specified & (1u << P_visibility))) n->used.font->visibility = src->visibility;
+        if (!(n->specified & (1u << P_color))) n->used.font->color = src->color;
+    }
+    if ((n->specified & (1u << P_bg)) && n->bg_current) {
+        e->own_bg(n, pi);
         n->used.bg->bg.r = n->used.font->color.r;
         n->used.bg->bg.g = n->used.font->color.g;
         n->used.bg->bg.b = n->used.font->color.b;
@@ -2645,6 +2834,7 @@ static void Engine_sig_run(Engine* e, int d, const InvRule* t, int n, int at, in
     for (; at < n && t[at].key == key; at++) {
         if (!(t[at].grp & mask)) continue;
         Rule* r = &e->rules[t[at].k];
+        if (r->off) continue;
         /* Blooms are a superset of both states (paint_blooms_dirty), so
          * the pruned walk cannot miss in either. */
         if (e->match_from(d, r, r->n - 1))
@@ -2843,6 +3033,57 @@ static void Engine_fanout_dirty(Engine* e) {
     e->nchanges = 0;
 }
 
+/* Viewport moved. The fact is per rule — its media row flipped — and the
+ * nodes it touches are exactly the ones that match it, on or off. So:
+ * table of flipped rules (keyed by subject like a staged batch), one
+ * signature pass over every live node with those rules forced on, dirty
+ * on any hit, then the rules take their new state. */
+static void Engine_mq_arm(Engine* e, int n, int arm, int sz, int nt, int nopen) {
+    int lo = arm * sz;
+    int hi = lo + sz < n ? lo + sz : n;
+    for (int d = lo; d < hi; d++) {
+        if (e->nodes[d].dead || e->nodes[d].dirty) continue;
+        if (Engine_match_sig(e, d, e->fo_rules, nt, nopen, KIND_CHILD))
+            e->nodes[d].dirty = 1;
+    }
+}
+
+static void Engine_media_dirty(Engine* eng) {
+    eng->resized = 0;
+    int nt = 0;
+    InvRule* t = eng->fo_rules;
+    for (int k = 0; k < eng->nrules && nt < eng->fo_rcap; k++) {
+        Rule* r = &eng->rules[k];
+        if (r->mq < 0 || !r->n) continue;
+        int off = !eng->mq_on(r->mq);
+        if (off == r->off) continue;
+        r->off = 0;
+        t[nt].key = compound_key(&r->c[r->n - 1]).ptr;
+        t[nt].k = k;
+        t[nt].grp = GRP_CHILD | GRP_DESC | GRP_FOLLOW | GRP_WIDE;
+        nt++;
+    }
+    if (!nt) return;
+    qsort(t, (size_t)nt, sizeof(InvRule), inv_rule_cmp);
+    int nopen = 0;
+    while (nopen < nt && !t[nopen].key) nopen++;
+    int nn = eng->nnodes;
+    int na = arm_count(nn);
+    int sz = arm_size(nn);
+    if (na <= 1) {
+        Engine_mq_arm(eng, nn, 0, sz, nt, nopen);
+    } else {
+        @parallel for (a in 0..na) {
+            Engine_mq_arm(eng, nn, a, sz, nt, nopen);
+        } !>.wait()!>;
+    }
+    for (int i = 0; i < nt; i++) {
+        Rule* r = &eng->rules[t[i].k];
+        r->off = !eng->mq_on(r->mq);
+    }
+    eng->cnt_rules += nt;
+}
+
 static void Engine_clear_dirty(Engine* e) {
     for (int i = 0; i < e->nnodes; i++)
         e->nodes[i].dirty = 0;
@@ -2864,6 +3105,27 @@ static void Engine_reset_dirty(Engine* e) {
             n->win_order[p] = -1;
             n->win_rank[p] = -1;
         }
+        e->reset_pseudo(i);
+    }
+}
+
+/* Twin's pseudo boxes come along with its element cascade; values are
+ * cloned into dst's own pool slots for the same reason as below. */
+static void Engine_copy_pseudo(Engine* e, int dst, int src) {
+    for (int p = 0; p < 2; p++) {
+        Node* d = &e->pnodes[2 * dst + p];
+        Node* s = &e->pnodes[2 * src + p];
+        int di = e->cap_nodes + 2 * dst + p;
+        e->bg_pool[di] = *s->used.bg;
+        e->box_pool[di] = *s->used.box;
+        e->font_pool[di] = *s->used.font;
+        d->used.bg = &e->bg_pool[di];
+        d->used.box = &e->box_pool[di];
+        d->used.font = &e->font_pool[di];
+        d->specified = s->specified;
+        d->fs_spec = s->fs_spec;
+        d->fs_unit = s->fs_unit;
+        d->bg_current = s->bg_current;
     }
 }
 
@@ -2882,6 +3144,7 @@ static void Engine_copy_specified(Engine* e, int dst, int src) {
     e->nodes[dst].fs_spec = e->nodes[src].fs_spec;
     e->nodes[dst].fs_unit = e->nodes[src].fs_unit;
     e->nodes[dst].bg_current = e->nodes[src].bg_current;
+    e->copy_pseudo(dst, src);
 }
 
 static double now_ms(void) {
@@ -3118,6 +3381,9 @@ static void !>(CCError) Engine_ingest_muts(Engine* e, char[:] text) {
         } else if (slice_eq_lit(cols[0], "-leaf") && nc >= 2) {
             m->kind = MUT_REMOVE_LEAF;
             m->id = parse_int_slice(cols[1]);
+        } else if (slice_eq_lit(cols[0], "resize") && nc >= 2) {
+            m->kind = MUT_RESIZE;
+            m->id = parse_int_slice(cols[1]);
         } else {
             return cc_err(CC_ERR_PARSE, "mut line");
         }
@@ -3153,6 +3419,11 @@ static int Engine_ensure_attr_cap(Engine* e, Node* n, int need) {
 }
 
 static void Engine_apply_mut(Engine* e, MutOp* m) {
+    if (m->kind == MUT_RESIZE) {
+        if (m->id != e->viewport_w) e->resized = 1;
+        e->viewport_w = m->id;
+        return;
+    }
     if (m->kind == MUT_ADD_LEAF) {
         if (m->id != e->nnodes || e->nnodes >= e->cap_nodes) return;
         Node* nd = &e->nodes[e->nnodes];
@@ -3282,11 +3553,11 @@ static void !>(CCError) Engine_run_mutations(Engine* e, CCShardDomain* domain, d
             if (m->kind == MUT_ADD_LEAF) {
                 if (nids < 256) ids[nids++] = m->parent;
                 if (nids < 256) ids[nids++] = m->id;
-            } else if (m->kind != MUT_RESTYLE) {
+            } else if (m->kind != MUT_RESTYLE && m->kind != MUT_RESIZE) {
                 if (nids < 256) ids[nids++] = m->id;
             }
         }
-        if (nids) {
+        if (end > start) {
             uint64_t names[MAX_SHARDS];
             size_t nnames = unique_node_shards(domain->mask, ids, nids, names, MAX_SHARDS);
             CCShardHold hold = nnames
@@ -3307,6 +3578,7 @@ static void !>(CCError) Engine_run_mutations(Engine* e, CCShardDomain* domain, d
             e->sum_blooms += now_ms() - t0;
             double tf = now_ms();
             e->fanout_dirty();
+            if (e->resized) e->media_dirty();
             e->sum_fanout += now_ms() - tf;
             e->reset_dirty();
             e->style_dirty() !>;
@@ -3382,6 +3654,23 @@ int main(int argc, char** argv) {
         CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
         CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
         io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch));
+        for (int p = 0; p < 2; p++) {
+            if (!eng.pseudo_live(i, p)) continue;
+            Node* q = &eng.pnodes[2 * i + p];
+            CCSlice ptag = p == 0 ? @slice("::before") : @slice("::after");
+            CCSlice pdisp = q->used.box->display.len ? q->used.box->display : @slice("inline");
+            CCSlice ppos = q->used.box->position.len ? q->used.box->position : @slice("static");
+            CCSlice pvis = q->used.font->visibility.len ? q->used.font->visibility : @slice("visible");
+            CCSlice pw = fmt_px(q->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
+            CCSlice ph = fmt_px(q->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
+            CCSlice pminw = fmt_px(q->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
+            CCSlice pfs = fmt_px(q->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
+            CCSlice plh = fmt_px(q->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
+            /* Stylo serializes a string `content` in double quotes. */
+            CCSlice c = q->used.box->content;
+            CCSlice content = (c.eq_cstr("''") || c.eq_cstr("\"\"")) ? @slice("\"\"") : c;
+            io.println(@string(`${i}\t${ptag}\tid=${id}\tdisp=${pdisp}\tpos=${ppos}\tw=${pw}\th=${ph}\tminw=${pminw}\tfs=${pfs}\tlh=${plh}\tfw=${q->used.font->fw}\tvis=${pvis}\tcolor=rgb(${q->used.font->color.r}, ${q->used.font->color.g}, ${q->used.font->color.b})\tbg=${q->used.bg->bg.r},${q->used.bg->bg.g},${q->used.bg->bg.b},${q->used.bg->bg.a}\tcontent=${content}`, @scratch));
+        }
     }
     return 0;
 }

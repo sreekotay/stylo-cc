@@ -73,6 +73,7 @@ pub struct Config {
     pub combinators: Vec<String>,
     pub pseudo_classes: Vec<String>,
     pub pseudo_class_chance: f64,
+    pub before_after_chance: f64,
     pub maximum_selector_length: i32,
     pub rule_count: i32,
     pub element_count: i32,
@@ -83,7 +84,13 @@ pub struct Config {
     pub style_seed: i32,
     pub dom_seed: i32,
     pub leaf_mutation_chance: f64,
+    pub media_query_chance: f64,
+    pub media_query_close_chance: f64,
     pub step_count: i32,
+    pub is_resize_test: bool,
+    /// Extra trailing resize (0 = none). Every StyleBench step ends at
+    /// 800 px, so the final dump alone cannot see a toggle; tiny uses this.
+    pub resize_final: i32,
     pub mutations_per_step: i32,
 }
 
@@ -125,6 +132,7 @@ impl Config {
             combinators: vec![" ".into(), ">".into()],
             pseudo_classes: vec![],
             pseudo_class_chance: 0.0,
+            before_after_chance: 0.0,
             maximum_selector_length: 6,
             rule_count: 5000,
             element_count: 20000,
@@ -135,7 +143,11 @@ impl Config {
             style_seed: 1,
             dom_seed: 2,
             leaf_mutation_chance: 0.1,
+            media_query_chance: 0.0,
+            media_query_close_chance: 0.0,
             step_count: 5,
+            is_resize_test: false,
+            resize_final: 0,
             mutations_per_step: 100,
         }
     }
@@ -199,6 +211,48 @@ impl Config {
         c
     }
 
+    /// StyleBench `beforeAndAfterConfiguration`. Same seeds as default.
+    pub fn before_after_suite() -> Self {
+        let mut c = Self::default_suite();
+        c.name = "BeforeAfter".into();
+        c.before_after_chance = 0.1;
+        c
+    }
+
+    /// Tiny tree / sheet with `::before` / `::after` subjects.
+    pub fn tiny_before_after() -> Self {
+        let mut c = Self::tiny();
+        c.name = "TinyBeforeAfter".into();
+        c.before_after_chance = 0.2;
+        c
+    }
+
+    /// StyleBench `mediaQueryConfiguration`: 5 000 elements, no `*`, ~1 % of
+    /// rules open an `@media (min|max-width)` block; the steps are viewport
+    /// resizes 300..800 by 50, not DOM edits.
+    pub fn media_suite() -> Self {
+        let mut c = Self::default_suite();
+        c.name = "MediaQuery".into();
+        c.is_resize_test = true;
+        c.media_query_chance = 0.01;
+        c.media_query_close_chance = 0.3;
+        c.star_chance = 0.0;
+        c.element_count = 5000;
+        c
+    }
+
+    /// Tiny tree / sheet with media blocks and resize steps.
+    pub fn tiny_media() -> Self {
+        let mut c = Self::tiny();
+        c.name = "TinyMediaQuery".into();
+        c.is_resize_test = true;
+        c.media_query_chance = 0.15;
+        c.media_query_close_chance = 0.3;
+        c.star_chance = 0.0;
+        c.resize_final = 450;
+        c
+    }
+
     /// Tiny tree / sheet with the structural pseudo-class mix.
     pub fn tiny_structural() -> Self {
         let mut c = Self::tiny();
@@ -255,6 +309,8 @@ pub enum Mut {
         attrs: Vec<Attr>,
     },
     RemoveLeaf { id: i32 },
+    /// Viewport width in CSS px (StyleBench `resizeViewToWidth`).
+    Resize { width: i32 },
     Restyle,
 }
 
@@ -296,28 +352,55 @@ pub fn generate(config: Config) -> Fixture {
     }
 }
 
+/// StyleBench `makeStylesheet`: a rule may open an `@media` block (one
+/// draw per rule while outside), and each rule inside may close it.
 fn make_stylesheet(cfg: &Config, rng: &mut Random, size: i32) -> String {
     let mut css = String::new();
+    let mut in_media = false;
     for _ in 0..size {
+        if !in_media && rng.chance(cfg.media_query_chance) {
+            css.push_str(&make_media_query(rng));
+            css.push('\n');
+            in_media = true;
+        }
         css.push_str(&make_rule(cfg, rng));
         css.push('\n');
+        if in_media && rng.chance(cfg.media_query_close_chance) {
+            css.push_str("}\n");
+            in_media = false;
+        }
     }
     css
 }
 
+/// `@media (min-width: Wpx) {` or max-width, W in 300..=700 step 100.
+fn make_media_query(rng: &mut Random) -> String {
+    let width = rng.number(500);
+    let width = 300 + width - (width % 100);
+    if rng.chance(0.5) {
+        format!("@media (min-width: {width}px) {{")
+    } else {
+        format!("@media (max-width: {width}px) {{")
+    }
+}
+
 fn make_rule(cfg: &Config, rng: &mut Random) -> String {
     let selector = make_selector(cfg, rng);
-    let declaration = make_declaration(rng);
+    let declaration = make_declaration(rng, &selector);
     format!("{selector} {{ {declaration} }}")
 }
 
-fn make_declaration(rng: &mut Random) -> String {
-    format!(
+fn make_declaration(rng: &mut Random, selector: &str) -> String {
+    let mut d = format!(
         "background-color: rgb({}, {}, {});",
         rng.next() % 256,
         rng.next() % 256,
         rng.next() % 256
-    )
+    );
+    if selector.ends_with("::before") || selector.ends_with("::after") {
+        d.push_str(" content: ''; min-width:5px; display:inline-block;");
+    }
+    d
 }
 
 fn make_selector(cfg: &Config, rng: &mut Random) -> String {
@@ -357,6 +440,7 @@ fn make_compound_selector(cfg: &Config, rng: &mut Random, index: i32, length: i3
     let use_star = !use_id_element_or_attribute && !is_first && rng.chance(cfg.star_chance);
     let use_class =
         !use_id && !use_star && (!use_id_element_or_attribute || rng.chance(cfg.class_chance));
+    let use_before_or_after = is_last && rng.chance(cfg.before_after_chance);
     let mut result = String::new();
     if use_element {
         result.push_str(&random_element_name(cfg, rng));
@@ -385,6 +469,13 @@ fn make_compound_selector(cfg: &Config, rng: &mut Random, index: i32, length: i3
     if use_pseudo_class {
         result.push(':');
         result.push_str(&random_pseudo_class(cfg, rng, is_last));
+    }
+    if use_before_or_after {
+        if rng.chance(0.5) {
+            result.push_str("::before");
+        } else {
+            result.push_str("::after");
+        }
     }
     result
 }
@@ -642,6 +733,24 @@ fn generate_mutations(cfg: &Config, rng: &mut Random, initial: &[Node]) -> Vec<M
         Some(live[rng.number(live.len() as i32) as usize])
     };
 
+    // StyleBench `makeSteps`: a resize test is only resizes, 300..800 by 50
+    // per step, no DOM edits.
+    if cfg.is_resize_test {
+        for _ in 0..cfg.step_count {
+            let mut width = 300;
+            while width <= 800 {
+                out.push(Mut::Resize { width });
+                out.push(Mut::Restyle);
+                width += 50;
+            }
+        }
+        if cfg.resize_final > 0 {
+            out.push(Mut::Resize { width: cfg.resize_final });
+            out.push(Mut::Restyle);
+        }
+        return out;
+    }
+
     for _ in 0..cfg.step_count {
         let mut n = 0;
         while n < cfg.mutations_per_step {
@@ -877,6 +986,7 @@ impl Fixture {
                     fmt_attrs(attrs)
                 )?,
                 Mut::RemoveLeaf { id } => writeln!(out, "-leaf\t{id}")?,
+                Mut::Resize { width } => writeln!(out, "resize\t{width}")?,
                 Mut::Restyle => writeln!(out, "restyle")?,
             }
         }
@@ -1056,6 +1166,9 @@ fn parse_mut_line(line: &str) -> Result<Mut, String> {
         }),
         "-leaf" if cols.len() >= 2 => Ok(Mut::RemoveLeaf {
             id: cols[1].parse().map_err(|_| "id")?,
+        }),
+        "resize" if cols.len() >= 2 => Ok(Mut::Resize {
+            width: cols[1].parse().map_err(|_| "width")?,
         }),
         _ => Err(format!("bad mut line: {line}")),
     }

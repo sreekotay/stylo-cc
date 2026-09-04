@@ -6,20 +6,24 @@ RECEIPTS ?= receipts
 FIXTURES ?= fixtures
 CCC ?= ccc
 
-.PHONY: setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth bench-style bench-sibling bench-structural bench-nth test build release bench help
+.PHONY: setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media test build release bench help
 
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
 	@echo "fixture-default StyleBench default (20k / 5k)"
-	@echo "compare         tiny + sibling/structural/nth-tiny + fixtures/local: cmp styles"
+	@echo "compare         tiny + sibling/structural/nth/ba/media-tiny + fixtures/local: cmp styles"
 	@echo "compare-local   every fixtures/local/*.stylebench vs Stylo"
 	@echo "compare-sibling generated tiny sibling combinators vs Stylo"
 	@echo "compare-structural generated tiny structural pseudo-classes vs Stylo"
 	@echo "compare-nth     generated tiny :nth-* pseudo-classes vs Stylo"
+	@echo "compare-ba      generated tiny ::before / ::after vs Stylo"
+	@echo "compare-media   generated tiny @media + resize steps vs Stylo"
 	@echo "bench-style     default suite, release Stylo + CC -O, cmp then times"
 	@echo "bench-sibling   sibling 20k/5k, release Stylo + warm CC -O, cmp then times"
 	@echo "bench-structural structural 20k/5k, same shape as bench-sibling"
 	@echo "bench-nth       nth 20k/5k, same shape as bench-sibling"
+	@echo "bench-ba        before/after 20k/5k, same shape as bench-sibling"
+	@echo "bench-media     media queries 5k/5k, 55 resizes, same shape as bench-sibling"
 	@echo "test            upstream cargo test --workspace"
 
 setup:
@@ -53,6 +57,14 @@ fixture-nth-tiny: $(STYLO)/Cargo.toml
 	mkdir -p $(FIXTURES)
 	$(CARGO) run -q -p stylebench-gen -- --tiny --nth > $(FIXTURES)/tiny_nth.stylebench
 
+fixture-ba-tiny: $(STYLO)/Cargo.toml
+	mkdir -p $(FIXTURES)
+	$(CARGO) run -q -p stylebench-gen -- --tiny-before-after > $(FIXTURES)/tiny_ba.stylebench
+
+fixture-media-tiny: $(STYLO)/Cargo.toml
+	mkdir -p $(FIXTURES)
+	$(CARGO) run -q -p stylebench-gen -- --tiny-media > $(FIXTURES)/tiny_media.stylebench
+
 compare-sibling: fixture-sibling-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_sibling.stylebench > $(RECEIPTS)/tiny_sibling.stylo.txt
@@ -83,7 +95,27 @@ compare-nth: fixture-nth-tiny
 	@echo OK tiny-nth
 	@grep '^# TIME' $(RECEIPTS)/tiny_nth.stylo.txt $(RECEIPTS)/tiny_nth.cc.txt
 
-compare: stylo-run cc-run compare-local compare-sibling compare-structural compare-nth
+compare-ba: fixture-ba-tiny
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_ba.stylebench > $(RECEIPTS)/tiny_ba.stylo.txt
+	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_ba.stylebench > $(RECEIPTS)/tiny_ba.cc.txt
+	@grep -v '^#' $(RECEIPTS)/tiny_ba.stylo.txt > /tmp/stylo.ba
+	@grep -v '^#' $(RECEIPTS)/tiny_ba.cc.txt > /tmp/cc.ba
+	cmp /tmp/stylo.ba /tmp/cc.ba
+	@echo OK tiny-ba
+	@grep '^# TIME' $(RECEIPTS)/tiny_ba.stylo.txt $(RECEIPTS)/tiny_ba.cc.txt
+
+compare-media: fixture-media-tiny
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_media.stylebench > $(RECEIPTS)/tiny_media.stylo.txt
+	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_media.stylebench > $(RECEIPTS)/tiny_media.cc.txt
+	@grep -v '^#' $(RECEIPTS)/tiny_media.stylo.txt > /tmp/stylo.media
+	@grep -v '^#' $(RECEIPTS)/tiny_media.cc.txt > /tmp/cc.media
+	cmp /tmp/stylo.media /tmp/cc.media
+	@echo OK tiny-media
+	@grep '^# TIME' $(RECEIPTS)/tiny_media.stylo.txt $(RECEIPTS)/tiny_media.cc.txt
+
+compare: stylo-run cc-run compare-local compare-sibling compare-structural compare-nth compare-ba compare-media
 	@grep -v '^#' $(RECEIPTS)/tiny.stylo.txt > /tmp/stylo.styles
 	@grep -v '^#' $(RECEIPTS)/tiny.cc.txt > /tmp/cc.styles
 	cmp /tmp/stylo.styles /tmp/cc.styles
@@ -128,6 +160,12 @@ bench-structural: $(STYLO)/Cargo.toml
 
 bench-nth: $(STYLO)/Cargo.toml
 	./scripts/bench-suite.sh nth
+
+bench-ba: $(STYLO)/Cargo.toml
+	./scripts/bench-suite.sh ba
+
+bench-media: $(STYLO)/Cargo.toml
+	./scripts/bench-suite.sh media
 
 build: $(STYLO)/Cargo.toml
 	cd $(STYLO) && $(CARGO) build --workspace

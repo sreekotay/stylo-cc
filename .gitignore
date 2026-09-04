@@ -8,3 +8,10 @@ receipts/*.tmp
 receipts/full/
 fixtures/*.stylebench
 engine/.cc-lsp-*
+# vendored WebKit StyleBench copy + local node deps + run output (scripts/browser-bench.sh fetches them)
+browser-bench/StyleBench/
+browser-bench/resources/
+browser-bench/.webkit-sparse/
+browser-bench/node_modules/
+browser-bench/package-lock.json
+browser-bench/results/

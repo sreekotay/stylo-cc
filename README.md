@@ -11,6 +11,7 @@ stylo/              git submodule — servo/stylo 0.20.0 (oracle crate + unit te
 harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
 scripts/            bench-suite.sh — the 20 k sibling / structural / nth / ba races, the 5 k media race
                     gen-longhands.shcc — CC script: Stylo's longhand list → engine/longhands.cch
+browser-bench/      StyleBench itself in Chrome / WebKit via Playwright (vendored copy gitignored)
 receipts/           last cmp-clean receipts, both runners: full dumps for tiny / local, header + body digest for 20 k (full/ is gitignored)
 ```
 
@@ -38,6 +39,19 @@ Style only. No layout. No paint. No browser. Stylo submodule tracks `origin/main
 | media (5 k elements) | 11.4 | **1.5** | 425.3 | **14.3** |
 
 CC is 2.7–7.6× faster on the first restyle and 1.5–30× faster on the edit rounds, with identical output; the smallest margin is the default suite's edit rounds (1.5×), the largest is media resizes (30×), where Stylo restyles every element on each resize and CC restyles only those a flipped rule touches. Widening the dump from 11 properties to all 189 cost CC about half a millisecond per column; Stylo already computed all of them.
+
+**The browsers, for scale.** The same StyleBench, unmodified, run in Chrome and in WebKit on this machine (`scripts/browser-bench.sh`; WebKit is Playwright's build, not Safari's shipped one). StyleBench times each edit step's JS + style recalc + **layout** in an 800×600 iframe and never times the initial resolution, so the only comparable column is the edit rounds, and the browser rows carry layout, UA-sheet matching, box construction and full-grammar CSS that ours do not. Order-of-magnitude only:
+
+| suite | Chrome edits | WebKit edits | Stylo edits | CC edits |
+|---|---|---|---|---|
+| default | 118 | 99 | 23.4 | 15.6 |
+| sibling | 693 | 421 | 144.6 | 72.9 |
+| structural | 282 | 411 | 135.4 | 16.5 |
+| nth | 351 | 460 | 166.1 | 38.1 |
+| before / after | 200 | 163 | 57.5 | 18.7 |
+| media (55 resizes) | 446 | 270 | 425.3 | 14.3 |
+
+A style-only probe on the same page (`--split`: Chrome `getComputedStyle`, WebKit `document.getAnimations()` to force a full style flush, then `getBoundingClientRect` for layout) puts Chrome's default edit rounds at 92 ms style / 16 ms layout and WebKit's at 44 / 36, and the untimed initial resolution at 38 ms (Chrome) and 66 ms (WebKit) against Stylo's 26.7 and our 9.8.
 
 **What this is not.** A Firefox speedup. Stylo here runs on a small host (`stylo-runner/`) rather than in a browser, and our engine implements StyleBench's CSS, not CSS. The claim is narrower: on this workload, doing the same job to the same output, this shape is faster. The rest of this file is the detail — what each suite exercises, how each side matches and invalidates, what was corrected to make the race fair, and how to run it.
 
@@ -236,6 +250,7 @@ make bench-nth        # nth 20k/5k, same shape
 make bench-ba         # before/after 20k/5k, same shape
 make bench-media      # media queries 5k elements, 55 resizes, same shape
 make longhands        # regenerate engine/longhands.cch from Stylo (--longhands dump + longhands.toml)
+scripts/browser-bench.sh all 5   # StyleBench in Chrome + Playwright WebKit (+ Safari if remote automation is on)
 ```
 
 `CC_STYLE_WORKERS=n` caps the CC worker pool (default: all cores).

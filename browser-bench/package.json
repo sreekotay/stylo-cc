@@ -1,0 +1,8 @@
+{
+  "name": "stylo-cc-browser-bench",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "^1.50.0"
+  }
+}

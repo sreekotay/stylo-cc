@@ -123,5 +123,5 @@ case "$cmd" in
     fi
     safari "${1:-5}" "${@:2}" || true
     ;;
-  *) echo "usage: $0 [all|chrome|chromium|webkit|safari|serve|fetch|report] [iterations] [-- run.mjs args]"; exit 2 ;;
+  *) echo "usage: $0 [all|chrome|chromium|webkit|safari|ladybird|ladybird-build|serve|fetch|report] [iterations] [-- run.mjs args]"; exit 2 ;;
 esac

@@ -39,4 +39,16 @@ Same print format on both sides: `index tag id=… name=value ×189` in Stylo's 
 
 ## Status (2026-09-04)
 
-All six suites `cmp`-clean at 20 k with the 189-column dump. CC is 2.7–7.6× faster on the first restyle and 1.5–30× on the mutation rounds (README “In short”). Not done: the rest of CSS (`calc()`, `var()`, value lists, `:not` / `:is`, layout-time semantics) — none of it is exercised by StyleBench, so the output is identical here and would not be on arbitrary CSS.
+All six suites `cmp`-clean at 20 k with the 189-column dump. CC is 2.7–7.6× faster on the first restyle and 1.5–30× on the mutation rounds (README “In short”). Length `calc()` (`px` / `em` / `rem` / `%` / numbers) is gated by `fixtures/local/calc.stylebench`. Not done: the rest of CSS (`var()`, value lists, `:not` / `:is`, layout-time semantics) — none of it is exercised by StyleBench, so the output is identical there and would not be on arbitrary CSS.
+
+## Ladybird (reference, not a gate)
+
+The `ladybird/` submodule is a Distribution build of [LadybirdBrowser/ladybird](https://github.com/LadybirdBrowser/ladybird) run against the same vendored StyleBench (`scripts/browser-bench.sh ladybird`). It is not a third oracle — we do not `cmp` against Ladybird — but it is the closest in-browser analogue to what we built: a Rust `StyleEngine` (matching, invalidation routing, cascade identities) behind a C++ bridge that materializes `ComputedValues` for layout.
+
+**Style-only clock.** Ladybird exposes `internals.getStyleInvalidationCounters().styleUpdateMicroseconds`, which brackets `Document::update_style` (style only, no layout). `scripts/browser-bench.sh ladybird 5 --internals` samples that around every StyleBench step and around the initial resolution (flush forced right after `createBenchmark()`). Receipt: `receipts/browser-ladybird-internals.txt`. On the edit rounds Ladybird's style pass is 1.0–4.4× Stylo and 2.5–8× slower than CC; on media it matches CC's scoped invalidation (55 ms vs Stylo's 425 ms). CC is 5.5–100× faster on the first restyle.
+
+**Conservative runner.** Stock StyleBench's `getBoundingClientRect()` flush lets Ladybird skip geometry-neutral style work (~4 ms class/attr steps). `--conservative` injects Ladybird's own StyleBenchConservative `_runTest` (`browser-bench/conservative.mjs`); Chrome and WebKit are unchanged within noise.
+
+**Engine replay (upstream, not working here yet).** Ladybird records StyleEngine boundary events during a StyleBench run (`LIBWEB_STYLE_RECORD`, `Meta/record-style-bench.py`) and replays them engine-only (`Build/distribution/bin/style-replay`). At submodule `a1db2e3a` replay of a full StyleBench trace fails: seven deferred-geometry event kinds are recorded but have no replay arms, then `publish_computed_groups` segfaults. Wrappers: `scripts/ladybird-style-record.sh`, `scripts/ladybird-style-replay.sh`. When upstream fixes replay, that is the closest apples-to-apples engine clock on their side.
+
+**Plug-in seam (if pursued).** Replace the Rust `StyleEngine` behind `Libraries/LibWeb/Rust/StyleEngineBoundary.json` — feature journal in, ordered matches + invalidation reactions + StyleRecord/group payloads out. That is a whole-engine contract, not a drop-in matcher.

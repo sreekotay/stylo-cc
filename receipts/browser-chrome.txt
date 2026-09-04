@@ -1,0 +1,64 @@
+# StyleBench (WebKit main 67bf126de007) run locally via scripts/browser-bench.sh, 2026-09-04
+# Apple M5, macOS 26.5.2
+# label: Google Chrome 152.0.7977.76 (installed, headless=new)
+# sync = step JS + style recalc + layout (800x600 iframe); async = constant 1 ms/step; initial resolution untimed by StyleBench
+== Google Chrome 152.0.7977.76 (installed, headless=new) (from /Users/airm5/Documents/code/stylo-cc/browser-bench/results/chrome.json): StyleBench, 5 iteration(s), ms (sync = style + layout flush; async = constant 1/step) ==
+suite                                iter steps   sync ms  async ms  total ms
+Descendant and child combinators        1    25     119.0      25.0     144.0
+Sibling combinators                     1    25     691.7      25.0     716.7
+Structural pseudo classes               1    25     284.1      25.0     309.1
+Nth pseudo classes                      1    25     346.0      25.0     371.0
+Before and after pseudo elements        1    25     204.6      25.0     229.6
+Dynamic media queries                   1    55     449.3      55.0     504.3
+Descendant and child combinators        2    25     119.9      25.0     144.9
+Sibling combinators                     2    25     693.4      25.0     718.4
+Structural pseudo classes               2    25     279.4      25.0     304.4
+Nth pseudo classes                      2    25     356.9      25.0     381.9
+Before and after pseudo elements        2    25     202.7      25.0     227.7
+Dynamic media queries                   2    55     441.4      55.0     496.4
+Descendant and child combinators        3    25     114.4      25.0     139.4
+Sibling combinators                     3    25     691.9      25.0     716.9
+Structural pseudo classes               3    25     283.1      25.0     308.1
+Nth pseudo classes                      3    25     350.5      25.0     375.5
+Before and after pseudo elements        3    25     198.1      25.0     223.1
+Dynamic media queries                   3    55     440.3      55.0     495.3
+Descendant and child combinators        4    25     119.9      25.0     144.9
+Sibling combinators                     4    25     696.2      25.0     721.2
+Structural pseudo classes               4    25     279.4      25.0     304.4
+Nth pseudo classes                      4    25     351.6      25.0     376.6
+Before and after pseudo elements        4    25     198.3      25.0     223.3
+Dynamic media queries                   4    55     447.3      55.0     502.3
+Descendant and child combinators        5    25     118.6      25.0     143.6
+Sibling combinators                     5    25     690.2      25.0     715.2
+Structural pseudo classes               5    25     285.7      25.0     310.7
+Nth pseudo classes                      5    25     351.1      25.0     376.1
+Before and after pseudo elements        5    25     196.8      25.0     221.8
+Dynamic media queries                   5    55     449.4      55.0     504.4
+suite (over iterations)              steps  sync mean  sync min  total mean
+Descendant and child combinators        25      118.4     114.4       143.4
+Sibling combinators                     25      692.7     690.2       717.7
+Structural pseudo classes               25      282.3     279.4       307.3
+Nth pseudo classes                      25      351.2     346.0       376.2
+Before and after pseudo elements        25      200.1     196.8       225.1
+Dynamic media queries                   55      445.5     440.3       500.5
+per step kind, sync ms summed over the suite's steps of that kind, mean over iterations:
+  Descendant and child combinators  Adding classes=23.2  Removing classes=33.3  Mutating attributes=38.5  Adding leaf elements=12.9  Removing leaf elements=10.4
+  Sibling combinators               Adding classes=112.9  Removing classes=109.8  Mutating attributes=150.6  Adding leaf elements=206.9  Removing leaf elements=112.5
+  Structural pseudo classes         Adding classes=23.8  Removing classes=35.6  Mutating attributes=40.3  Adding leaf elements=125.9  Removing leaf elements=56.8
+  Nth pseudo classes                Adding classes=29.8  Removing classes=43.9  Mutating attributes=48.0  Adding leaf elements=157.1  Removing leaf elements=72.5
+  Before and after pseudo elements  Adding classes=42.2  Removing classes=58.7  Mutating attributes=72.3  Adding leaf elements=15.4  Removing leaf elements=11.6
+  Dynamic media queries             resizes=445.5
+StyleBench score (runs/min = 60000 / geomean(suite totals) / 1.5): mean 120.47  [120.0, 120.1, 121.4, 120.4, 120.4]
+geomean of suite totals, ms: mean 332.0  [333.3, 333.2, 329.4, 332.2, 332.1]
+
+# --split probe (ours, not StyleBench): forces a full style flush then layout separately; also times the initial resolution StyleBench leaves untimed.
+# Noisy: repeated loads moved structural / nth / ba / media 'steps style' by 30-60% while StyleBench's own sync stayed within 2%. Read the default row; treat the rest as indicative.
+== Google Chrome 152.0.7977.76 (installed, headless=new): style / layout split probe (ours, not StyleBench; ms; best of 3 loads) ==
+suite                                  build init style init layout steps style steps layout steps sum  live
+Descendant and child combinators         9.8       36.9         9.2        87.2         14.7     101.9  20000 (25 steps)
+Sibling combinators                      8.4       85.4         9.2       709.6         16.3     725.9  20000 (25 steps)
+Structural pseudo classes               13.4       64.9        13.2       385.9         20.4     406.3  20000 (25 steps)
+Nth pseudo classes                      14.9       89.7        13.6       537.8         23.8     561.6  20000 (25 steps)
+Before and after pseudo elements        16.9      129.9        58.1       299.3         35.5     334.8  20000 (25 steps)
+Dynamic media queries                   12.2       17.2         4.3       735.9         68.8     804.7  5000 (55 steps)
+

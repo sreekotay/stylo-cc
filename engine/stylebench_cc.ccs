@@ -5,11 +5,13 @@
  * tokens interned at fill (owned pool, pointer eq); ancestor bloom +
  * inverted parent>* and (subject, left) pair maps; match_from on the join.
  * Specified props match in @parallel for on share canons (same parent +
- * interned tag / id / classes / attrs). Dirty restyle re-resolves share
+ * interned tag / id / classes / attrs + revalidation: which sibling-last
+ * rules match, since + / ~ are not decided by the ancestor chain). Dirty
+ * restyle re-resolves share
  * from the sibling list only. Inherited font-size / line-height /
  * font-weight / visibility / color hop the parent in one serial depth walk.
  * Mutations: redis_idiomatic hold_sorted on node shards; change log at
- * apply_mut; fan-out from the left atom through pair / parent maps.
+ * apply_mut; fan-out is the batch transition (all changes vs all undone).
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/cc_instantiate.cch>
@@ -26,6 +28,7 @@
 #define MAX_ATTR    16
 #define MAX_SELCOMP 16
 #define MAX_SHARDS  64
+#define SIB_SLOTS   8
 #define PX_AUTO   (-1)
 #define PX_NORMAL (-2)
 #define INIT_FS_PX 16
@@ -148,7 +151,7 @@ static const Specified SPEC_INIT = {
           [type_sel | universal] any [hash | class | attr]
         | some [hash | class | attr]
     ]
-    combinator: keep [any wschar #'>' any wschar | some wschar]
+    combinator: keep [any wschar [#'>' | #'+' | #'~'] any wschar | some wschar]
     selector:   collect [compound any [combinator compound]]
 
     prop:      keep ident
@@ -213,13 +216,23 @@ typedef struct {
     CCSlice classes, attrs;
 } MutOp;
 
+/* One filter for both axes (ancestors, preceding siblings). 256 bits:
+ * a sibling list of ~20 with ~4 atoms each would saturate 64. */
+#define BLOOM_WORDS 4
+typedef struct {
+    uint64_t w[BLOOM_WORDS];
+} Bloom;
+
 typedef struct {
     int parent;
     int nclass, nattr;
     int cap_class, cap_attr;
     int dead;
     int dirty;
-    int first_child, next_sib;
+    int inv_gen;
+    int sib_n;
+    int sib_hit[SIB_SLOTS];
+    int first_child, last_child, next_sib, prev_sib;
     int depth;
     unsigned specified;
     int spec_a[NPROP];
@@ -235,7 +248,7 @@ typedef struct {
     CCSlice dom_id;
     CCSlice* classes;
     Attr* attrs;
-    uint64_t self, anc;
+    Bloom self, anc, prevs;
 } Node;
 
 typedef struct {
@@ -247,6 +260,8 @@ typedef struct {
     CCSlice* attr_n;
     CCSlice* attr_v;
     int* attr_eq;
+    Bloom need;
+    int open;
 } Compound;
 
 typedef struct {
@@ -260,7 +275,7 @@ typedef struct {
     int attr_eq[MAX_ATTR];
 } CompoundScratch;
 
-typedef enum { COMB_DESC, COMB_CHILD } Comb;
+typedef enum { COMB_DESC, COMB_CHILD, COMB_NEXT, COMB_SUBSEQ } Comb;
 
 typedef struct {
     char* subj;
@@ -329,6 +344,10 @@ typedef struct {
     Map::[CCSlice, Vec::[int]] live_class;
     Map::[CCSlice, Vec::[int]] live_type;
     Vec::[int] universal;
+    Map::[CCSlice, Vec::[int]] sib_by_id;
+    Map::[CCSlice, Vec::[int]] sib_by_class;
+    Map::[CCSlice, Vec::[int]] sib_by_type;
+    Vec::[int] sib_universal;
     Change* changes;
     int nchanges, cap_changes;
     int* inv_ids;
@@ -339,6 +358,8 @@ typedef struct {
     int* level_off;
     int max_depth;
     int levels_stale;
+    int has_sib_comb;
+    int inv_stamp;
     int* share_of;
     ShareEnt* share_ents;
     int ncanon;
@@ -350,6 +371,8 @@ typedef struct {
     StyBox* box_pool;
     StyFont* font_pool;
     double t_levels, t_share, t_match, t_inherit;
+    int last_dirty, sum_dirty;
+    double sum_sig, sum_canon, sum_match, sum_copy, sum_inherit;
     double t0_levels, t0_share, t0_match, t0_inherit;
 } Engine;
 
@@ -370,9 +393,9 @@ typedef struct {
 };
 
 @typeview Mutate on Engine {
-    r: intern, fill_node, ensure_class_cap, ensure_attr_cap, apply_mut,
-       log_change, note_live, forget_live, push_bucket, store, cap_nodes,
-       cap_changes, live_class;
+    r: intern, fill_node, insert_child, dirty_following, ensure_class_cap,
+       ensure_attr_cap, apply_mut, log_change, note_live, forget_live,
+       push_bucket, store, cap_nodes, cap_changes, live_class, has_sib_comb;
     rw: nodes, nnodes, nchanges, changes, levels_stale;
 };
 
@@ -384,6 +407,9 @@ static int Node_match_compound(Node* n, const Compound* c);
 static void Engine_note_live(Engine* e, int id);
 static int Engine_ensure_class_cap(Engine* e, Node* n, int need);
 static int Engine_ensure_attr_cap(Engine* e, Node* n, int need);
+static void Engine_insert_child(Engine* e, int parent, int at, int id);
+static void Engine_dirty_desc(Engine* e, int src);
+static void Engine_dirty_following(Engine* e, int src);
 
 static CCSlice !>(CCError) CCSlice_read_path(CCSlice* path, CCArena arena) {
     return cc_file_read_path(*path, arena);
@@ -395,10 +421,13 @@ static CCSlice CssNode_span(CssNode* nd) {
     return v;
 }
 
-static int slice_has_gt(CCSlice s) {
-    @for (ch in s)
-        if (ch == '>') return 1;
-    return 0;
+static Comb comb_from_span(CCSlice s) {
+    @for (ch in s) {
+        if (ch == '>') return COMB_CHILD;
+        if (ch == '+') return COMB_NEXT;
+        if (ch == '~') return COMB_SUBSEQ;
+    }
+    return COMB_DESC;
 }
 
 static int split_commas(CCSlice cell, CCSlice* out, int cap) {
@@ -475,6 +504,55 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
     return c->star || c->type.len || c->id.len || c->nclass || c->nattr;
 }
 
+/* Hash the bytes, not the interned pointer: arena addresses change per
+ * run, and the pointer hash made the false-positive rate a dice roll. */
+static void bloom_add(Bloom* b, CCSlice s) {
+    if (!s.ptr || !s.len) return;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < s.len; i++) {
+        h ^= (uint64_t)(unsigned char)s.ptr[i];
+        h *= 0x100000001b3ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    unsigned a = (unsigned)(h & 255u);
+    unsigned c = (unsigned)((h >> 8) & 255u);
+    b->w[a >> 6] |= 1ULL << (a & 63u);
+    b->w[c >> 6] |= 1ULL << (c & 63u);
+}
+
+static void bloom_or(Bloom* dst, const Bloom* src) {
+    for (int i = 0; i < BLOOM_WORDS; i++)
+        dst->w[i] |= src->w[i];
+}
+
+static int bloom_empty(const Bloom* b) {
+    for (int i = 0; i < BLOOM_WORDS; i++)
+        if (b->w[i]) return 0;
+    return 1;
+}
+
+/* Every bit of need is in have. */
+static int bloom_has(const Bloom* have, const Bloom* need) {
+    for (int i = 0; i < BLOOM_WORDS; i++)
+        if ((have->w[i] & need->w[i]) != need->w[i]) return 0;
+    return 1;
+}
+
+/* Once per compound at fill; match_from reads it on every hop. */
+static void compound_paint_need(Compound* c) {
+    Bloom n = {0};
+    bloom_add(&n, c->type);
+    bloom_add(&n, c->id);
+    for (int i = 0; i < c->nclass; i++)
+        bloom_add(&n, c->classes[i]);
+    for (int i = 0; i < c->nattr; i++)
+        bloom_add(&n, c->attr_n[i]);
+    c->need = n;
+    c->open = bloom_empty(&n);
+}
+
 static int pack_compound(CCArena store, CompoundScratch* s, Compound* d) {
     d->star = s->star;
     d->nclass = s->nclass;
@@ -502,6 +580,7 @@ static int pack_compound(CCArena store, CompoundScratch* s, Compound* d) {
         memcpy(d->attr_v, s->attr_v, sizeof(CCSlice) * (size_t)s->nattr);
         memcpy(d->attr_eq, s->attr_eq, sizeof(int) * (size_t)s->nattr);
     }
+    compound_paint_need(d);
     return 1;
 }
 
@@ -529,7 +608,7 @@ static int fill_selector(Engine* e, CssNode* nd, Rule* r) {
             r->n++;
             have_comb = 0;
         } else if (id == Css_KEEP_combinator) {
-            pending = slice_has_gt(ch->span()) ? COMB_CHILD : COMB_DESC;
+            pending = comb_from_span(ch->span());
             have_comb = 1;
         }
         ch = ch->next(nd);
@@ -1046,13 +1125,51 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
     }
     int id = (int)(nd - e->nodes);
     nd->first_child = -1;
+    nd->last_child = -1;
     nd->next_sib = -1;
-    if (parent >= 0) {
-        nd->next_sib = e->nodes[parent].first_child;
-        e->nodes[parent].first_child = id;
-    }
+    nd->prev_sib = -1;
+    if (parent >= 0)
+        e->insert_child(parent, -1, id);
     e->note_live(id);
     return 1;
+}
+
+static void Engine_insert_child(Engine* e, int parent, int at, int id) {
+    if (parent < 0 || id < 0) return;
+    Node* p = &e->nodes[parent];
+    Node* n = &e->nodes[id];
+    n->parent = parent;
+    n->next_sib = -1;
+    n->prev_sib = -1;
+    int before = -1;
+    if (at >= 0) {
+        int k = 0;
+        for (int c = p->first_child; c >= 0; c = e->nodes[c].next_sib) {
+            if (e->nodes[c].dead) continue;
+            if (k == at) {
+                before = c;
+                break;
+            }
+            k++;
+        }
+    }
+    if (before < 0) {
+        n->prev_sib = p->last_child;
+        if (p->last_child >= 0)
+            e->nodes[p->last_child].next_sib = id;
+        else
+            p->first_child = id;
+        p->last_child = id;
+        return;
+    }
+    int prev = e->nodes[before].prev_sib;
+    n->next_sib = before;
+    n->prev_sib = prev;
+    e->nodes[before].prev_sib = id;
+    if (prev >= 0)
+        e->nodes[prev].next_sib = id;
+    else
+        p->first_child = id;
 }
 
 static void Engine_add_tree_row(Engine* e, TreeRow* row) {
@@ -1214,10 +1331,27 @@ static void !>(CCError) Engine_index_rules(Engine* e) {
         Rule* r = &e->rules[k];
         if (!r->n || !r->c)
             continue;
-        for (int ci = 0; ci + 1 < r->n; ci++)
+        for (int ci = 0; ci + 1 < r->n; ci++) {
             e->note_left_extra(&r->c[ci], k, 1);
+            if (r->comb[ci] == COMB_NEXT || r->comb[ci] == COMB_SUBSEQ)
+                e->has_sib_comb = 1;
+        }
         Compound* s = &r->c[r->n - 1];
         int ok = 0;
+        /* Sibling-last: decided by the subject's own siblings, so it lives
+         * in the revalidation set only. style_one applies the recorded hits. */
+        if (r->n >= 2 &&
+            (r->comb[r->n - 2] == COMB_NEXT || r->comb[r->n - 2] == COMB_SUBSEQ)) {
+            if (!r->props) continue;
+            ok = !compound_open(s) &&
+                 e->push_keyed(s, k, e->sib_by_id, e->sib_by_class, e->sib_by_type);
+            if (!ok) {
+                Vec::[int]* su = &e->sib_universal;
+                ok = su->push(k) == 0;
+            }
+            if (!ok) return cc_err(CC_ERR_OUT_OF_MEMORY, "index sib rule");
+            continue;
+        }
         int child_star = compound_open(s) && r->n >= 2 &&
                          r->comb[r->n - 2] == COMB_CHILD;
         if (child_star) {
@@ -1249,44 +1383,39 @@ static void !>(CCError) Engine_index_rules(Engine* e) {
     return cc_ok();
 }
 
-static uint64_t atom_bits(CCSlice s) {
-    if (!s.ptr || !s.len) return 0;
-    uint64_t h = (uint64_t)(uintptr_t)s.ptr;
-    h ^= h >> 30;
-    h *= 0xbf58476d1ce4e5b9ULL;
-    h ^= h >> 27;
-    return (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
-}
-
-static uint64_t compound_need(const Compound* c) {
-    uint64_t n = atom_bits(c->type) | atom_bits(c->id);
-    for (int i = 0; i < c->nclass; i++)
-        n |= atom_bits(c->classes[i]);
-    for (int i = 0; i < c->nattr; i++)
-        n |= atom_bits(c->attr_n[i]);
-    return n;
-}
-
 static void Engine_paint_blooms(Engine* e) {
     for (int i = 0; i < e->nnodes; i++) {
         Node* n = &e->nodes[i];
+        Bloom z = {0};
+        n->self = z;
+        n->anc = z;
+        n->prevs = z;
         if (n->dead) continue;
-        uint64_t self = atom_bits(n->tag) | atom_bits(n->dom_id);
+        bloom_add(&n->self, n->tag);
+        bloom_add(&n->self, n->dom_id);
         for (int c = 0; c < n->nclass; c++)
-            self |= atom_bits(n->classes[c]);
+            bloom_add(&n->self, n->classes[c]);
         for (int a = 0; a < n->nattr; a++)
-            self |= atom_bits(n->attrs[a].name);
-        n->self = self;
+            bloom_add(&n->self, n->attrs[a].name);
     }
     for (int i = 0; i < e->nnodes; i++) {
         Node* n = &e->nodes[i];
-        n->anc = 0;
         if (n->dead) continue;
         int p = n->parent;
         while (p >= 0) {
             if (!e->nodes[p].dead)
-                n->anc |= e->nodes[p].self;
+                bloom_or(&n->anc, &e->nodes[p].self);
             p = e->nodes[p].parent;
+        }
+    }
+    /* Same filter on the sibling axis: union of preceding siblings. */
+    for (int i = 0; i < e->nnodes; i++) {
+        if (e->nodes[i].dead || e->nodes[i].first_child < 0) continue;
+        Bloom acc = {0};
+        for (int c = e->nodes[i].first_child; c >= 0; c = e->nodes[c].next_sib) {
+            if (e->nodes[c].dead) continue;
+            e->nodes[c].prevs = acc;
+            bloom_or(&acc, &e->nodes[c].self);
         }
     }
 }
@@ -1338,6 +1467,10 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->live_class = map_new::[CCSlice, Vec::[int]](e->store);
     e->live_type = map_new::[CCSlice, Vec::[int]](e->store);
     e->universal = vec_new::[int](e->store);
+    e->sib_by_id = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_by_class = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_by_type = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_universal = vec_new::[int](e->store);
     size_t mut_lines = 1;
     @for (ch in mut_s)
         if (ch == '\n') mut_lines++;
@@ -1431,15 +1564,39 @@ static int Engine_match_from(Engine* e, int idx, const Rule* r, int ci) {
     if (ci == 0)
         return 1;
     Comb comb = r->comb[ci - 1];
-    uint64_t need = compound_need(&r->c[ci - 1]);
+    const Compound* left = &r->c[ci - 1];
+    const Bloom* need = &left->need;
+    int open = left->open;
     int p = e->nodes[idx].parent;
     if (comb == COMB_CHILD) {
         if (p < 0) return 0;
-        if (need && (e->nodes[p].self & need) != need)
+        if (!open && !bloom_has(&e->nodes[p].self, need))
             return 0;
         return e->match_from(p, r, ci - 1);
     }
-    if (need && (n->anc & need) != need)
+    if (comb == COMB_NEXT) {
+        int prev = n->prev_sib;
+        while (prev >= 0 && e->nodes[prev].dead)
+            prev = e->nodes[prev].prev_sib;
+        if (prev < 0) return 0;
+        if (!open && !bloom_has(&e->nodes[prev].self, need))
+            return 0;
+        return e->match_from(prev, r, ci - 1);
+    }
+    if (comb == COMB_SUBSEQ) {
+        if (!open && !bloom_has(&n->prevs, need))
+            return 0;
+        int s = n->prev_sib;
+        while (s >= 0) {
+            if (!e->nodes[s].dead &&
+                (open || bloom_has(&e->nodes[s].self, need)) &&
+                e->match_from(s, r, ci - 1))
+                return 1;
+            s = e->nodes[s].prev_sib;
+        }
+        return 0;
+    }
+    if (!open && !bloom_has(&n->anc, need))
         return 0;
     while (p >= 0) {
         if (e->match_from(p, r, ci - 1))
@@ -1461,6 +1618,22 @@ static int Engine_match_from_join(Engine* e, int idx, const Rule* r, int ci) {
     if (comb == COMB_CHILD) {
         if (p < 0) return 0;
         return e->match_from_join(p, r, ci - 1);
+    }
+    if (comb == COMB_NEXT) {
+        int prev = n->prev_sib;
+        while (prev >= 0 && e->nodes[prev].dead)
+            prev = e->nodes[prev].prev_sib;
+        if (prev < 0) return 0;
+        return e->match_from_join(prev, r, ci - 1);
+    }
+    if (comb == COMB_SUBSEQ) {
+        int s = n->prev_sib;
+        while (s >= 0) {
+            if (!e->nodes[s].dead && e->match_from_join(s, r, ci - 1))
+                return 1;
+            s = e->nodes[s].prev_sib;
+        }
+        return 0;
     }
     while (p >= 0) {
         if (e->match_from_join(p, r, ci - 1))
@@ -1633,6 +1806,61 @@ static void Engine_apply_pairs(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[
     e->apply_pairs_other(i, n, m, n->tag, other);
 }
 
+/* Revalidation. Parent + identity proves two nodes match the same rules
+ * only when every rule is decided by the ancestor chain. A rule whose last
+ * combinator is + / ~ is decided by preceding siblings, so match those
+ * directly and put the result in the share key. Twins that agree share
+ * everything; twins that disagree are separate canons. Same walk order for
+ * twins, so the hit list compares exactly. Overflow means "never share". */
+static void Engine_sib_hits(Engine* e, int i, Node* n, Vec::[int]* b) {
+    if (!b || !b->data) return;
+    Vec::[int] rules = *b;
+    @for (k in rules) {
+        if (n->sib_n < 0) return;
+        Rule* r = &e->rules[k];
+        if (!r->n || !e->match_from(i, r, r->n - 1)) continue;
+        if (n->sib_n >= SIB_SLOTS) {
+            n->sib_n = -1;
+            return;
+        }
+        n->sib_hit[n->sib_n++] = k;
+    }
+}
+
+static void Engine_sib_sig(Engine* e, int i) {
+    Node* n = &e->nodes[i];
+    n->sib_n = 0;
+    if (n->dead) return;
+    if (n->dom_id.len)
+        e->sib_hits(i, n, e->sib_by_id->get_ptr(n->dom_id));
+    for (int c = 0; c < n->nclass; c++)
+        e->sib_hits(i, n, e->sib_by_class->get_ptr(n->classes[c]));
+    e->sib_hits(i, n, e->sib_by_type->get_ptr(n->tag));
+    e->sib_hits(i, n, &e->sib_universal);
+}
+
+/* Overflowed revalidation: no recorded list, match the buckets here. */
+static void Engine_apply_sib_bucket(Engine* e, int i, Node* n, Vec::[int]* b) {
+    if (!b || !b->data) return;
+    Vec::[int] rules = *b;
+    @for (k in rules)
+        e->apply_rule(i, n, k);
+}
+
+static void Engine_apply_sib(Engine* e, int i, Node* n) {
+    if (n->sib_n >= 0) {
+        for (int k = 0; k < n->sib_n; k++)
+            e->apply_specified(i, n, &e->rules[n->sib_hit[k]]);
+        return;
+    }
+    if (n->dom_id.len)
+        Engine_apply_sib_bucket(e, i, n, e->sib_by_id->get_ptr(n->dom_id));
+    for (int c = 0; c < n->nclass; c++)
+        Engine_apply_sib_bucket(e, i, n, e->sib_by_class->get_ptr(n->classes[c]));
+    Engine_apply_sib_bucket(e, i, n, e->sib_by_type->get_ptr(n->tag));
+    Engine_apply_sib_bucket(e, i, n, &e->sib_universal);
+}
+
 static void Engine_style_one(Engine* e, int i) {
     Node* n = &e->nodes[i];
     if (n->dead) return;
@@ -1662,6 +1890,7 @@ static void Engine_style_one(Engine* e, int i) {
         @for (rule_idx in rules)
             e->apply_rule(i, n, rule_idx);
     }
+    Engine_apply_sib(e, i, n);
     e->seal_box(n, i);
 }
 
@@ -1765,6 +1994,9 @@ static uint64_t node_share_hash(const Node* n) {
         h = h * 0x9E3779B97F4A7C15ULL + (uint64_t)(uintptr_t)n->attrs[i].name.ptr;
         h ^= (uint64_t)(uintptr_t)n->attrs[i].value.ptr;
     }
+    h ^= (uint64_t)(uint32_t)n->sib_n << 40;
+    for (int i = 0; i < n->sib_n; i++)
+        h = h * 0x9E3779B97F4A7C15ULL + (uint64_t)(uint32_t)n->sib_hit[i];
     return h;
 }
 
@@ -1773,12 +2005,15 @@ static int node_share_eq(const Node* a, const Node* b) {
     if (a->tag.ptr != b->tag.ptr) return 0;
     if (a->dom_id.ptr != b->dom_id.ptr) return 0;
     if (a->nclass != b->nclass || a->nattr != b->nattr) return 0;
+    if (a->sib_n < 0 || b->sib_n < 0 || a->sib_n != b->sib_n) return 0;
     for (int i = 0; i < a->nclass; i++)
         if (a->classes[i].ptr != b->classes[i].ptr) return 0;
     for (int i = 0; i < a->nattr; i++) {
         if (a->attrs[i].name.ptr != b->attrs[i].name.ptr) return 0;
         if (a->attrs[i].value.ptr != b->attrs[i].value.ptr) return 0;
     }
+    for (int i = 0; i < a->sib_n; i++)
+        if (a->sib_hit[i] != b->sib_hit[i]) return 0;
     return 1;
 }
 
@@ -1950,41 +2185,135 @@ static int Engine_left_matches(Engine* e, int src, const Rule* r, CCSlice A) {
     return 0;
 }
 
+static void Engine_push_inv(Engine* e, int d, int* nc) {
+    if (d < 0 || d >= e->nnodes) return;
+    if (e->nodes[d].dead) return;
+    if (e->nodes[d].inv_gen == e->inv_stamp) return;
+    if (*nc >= e->cap_nodes) return;
+    e->nodes[d].inv_gen = e->inv_stamp;
+    e->inv_ids[(*nc)++] = d;
+}
+
 static void Engine_collect_desc(Engine* e, int src, int child_only, const Compound* S, int* nc) {
     for (int c = e->nodes[src].first_child; c >= 0; c = e->nodes[c].next_sib) {
         if (e->nodes[c].dead) continue;
-        if (!S || compound_open(S) || e->nodes[c].match_compound(S)) {
-            if (*nc < e->cap_nodes) e->inv_ids[(*nc)++] = c;
-        }
+        if (!S || compound_open(S) || e->nodes[c].match_compound(S))
+            e->push_inv(c, nc);
         if (!child_only)
             e->collect_desc(c, 0, S, nc);
     }
 }
 
-static void Engine_dirty_rule_flip(Engine* e, Change* ch, int k) {
+static void Engine_collect_bucket_under(Engine* e, Map::[CCSlice, Vec::[int]] m,
+                                        CCSlice key, int src, int child_only,
+                                        const Compound* S, int* nc) {
+    if (!m || !key.len) return;
+    Vec::[int]* b = m->get_ptr(key);
+    if (!b || !b->data) return;
+    Vec::[int] ids = *b;
+    @for (d in ids) {
+        if (d < 0 || d >= e->nnodes) continue;
+        if (e->nodes[d].dead) continue;
+        if (!node_under(e, d, src, child_only)) continue;
+        if (S && !compound_open(S) && !e->nodes[d].match_compound(S))
+            continue;
+        e->push_inv(d, nc);
+    }
+}
+
+static void Engine_collect_under(Engine* e, int src, int child_only, const Compound* S, int* nc) {
+    if (!S || compound_open(S)) {
+        e->collect_desc(src, child_only, S, nc);
+        return;
+    }
+    if (S->id.len)
+        e->collect_bucket_under(e->live_id, S->id, src, child_only, S, nc);
+    if (S->type.len)
+        e->collect_bucket_under(e->live_type, S->type, src, child_only, S, nc);
+    for (int i = 0; i < S->nclass; i++)
+        e->collect_bucket_under(e->live_class, S->classes[i], src, child_only, S, nc);
+}
+
+static void Engine_collect_following(Engine* e, int src, int next_only, int with_desc,
+                                     const Compound* S, int* nc) {
+    for (int s = e->nodes[src].next_sib; s >= 0; s = e->nodes[s].next_sib) {
+        if (e->nodes[s].dead) continue;
+        if (!S || compound_open(S) || e->nodes[s].match_compound(S))
+            e->push_inv(s, nc);
+        if (with_desc)
+            e->collect_desc(s, 0, S, nc);
+        if (next_only)
+            return;
+    }
+}
+
+static void Engine_dirty_following(Engine* e, int src) {
+    if (src < 0 || src >= e->nnodes) return;
+    for (int s = e->nodes[src].next_sib; s >= 0; s = e->nodes[s].next_sib) {
+        if (e->nodes[s].dead) continue;
+        e->nodes[s].dirty = 1;
+        e->dirty_desc(s);
+    }
+}
+
+static void Engine_collect_for_src(Engine* e, int src, const Rule* r, CCSlice atom, int* nc) {
+    if (!r->n || !r->c || src < 0 || src >= e->nnodes) return;
+    if (e->nodes[src].dead) return;
+    if (!e->left_matches(src, r, atom)) return;
+    int earlier = 0;
+    int has_sib = 0;
+    for (int ci = 0; ci + 1 < r->n; ci++) {
+        if (r->comb[ci] == COMB_NEXT || r->comb[ci] == COMB_SUBSEQ)
+            has_sib = 1;
+        if (ci + 2 < r->n && compound_has_atom(&r->c[ci], atom))
+            earlier = 1;
+    }
+    Comb last = r->n >= 2 ? r->comb[r->n - 2] : COMB_DESC;
+    int child_only = !earlier && last == COMB_CHILD;
+    if (last == COMB_NEXT && !earlier)
+        e->collect_following(src, 1, 0, &r->c[r->n - 1], nc);
+    else if (last == COMB_SUBSEQ && !earlier)
+        e->collect_following(src, 0, 0, &r->c[r->n - 1], nc);
+    else {
+        e->collect_under(src, child_only, &r->c[r->n - 1], nc);
+        if (has_sib)
+            e->collect_following(src, 0, 1, &r->c[r->n - 1], nc);
+    }
+}
+
+static void Engine_undo_all(Engine* e) {
+    for (int i = e->nchanges - 1; i >= 0; i--)
+        e->change_undo(&e->changes[i]);
+}
+
+static void Engine_redo_all(Engine* e) {
+    for (int i = 0; i < e->nchanges; i++)
+        e->change_redo(&e->changes[i]);
+}
+
+/* Batch transition: match_from with every logged change vs none. */
+static void Engine_dirty_rule_batch(Engine* e, int k) {
     Rule* r = &e->rules[k];
     if (!r->n || !r->c) return;
-    int src = ch->node;
-    int after_left = e->left_matches(src, r, ch->atom);
-    e->change_undo(ch);
-    int before_left = e->left_matches(src, r, ch->atom);
-    e->change_redo(ch);
-    if (!after_left && !before_left) return;
-    int earlier = 0;
-    for (int ci = 0; ci + 2 < r->n; ci++)
-        if (compound_has_atom(&r->c[ci], ch->atom)) earlier = 1;
-    int child_only = !earlier && r->n >= 2 && r->comb[r->n - 2] == COMB_CHILD;
+    e->inv_stamp++;
     int nc = 0;
-    e->collect_desc(src, child_only, &r->c[r->n - 1], &nc);
+    for (int i = 0; i < e->nchanges; i++)
+        e->collect_for_src(e->changes[i].node, r, e->changes[i].atom, &nc);
+    e->undo_all();
+    for (int i = 0; i < e->nchanges; i++)
+        e->collect_for_src(e->changes[i].node, r, e->changes[i].atom, &nc);
+    if (!nc) {
+        e->redo_all();
+        return;
+    }
     for (int i = 0; i < nc; i++)
         e->inv_off[i] = e->match_from_join(e->inv_ids[i], r, r->n - 1);
-    e->change_undo(ch);
+    e->redo_all();
     for (int i = 0; i < nc; i++) {
         int d = e->inv_ids[i];
         if (e->match_from_join(d, r, r->n - 1) != e->inv_off[i])
             e->nodes[d].dirty = 1;
     }
-    e->change_redo(ch);
 }
 
 static void Engine_dirty_bucket_under(Engine* e, Map::[CCSlice, Vec::[int]] m,
@@ -2100,7 +2429,7 @@ static void Engine_dirty_left_extra(Engine* e, int src, CCSlice A) {
     }
 }
 
-/* Dirty N. Descendants only if match_from flips with vs without the atom. */
+/* Dirty N. Join flip is the batch (all changes vs all undone). */
 static void Engine_fanout_dirty(Engine* e) {
     int n = e->nnodes;
     for (int i = 0; i < e->nchanges; i++) {
@@ -2109,13 +2438,24 @@ static void Engine_fanout_dirty(Engine* e) {
         if (id < 0 || id >= n) continue;
         if (e->nodes[id].dead) continue;
         e->nodes[id].dirty = 1;
+    }
+    int nr = 0;
+    for (int i = 0; i < e->nchanges; i++) {
+        Change* ch = &e->changes[i];
         if (!e->left_rules || !ch->atom.len) continue;
         Vec::[int]* rs = e->left_rules->get_ptr(ch->atom);
         if (!rs || !rs->data) continue;
         Vec::[int] rules = *rs;
-        @for (k in rules)
-            e->dirty_rule_flip(ch, k);
+        @for (k in rules) {
+            int seen = 0;
+            for (int t = 0; t < nr; t++)
+                if (e->share_ents[t].i == k) { seen = 1; break; }
+            if (!seen && nr < e->cap_nodes)
+                e->share_ents[nr++].i = k;
+        }
     }
+    for (int t = 0; t < nr; t++)
+        e->dirty_rule_batch(e->share_ents[t].i);
     e->nchanges = 0;
 }
 
@@ -2166,18 +2506,60 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
+/* One arm is a run of nodes, not a node. The runtime gates spawn on
+ * leaf-arm cost (CC_PAR_CHURN_NS, 8us): a one-node arm sits on that
+ * line and the verdict flips per run. ARM_MIN nodes is unambiguous;
+ * above that, enough arms to feed every worker a few times over. */
+#define ARM_MIN 32
+static int arm_size(int n) {
+    size_t w = cc_sched_get_num_workers();
+    int target = (int)(w ? w * 4 : 16);
+    int sz = n / target;
+    return sz < ARM_MIN ? ARM_MIN : sz;
+}
+
+static int arm_count(int n) {
+    int sz = arm_size(n);
+    return n > 0 ? (n + sz - 1) / sz : 0;
+}
+
+static void Engine_sig_arm(Engine* e, const int* ids, int n, int arm) {
+    int sz = arm_size(n);
+    int lo = arm * sz;
+    int hi = lo + sz < n ? lo + sz : n;
+    for (int k = lo; k < hi; k++)
+        Engine_sib_sig(e, ids ? ids[k] : k);
+}
+
+static void Engine_style_arm(Engine* e, int n, int arm, int dirty_only) {
+    int sz = arm_size(n);
+    int lo = arm * sz;
+    int hi = lo + sz < n ? lo + sz : n;
+    for (int k = lo; k < hi; k++) {
+        int i = e->share_ents[k].i;
+        if (!dirty_only || e->nodes[i].dirty)
+            e->style_one(i);
+    }
+}
+
 static void !>(CCError) Engine_style_all(Engine* eng) {
     EngineMatch m = eng;
     double t0 = now_ms();
     m->paint_levels();
     eng->t_levels = now_ms() - t0;
     t0 = now_ms();
+    int nn = eng->nnodes;
+    int na = arm_count(nn);
+    @parallel for (a in 0..na) {
+        Engine_sig_arm(eng, 0, nn, a);
+    } !>.wait()!>;
     eng->build_share();
     eng->t_share = now_ms() - t0;
     int nc = eng->ncanon;
     t0 = now_ms();
-    @parallel for (k in 0..nc) {
-        m->style_one(eng->share_ents[k].i);
+    na = arm_count(nc);
+    @parallel for (a in 0..na) {
+        Engine_style_arm(eng, nc, a, 0);
     } !>.wait()!>;
     for (int i = 0; i < eng->nnodes; i++) {
         if (eng->share_of[i] != i)
@@ -2209,20 +2591,38 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
     }
     eng->t_levels = now_ms() - t0;
     t0 = now_ms();
+    int nd = 0;
+    for (int i = 0; i < eng->nnodes; i++)
+        if (eng->nodes[i].dirty && !eng->nodes[i].dead)
+            eng->inv_ids[nd++] = i;
+    int na = arm_count(nd);
+    if (na <= 1) {
+        Engine_sig_arm(eng, eng->inv_ids, nd, 0);
+    } else {
+        @parallel for (a in 0..na) {
+            Engine_sig_arm(eng, eng->inv_ids, nd, a);
+        } !>.wait()!>;
+    }
+    eng->last_dirty = nd;
+    eng->sum_sig += now_ms() - t0;
+    double t1 = now_ms();
     eng->rebuild_share_dirty();
+    eng->sum_canon += now_ms() - t1;
     eng->t_share = now_ms() - t0;
     int nc = eng->ncanon;
     t0 = now_ms();
-    @parallel for (k in 0..nc) {
-        int i = eng->share_ents[k].i;
-        if (eng->nodes[i].dirty)
-            m->style_one(i);
+    na = arm_count(nc);
+    @parallel for (a in 0..na) {
+        Engine_style_arm(eng, nc, a, 1);
     } !>.wait()!>;
+    eng->sum_match += now_ms() - t0;
+    t1 = now_ms();
     for (int i = 0; i < eng->nnodes; i++) {
         if (!eng->nodes[i].dirty) continue;
         if (eng->share_of[i] != i)
             m->copy_specified(i, eng->share_of[i]);
     }
+    eng->sum_copy += now_ms() - t1;
     eng->t_match = now_ms() - t0;
     for (int si = 0; si < eng->nnodes; si++) {
         if (eng->nodes[si].dead || !eng->nodes[si].dirty) continue;
@@ -2240,6 +2640,7 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
             m->inherit_one(i);
     }
     eng->t_inherit = now_ms() - t0;
+    eng->sum_inherit += eng->t_inherit;
     return cc_ok();
 }
 
@@ -2365,27 +2766,33 @@ static void Engine_apply_mut(Engine* e, MutOp* m) {
     if (m->kind == MUT_ADD_LEAF) {
         if (m->id != e->nnodes || e->nnodes >= e->cap_nodes) return;
         Node* nd = &e->nodes[e->nnodes];
-        e->fill_node(nd, m->parent, m->a, m->b, m->classes, m->attrs);
+        e->fill_node(nd, -1, m->a, m->b, m->classes, m->attrs);
+        e->insert_child(m->parent, m->at, e->nnodes);
         nd->dirty = 1;
         e->levels_stale = 1;
         e->nnodes++;
+        if (e->has_sib_comb)
+            e->dirty_following(m->id);
         return;
     }
     if (m->id < 0 || m->id >= e->nnodes) return;
     Node* n = &e->nodes[m->id];
     if (m->kind == MUT_REMOVE_LEAF) {
+        if (e->has_sib_comb)
+            e->dirty_following(m->id);
         int p = n->parent;
-        if (p >= 0) {
-            int* w = &e->nodes[p].first_child;
-            while (*w >= 0) {
-                if (*w == m->id) {
-                    *w = n->next_sib;
-                    break;
-                }
-                w = &e->nodes[*w].next_sib;
-            }
-        }
+        int prev = n->prev_sib;
+        int next = n->next_sib;
+        if (prev >= 0)
+            e->nodes[prev].next_sib = next;
+        else if (p >= 0)
+            e->nodes[p].first_child = next;
+        if (next >= 0)
+            e->nodes[next].prev_sib = prev;
+        else if (p >= 0)
+            e->nodes[p].last_child = prev;
         n->next_sib = -1;
+        n->prev_sib = -1;
         n->dead = 1;
         n->parent = -1;
         return;
@@ -2497,6 +2904,7 @@ static void !>(CCError) Engine_run_mutations(Engine* e, CCShardDomain* domain, d
             double t0 = now_ms();
             e->style_dirty() !>;
             *mut_ms += now_ms() - t0;
+            e->sum_dirty += e->last_dirty;
             e->clear_dirty();
             start = end + 1;
         } else {
@@ -2516,6 +2924,11 @@ int main(int argc, char** argv) {
         : @slice("fixtures/tiny.stylebench");
     char[:] text = path.read_path(store) !>;
 
+    /* Pool size, like Stylo's STYLE_THREAD_POOL cap. Unset = every core. */
+    const char* wenv = getenv("CC_STYLE_WORKERS");
+    if (wenv && atoi(wenv) > 0)
+        cc_sched_set_num_workers((size_t)atoi(wenv));
+
     Engine eng = {0};
     eng.store = store;
     eng.load_fixture(text) !>;
@@ -2523,6 +2936,8 @@ int main(int argc, char** argv) {
     double t0 = now_ms();
     eng.style_all() !>;
     double ms = now_ms() - t0;
+    CCSchedulerStats st0 = {0};
+    cc_scheduler_stats(&st0);
     eng.t0_levels = eng.t_levels;
     eng.t0_share = eng.t_share;
     eng.t0_match = eng.t_match;
@@ -2536,13 +2951,15 @@ int main(int argc, char** argv) {
     CCShardDomain domain = cc_shard_domain(excl, mask);
     double mut_ms = 0;
     eng.run_mutations(&domain, &mut_ms) !>;
+    CCSchedulerStats st1 = {0};
+    cc_scheduler_stats(&st1);
 
     int live = 0;
     for (int i = 0; i < eng.nnodes; i++)
         if (!eng.nodes[i].dead) live++;
 
     io.println(@string(`# runner=cc fixture=${path}`, @scratch));
-    io.println(@string(`# TIME_MS=${ms} TIME_MUT_MS=${mut_ms} elements=${live} TIME_LEVELS=${eng.t0_levels} TIME_SHARE=${eng.t0_share} TIME_MATCH=${eng.t0_match} TIME_INHERIT=${eng.t0_inherit} LAST_MATCH=${eng.t_match} canons=${ncanon0} depth=${eng.max_depth} rules=${eng.nrules} univ=${eng.universal.len}`, @scratch));
+    io.println(@string(`# TIME_MS=${ms} TIME_MUT_MS=${mut_ms} elements=${live} TIME_LEVELS=${eng.t0_levels} TIME_SHARE=${eng.t0_share} TIME_MATCH=${eng.t0_match} TIME_INHERIT=${eng.t0_inherit} LAST_MATCH=${eng.t_match} LAST_SHARE=${eng.t_share} LAST_INHERIT=${eng.t_inherit} LAST_DIRTY=${eng.last_dirty} SUM_DIRTY=${eng.sum_dirty} WORKERS=${st0.workers}/${st1.workers} MUT_SIG=${eng.sum_sig} MUT_CANON=${eng.sum_canon} MUT_MATCH=${eng.sum_match} MUT_COPY=${eng.sum_copy} MUT_INHERIT=${eng.sum_inherit} canons=${ncanon0} depth=${eng.max_depth} rules=${eng.nrules} univ=${eng.universal.len}`, @scratch));
     for (int i = 0; i < eng.nnodes; i++) {
         Node* n = &eng.nodes[i];
         if (n->dead) continue;

@@ -39,7 +39,7 @@ compound: collect [
       [type_sel | universal] any [hash | class | attr]
     | some [hash | class | attr]
 ]
-combinator: keep [any wschar #'>' any wschar | some wschar]
+combinator: keep [any wschar [#'>' | #'+' | #'~'] any wschar | some wschar]
 selector:   collect [compound any [combinator compound]]
 
 prop:      keep ident

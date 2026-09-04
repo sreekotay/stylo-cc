@@ -1,0 +1,25 @@
+# stylebench-fixture 1
+# name=attr-descendant-batch
+# Two ancestor attrs in one restyle. Per-change undo misses the join flip.
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+[attr0] elem2 { background-color: rgb(213, 40, 106); }
+.class39 { background-color: rgb(93, 190, 200); }
+---tree---
+0	-1	div	testroot		
+1	0	elem9	-		
+2	1	elem9	-		
+3	2	elem2	-	class39	
+---mut---
++attr	1	attr0=val7
++attr	2	attr0=val
+restyle

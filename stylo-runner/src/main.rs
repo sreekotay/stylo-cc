@@ -185,6 +185,7 @@ fn main() {
     snapshots.clear();
     doc.clear_restyle_bits();
 
+    let sibling_combs = fix.css.contains(" + ") || fix.css.contains(" ~ ");
     let mut mut_ms = 0.0;
     let mut pending = false;
     for m in &fix.mutations {
@@ -198,7 +199,7 @@ fn main() {
                 pending = false;
             }
         } else {
-            doc.apply_mut(m, &mut snapshots);
+            doc.apply_mut(m, &mut snapshots, sibling_combs);
             pending = true;
         }
     }

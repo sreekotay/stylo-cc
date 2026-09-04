@@ -1,5 +1,5 @@
 # runner=cc fixture=fixtures/local/attr.stylebench
-# TIME_MS=0.07500004768371582 TIME_MUT_MS=0.0 elements=7 TIME_LEVELS=0.0 TIME_SHARE=0.0009999275207519531 TIME_MATCH=0.06699991226196289 TIME_INHERIT=0.0 LAST_MATCH=0.06699991226196289 canons=7 depth=2 rules=5 univ=1
+# TIME_MS=0.009000062942504883 TIME_MUT_MS=0.0 elements=7 TIME_LEVELS=0.0 TIME_SHARE=0.0009999275207519531 TIME_MATCH=0.002000093460083008 TIME_INHERIT=0.0 LAST_MATCH=0.002000093460083008 LAST_SHARE=0.0009999275207519531 LAST_INHERIT=0.0 LAST_DIRTY=0 SUM_DIRTY=0 WORKERS=10/10 MUT_SIG=0.0 MUT_CANON=0.0 MUT_MATCH=0.0 MUT_COPY=0.0 MUT_INHERIT=0.0 canons=7 depth=2 rules=5 univ=1
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(17, 17, 17)	bg=0,0,0,0
 1	span	id=sheet	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=20px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 255)	bg=0,0,0,0
 2	span	id=imp	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 255, 0)	bg=0,0,0,0

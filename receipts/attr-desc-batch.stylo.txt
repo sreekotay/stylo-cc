@@ -1,0 +1,6 @@
+# runner=stylo fixture=fixtures/local/attr-desc-batch.stylebench threads=6
+# TIME_MS=1.092 TIME_MUT_MS=0.256 elements=4
+0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
+1	elem9	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
+2	elem9	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
+3	elem2	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=213,40,106,255

@@ -1,0 +1,22 @@
+# stylebench-fixture 1
+# name=attr-descendant
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+[attr0] elem2 { background-color: rgb(213, 40, 106); }
+.class39 { background-color: rgb(93, 190, 200); }
+---tree---
+0	-1	div	testroot		
+1	0	elem9	-		
+2	1	elem2	-	class39	
+---mut---
++attr	1	attr0=val7
+restyle

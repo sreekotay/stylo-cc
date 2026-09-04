@@ -1,5 +1,5 @@
 # runner=cc fixture=fixtures/local/computed.stylebench
-# TIME_MS=0.04500007629394531 TIME_MUT_MS=0.0 elements=6 TIME_LEVELS=0.0 TIME_SHARE=0.0 TIME_MATCH=0.04400014877319336 TIME_INHERIT=0.0009999275207519531 LAST_MATCH=0.04400014877319336 canons=6 depth=2 rules=6 univ=1
+# TIME_MS=0.006000041961669922 TIME_MUT_MS=0.0 elements=6 TIME_LEVELS=0.0 TIME_SHARE=0.002000093460083008 TIME_MATCH=0.003000020980834961 TIME_INHERIT=0.0009999275207519531 LAST_MATCH=0.003000020980834961 LAST_SHARE=0.002000093460083008 LAST_INHERIT=0.0009999275207519531 LAST_DIRTY=0 SUM_DIRTY=0 WORKERS=10/10 MUT_SIG=0.0 MUT_CANON=0.0 MUT_MATCH=0.0 MUT_COPY=0.0 MUT_INHERIT=0.0 canons=6 depth=2 rules=6 univ=1
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0
 1	span	id=pct	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=20px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0
 2	span	id=half	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0

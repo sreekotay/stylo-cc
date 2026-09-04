@@ -136,6 +136,36 @@ impl Config {
         c.mutations_per_step = 8;
         c
     }
+
+    /// StyleBench `siblingCombinatorConfiguration`. Same seeds as default.
+    pub fn sibling_suite() -> Self {
+        let mut c = Self::default_suite();
+        c.name = "Sibling".into();
+        c.combinators = vec![
+            " ".into(),
+            " ".into(),
+            ">".into(),
+            ">".into(),
+            "~".into(),
+            "+".into(),
+        ];
+        c
+    }
+
+    /// Tiny tree / sheet with the sibling combinator mix.
+    pub fn tiny_sibling() -> Self {
+        let mut c = Self::tiny();
+        c.name = "TinySibling".into();
+        c.combinators = vec![
+            " ".into(),
+            " ".into(),
+            ">".into(),
+            ">".into(),
+            "~".into(),
+            "+".into(),
+        ];
+        c
+    }
 }
 
 #[derive(Clone, Debug)]

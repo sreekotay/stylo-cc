@@ -1,5 +1,5 @@
 # runner=stylo fixture=fixtures/default.stylebench threads=6
-# TIME_MS=31.573 TIME_MUT_MS=25.002 elements=20002
+# TIME_MS=28.708 TIME_MUT_MS=24.479 elements=20002
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
 1	elem9	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=34,96,48,255
 2	elem2	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=213,40,106,255

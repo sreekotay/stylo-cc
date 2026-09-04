@@ -342,7 +342,24 @@ impl HostDoc {
         }
     }
 
-    pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap) {
+    fn dirty_following_subtrees(&self, fixture_id: i32) {
+        let Some(id) = (fixture_id as u32).checked_add(1) else {
+            return;
+        };
+        if id as usize >= self.slots.len() {
+            return;
+        }
+        let mut n = self.slots[id as usize].next;
+        while let Some(sid) = n {
+            if !self.slots[sid as usize].dead.get() {
+                self.slots[sid as usize].data.borrow_mut().hint = RestyleHint::restyle_subtree();
+                self.note_dirty_path(sid as i32 - 1);
+            }
+            n = self.slots[sid as usize].next;
+        }
+    }
+
+    pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap, sibling_combs: bool) {
         match m {
             Mut::AddClass { id, class } => {
                 let atom = AtomIdent::from(&**class);
@@ -410,8 +427,16 @@ impl HostDoc {
             } => {
                 self.add_leaf(*id, *parent, *at, tag, dom_id.as_deref(), classes, attrs);
                 self.note_dirty_path(*id);
+                if sibling_combs {
+                    self.dirty_following_subtrees(*id);
+                }
             }
-            Mut::RemoveLeaf { id } => self.remove_leaf(*id),
+            Mut::RemoveLeaf { id } => {
+                if sibling_combs {
+                    self.dirty_following_subtrees(*id);
+                }
+                self.remove_leaf(*id);
+            }
             Mut::Restyle => {}
         }
     }

@@ -1,0 +1,285 @@
+/* CSS value cells. Plain C on purpose: the engine's @comptime block
+ * includes this to bake initial values into struct literals, and the
+ * runtime includes it to parse declarations and print computed values.
+ * Three cells cover every longhand Stylo exposes to content:
+ *   atom  - an interned text (keywords, and anything kept verbatim)
+ *   len   - one number with a unit, or a keyword (auto / normal / none)
+ *   color - rgba, or currentcolor / none / auto
+ */
+#ifndef STYLEBENCH_CSSVAL_H
+#define STYLEBENCH_CSSVAL_H
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+enum { U_NUM = 0, U_PX, U_EM, U_REM, U_PCT };
+enum { LKW_NONE = 0, LKW_AUTO, LKW_NORMAL, LKW_NONE_KW, LKW_MAX_CONTENT,
+       LKW_MIN_CONTENT, LKW_FIT_CONTENT, LKW_BOLDER, LKW_LIGHTER, N_LKW };
+static const char* const LKW_TEXT[N_LKW] = {
+    "", "auto", "normal", "none", "max-content", "min-content", "fit-content",
+    "bolder", "lighter"
+};
+
+/* v is the specified number; px is what it resolves to (em / rem / % on
+ * font-size). Keeping v means a re-inherit re-resolves exactly. */
+typedef struct {
+    float v;
+    float px;
+    uint8_t unit;
+    uint8_t kw;
+} CssLen;
+
+enum { CKW_RGB = 0, CKW_CURRENT, CKW_NONE, CKW_AUTO };
+typedef struct {
+    uint8_t r, g, b, a, kw;
+} CssColor;
+
+static const char* cssval_trim(const char* s, size_t* n) {
+    while (*n && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r')) { s++; (*n)--; }
+    while (*n && (s[*n - 1] == ' ' || s[*n - 1] == '\t' || s[*n - 1] == '\n' || s[*n - 1] == '\r')) (*n)--;
+    return s;
+}
+
+static int cssval_eq(const char* s, size_t n, const char* lit) {
+    size_t m = strlen(lit);
+    if (n != m) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char a = s[i], b = lit[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int cssval_parse_len(const char* s, size_t n, CssLen* out) {
+    s = cssval_trim(s, &n);
+    memset(out, 0, sizeof(*out));
+    for (int k = 1; k < N_LKW; k++) {
+        if (cssval_eq(s, n, LKW_TEXT[k])) {
+            out->kw = (uint8_t)k;
+            return 1;
+        }
+    }
+    if (!n) return 0;
+    size_t i = 0;
+    int neg = 0;
+    if (s[i] == '-' || s[i] == '+') { neg = s[i] == '-'; i++; }
+    double v = 0;
+    int digits = 0;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; digits++; }
+    if (i < n && s[i] == '.') {
+        i++;
+        double f = 0.1;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { v += (s[i] - '0') * f; f *= 0.1; i++; digits++; }
+    }
+    if (!digits) return 0;
+    if (neg) v = -v;
+    const char* u = s + i;
+    size_t un = n - i;
+    if (un == 0) out->unit = U_NUM;
+    else if (cssval_eq(u, un, "px")) out->unit = U_PX;
+    else if (cssval_eq(u, un, "em")) out->unit = U_EM;
+    else if (cssval_eq(u, un, "rem")) out->unit = U_REM;
+    else if (un == 1 && u[0] == '%') out->unit = U_PCT;
+    else return 0;
+    out->v = (float)v;
+    out->px = out->unit == U_PX ? (float)v : 0.0f;
+    return 1;
+}
+
+/* em / rem resolve against a font size; % only on font-size (the caller
+ * passes the parent's size as `fs` for that one field). */
+static inline void cssval_resolve(CssLen* l, float fs, float root_fs, int pct_of_fs) {
+    if (l->kw) return;
+    switch (l->unit) {
+    case U_EM:  l->px = l->v * fs; break;
+    case U_REM: l->px = l->v * root_fs; break;
+    case U_PCT: if (pct_of_fs) l->px = l->v * fs / 100.0f; break;
+    default: break;
+    }
+}
+
+static int cssval_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int cssval_parse_num_at(const char* s, size_t n, size_t* i, double* out) {
+    size_t k = *i;
+    while (k < n && (s[k] == ' ' || s[k] == '\t')) k++;
+    size_t start = k;
+    double v = 0;
+    int neg = 0, digits = 0;
+    if (k < n && (s[k] == '-' || s[k] == '+')) { neg = s[k] == '-'; k++; }
+    while (k < n && s[k] >= '0' && s[k] <= '9') { v = v * 10 + (s[k] - '0'); k++; digits++; }
+    if (k < n && s[k] == '.') {
+        k++;
+        double f = 0.1;
+        while (k < n && s[k] >= '0' && s[k] <= '9') { v += (s[k] - '0') * f; f *= 0.1; k++; digits++; }
+    }
+    if (!digits) { *i = start; return 0; }
+    if (k < n && s[k] == '%') { v = v * 255.0 / 100.0; k++; }
+    while (k < n && (s[k] == ' ' || s[k] == '\t')) k++;
+    *out = neg ? -v : v;
+    *i = k;
+    return 1;
+}
+
+static uint8_t cssval_clamp255(double v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)(v + 0.5);
+}
+
+static int cssval_parse_color(const char* s, size_t n, CssColor* out) {
+    s = cssval_trim(s, &n);
+    memset(out, 0, sizeof(*out));
+    if (cssval_eq(s, n, "currentcolor")) { out->kw = CKW_CURRENT; return 1; }
+    if (cssval_eq(s, n, "none")) { out->kw = CKW_NONE; return 1; }
+    if (cssval_eq(s, n, "auto")) { out->kw = CKW_AUTO; return 1; }
+    if (cssval_eq(s, n, "transparent")) return 1;
+    if (cssval_eq(s, n, "black")) { out->a = 255; return 1; }
+    if (cssval_eq(s, n, "white")) { out->r = out->g = out->b = out->a = 255; return 1; }
+    if (cssval_eq(s, n, "red")) { out->r = 255; out->a = 255; return 1; }
+    if (n >= 4 && s[0] == '#') {
+        int d[8];
+        size_t m = n - 1;
+        if (m != 3 && m != 4 && m != 6 && m != 8) return 0;
+        for (size_t i = 0; i < m; i++) {
+            d[i] = cssval_hex(s[1 + i]);
+            if (d[i] < 0) return 0;
+        }
+        out->a = 255;
+        if (m <= 4) {
+            out->r = (uint8_t)(d[0] * 17);
+            out->g = (uint8_t)(d[1] * 17);
+            out->b = (uint8_t)(d[2] * 17);
+            if (m == 4) out->a = (uint8_t)(d[3] * 17);
+        } else {
+            out->r = (uint8_t)(d[0] * 16 + d[1]);
+            out->g = (uint8_t)(d[2] * 16 + d[3]);
+            out->b = (uint8_t)(d[4] * 16 + d[5]);
+            if (m == 8) out->a = (uint8_t)(d[6] * 16 + d[7]);
+        }
+        return 1;
+    }
+    if (n >= 5 && (s[0] == 'r' || s[0] == 'R') && (s[1] == 'g' || s[1] == 'G') &&
+        (s[2] == 'b' || s[2] == 'B')) {
+        size_t i = 3;
+        if (i < n && (s[i] == 'a' || s[i] == 'A')) i++;
+        while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+        if (i >= n || s[i] != '(') return 0;
+        i++;
+        double c[4] = { 0, 0, 0, 255 };
+        int k = 0;
+        for (; k < 4; k++) {
+            if (!cssval_parse_num_at(s, n, &i, &c[k])) break;
+            if (k == 3) break;
+            if (i < n && (s[i] == ',' || s[i] == '/')) { i++; continue; }
+            if (i < n && s[i] != ')') continue; /* space separated */
+            k++;
+            break;
+        }
+        if (k < 2) return 0;
+        if (k == 3) {
+            /* alpha given as 0..1 unless it came with % (already scaled) */
+            if (c[3] <= 1.0 && !(i > 0 && s[i - 1] == '%')) c[3] = c[3] * 255.0;
+        }
+        while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+        if (i >= n || s[i] != ')') return 0;
+        out->r = cssval_clamp255(c[0]);
+        out->g = cssval_clamp255(c[1]);
+        out->b = cssval_clamp255(c[2]);
+        out->a = cssval_clamp255(c[3]);
+        return 1;
+    }
+    return 0;
+}
+
+/* One declaration in a rule: which longhand, its importance, and the
+ * value in the cell for that longhand's kind. `wide` is a CSS-wide
+ * keyword: 1 = initial (the cell is unused). */
+typedef struct {
+    uint16_t prop;
+    uint8_t imp;
+    uint8_t wide;
+    union {
+        int atom;
+        CssLen len;
+        CssColor color;
+    } v;
+} CssDecl;
+
+/* Output line builder: one computed-style row is a few KB. */
+typedef struct {
+    char* p;
+    size_t n, cap;
+} CssOut;
+
+static inline void css_out_bytes(CssOut* o, const char* s, size_t n) {
+    if (o->n + n > o->cap) n = o->cap > o->n ? o->cap - o->n : 0;
+    memcpy(o->p + o->n, s, n);
+    o->n += n;
+}
+
+static inline void css_out_str(CssOut* o, const char* s) { css_out_bytes(o, s, strlen(s)); }
+
+static void css_out_num(CssOut* o, double v) {
+    char buf[32];
+    int n;
+    if (v == (double)(long long)v && v > -1e15 && v < 1e15)
+        n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+    else
+        n = snprintf(buf, sizeof buf, "%g", v);
+    if (n < 0) n = 0;
+    css_out_bytes(o, buf, (size_t)n);
+}
+
+static void css_out_len(CssOut* o, const CssLen* l) {
+    if (l->kw) { css_out_str(o, LKW_TEXT[l->kw]); return; }
+    switch (l->unit) {
+    case U_NUM: css_out_num(o, l->v); break;
+    case U_PCT: css_out_num(o, l->v); css_out_str(o, "%"); break;
+    default:    css_out_num(o, l->px); css_out_str(o, "px"); break;
+    }
+}
+
+static void css_out_color(CssOut* o, const CssColor* c) {
+    if (c->kw == CKW_CURRENT) { css_out_str(o, "currentcolor"); return; }
+    if (c->kw == CKW_NONE) { css_out_str(o, "none"); return; }
+    if (c->kw == CKW_AUTO) { css_out_str(o, "auto"); return; }
+    char buf[64];
+    int n;
+    if (c->a == 255)
+        n = snprintf(buf, sizeof buf, "rgb(%d, %d, %d)", c->r, c->g, c->b);
+    else if (c->a == 0)
+        n = snprintf(buf, sizeof buf, "rgba(%d, %d, %d, 0)", c->r, c->g, c->b);
+    else
+        n = snprintf(buf, sizeof buf, "rgba(%d, %d, %d, %g)", c->r, c->g, c->b, c->a / 255.0);
+    if (n < 0) n = 0;
+    css_out_bytes(o, buf, (size_t)n);
+}
+
+/* Stylo serializes a string `content` in double quotes. */
+static void css_out_content(CssOut* o, const char* s, size_t n) {
+    if (n >= 2 && s[0] == '\'' && s[n - 1] == '\'') {
+        css_out_str(o, "\"");
+        css_out_bytes(o, s + 1, n - 2);
+        css_out_str(o, "\"");
+        return;
+    }
+    css_out_bytes(o, s, n);
+}
+
+static inline int cssval_len_eq(const CssLen* a, const CssLen* b) {
+    return a->kw == b->kw && a->unit == b->unit && a->v == b->v && a->px == b->px;
+}
+
+static inline int cssval_color_eq(const CssColor* a, const CssColor* b) {
+    return a->kw == b->kw && a->r == b->r && a->g == b->g && a->b == b->b && a->a == b->a;
+}
+
+#endif

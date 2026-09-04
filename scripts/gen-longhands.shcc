@@ -1,0 +1,156 @@
+#!/usr/bin/env -S ccc --as=shcc
+/*
+ * Longhand table for the CC engine, from Stylo's own sources.
+ *
+ *   stylo-runner/target/release/stylo-runner --longhands \
+ *     | ccc scripts/gen-longhands.shcc > engine/longhands.cch
+ *
+ * stdin: one row per content-enabled physical longhand, in Stylo's id
+ * order: `name \t inherited \t initial`. The struct family and the value
+ * shape come from stylo/style/properties/longhands.toml (path may be given
+ * as the one argument). The output is a plain C table; the engine's
+ * @comptime block walks it and emits the typed structs, initial-value
+ * literals, and per-family inherit / resolve / dump code. Adding a
+ * longhand is a row here and nothing else.
+ */
+#include <string.h>
+
+@grammar(schema) LhRow {~~~~
+    rules [
+        cell:  keep [some complement charset [#'\t' #'\n']]
+        digit: charset [#'0' - #'9']
+        num:   keep [some digit]
+    ]
+    name: cell #'\t' inherited: int num #'\t' init: cell #'\n'
+~~~~}
+
+/* The subset of TOML the table uses: `[section]` headers and
+ * `key = "string"` rows. Everything else is a line to skip. */
+@grammar(rules) Toml {~~~~
+    top:     collect [any line]
+    line:    [section | kv | other]
+    rest:    any complement charset [#'\n']
+    sp:      any charset [#' ' #'\t']
+    section: collect [#'[' keep [some complement charset [#']' #'\n']] #']' rest #'\n']
+    key:     keep [some charset [#'a' - #'z' #'A' - #'Z' #'0' - #'9' #'_' #'-']]
+    str:     [#'"' keep [any complement charset [#'"' #'\n']] #'"']
+    kv:      collect [key sp #'=' sp str rest #'\n']
+    other:   [rest #'\n']
+~~~~}
+
+typedef struct {
+    CCSlice fam;
+    CCSlice type;
+} Entry;
+
+static CCSlice node_span(TomlNode* nd) {
+    CCSlice v = cc_slice_empty();
+    if (nd) nd->slice(&v);
+    return v;
+}
+
+/* Value shape by Stylo's specified type. A type that serializes as one
+ * number-with-unit or one of a few keywords is a `len`; colors are
+ * `color`; anything else is kept as interned text. */
+static const char* const LEN_TYPES[] = {
+    "BaselineShift", "BorderSideOffset", "BorderSideWidth", "FlexBasis", "FontSize",
+    "FontStretch", "FontWeight", "Inset", "Integer", "LengthPercentage", "LetterSpacing",
+    "LineHeight", "Margin", "MaxSize", "NonNegativeLengthOrNumber",
+    "NonNegativeLengthPercentage", "NonNegativeLengthPercentageOrAuto", "NonNegativeNumber",
+    "Opacity", "OverflowClipMargin", "Perspective", "SVGLength", "SVGOpacity", "SVGWidth",
+    "Size", "TextDecorationLength", "TextIndent", "WordSpacing", "ZIndex",
+    "length::NonNegativeLengthPercentageOrNormal", "position::HorizontalPosition",
+    "position::VerticalPosition", 0
+};
+static const char* const COLOR_TYPES[] = {
+    "Color", "ColorPropertyValue", "SVGPaint", "color::CaretColor", 0
+};
+
+static const char* kind_of(CCSlice type) {
+    for (int i = 0; LEN_TYPES[i]; i++)
+        if (type.eq_cstr(LEN_TYPES[i])) return "LH_LEN";
+    for (int i = 0; COLOR_TYPES[i]; i++)
+        if (type.eq_cstr(COLOR_TYPES[i])) return "LH_COLOR";
+    return "LH_ATOM";
+}
+
+CCArena ar = cc_arena_heap(megabytes(64)) @destroy;
+CCStdio out = cc_stdio_create(ar);
+
+char[:0] toml_path = args.len >= 1
+    ? cc_slice_cstr(((char**)args.ptr)[0])
+    : @slice("stylo/style/properties/longhands.toml");
+CCSlice toml = cc_file_read_path(toml_path, ar) !>;
+
+/* The grammar wants every line newline-terminated. */
+char* tbuf = (char*)cc_arena_alloc(ar, toml.len + 1, 1);
+memcpy(tbuf, toml.ptr, toml.len);
+tbuf[toml.len] = '\n';
+TomlNode* root = Toml.parse(tbuf, toml.len + 1, ar);
+if (!root) {
+    out.eprintln(@slice("longhands.toml: grammar miss"));
+    return 2;
+}
+TomlNode* top = root->first();
+if (top && top->is_list()) root = top;
+
+Map::[CCSlice, Entry] table = map_new::[CCSlice, Entry](ar);
+CCSlice cur = cc_slice_empty();
+int cur_dotted = 0;
+TomlNode* ch = root->first();
+while (ch) {
+    if (ch->is_list() && ch->id() == Toml_KEEP_section) {
+        cur = node_span(ch->first());
+        cur_dotted = 0;
+        @for (c in cur) if (c == '.') cur_dotted = 1;
+        if (!cur_dotted) {
+            Entry en = { cc_slice_empty(), cc_slice_empty() };
+            table->insert(cur, en);
+        }
+    } else if (ch->is_list() && ch->id() == Toml_KEEP_kv && cur.len && !cur_dotted) {
+        TomlNode* k = ch->first();
+        TomlNode* v = k ? k->next(ch) : 0;
+        CCSlice key = node_span(k);
+        CCSlice val = node_span(v);
+        Entry* en = table->get_ptr(cur);
+        if (en) {
+            if (key.eq_cstr("struct")) en->fam = val;
+            else if (key.eq_cstr("type")) en->type = val;
+        }
+    }
+    ch = ch->next(root);
+}
+
+char[:] rows = in;
+LhRowReader rd = cc_reader(LhRow, rows.ptr, rows.len, ar);
+LhRow row;
+int n = 0;
+CCString body = cc_string_with_capacity(ar, 32768);
+while (cc_next(LhRow, &rd, &row)) {
+    Entry* en = table->get_ptr(row.name);
+    if (!en || !en->fam.len) {
+        out.eprintln(@string(`longhands.toml: no struct for ${row.name}`, ar));
+        return 2;
+    }
+    CCString line = @string(`    { "${row.name}", "${en->fam}", ${row.inherited}, ${kind_of(en->type)}, "${row.init}" },\n`, ar);
+    body.push(line.as_slice(), ar);
+    n++;
+}
+if (!cc_at_end(LhRow, &rd)) {
+    out.eprintln(@slice("longhands: row grammar miss"));
+    return 2;
+}
+
+out.write_all(@slice("/* Generated by scripts/gen-longhands.shcc from `stylo-runner --longhands`\n"
+                      " * and stylo/style/properties/longhands.toml. Do not edit. */\n\n"
+                      "enum { LH_ATOM = 0, LH_LEN = 1, LH_COLOR = 2 };\n"
+                      "typedef struct {\n"
+                      "    const char* name;\n"
+                      "    const char* fam;\n"
+                      "    int inherited;\n"
+                      "    int kind;\n"
+                      "    const char* init;\n"
+                      "} LonghandRow;\n\n"
+                      "static const LonghandRow LONGHANDS[] = {\n")) !>;
+out.write_all(body.as_slice()) !>;
+out.write_all(@string(`};\nenum { N_LONGHANDS = ${n} };\n`, ar).as_slice()) !>;

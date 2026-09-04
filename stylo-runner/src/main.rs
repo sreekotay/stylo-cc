@@ -33,7 +33,6 @@ use style::values::computed::font::GenericFontFamily;
 use style::values::specified::font::QueryFontMetricsFlags;
 use style::Atom;
 use style::servo_arc::Arc;
-use style_traits::ToCss;
 use stylebench_fixture::{Fixture, Mut};
 
 #[derive(Debug)]
@@ -108,15 +107,37 @@ fn parse_sheet(css: &str, lock: style::shared_lock::SharedRwLock) -> Stylesheet 
     )
 }
 
-fn bg_rgba(style: &ComputedValues) -> (u8, u8, u8, u8) {
-    use style::color::ColorSpace;
-    let abs = style.resolve_color(&style.get_background().background_color);
-    let srgb = abs.to_color_space(ColorSpace::Srgb);
-    let r = (srgb.components.0 * 255.0).round().clamp(0.0, 255.0) as u8;
-    let g = (srgb.components.1 * 255.0).round().clamp(0.0, 255.0) as u8;
-    let b = (srgb.components.2 * 255.0).round().clamp(0.0, 255.0) as u8;
-    let a = (srgb.alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-    (r, g, b, a)
+/// prints every one of them.
+fn content_longhands() -> Vec<style::properties::LonghandId> {
+    use style::properties::{NonCustomPropertyId, PropertyId};
+    let mut out = Vec::new();
+    for id in NonCustomPropertyId::iter() {
+        let Some(lh) = id.as_longhand() else { continue };
+        if lh.is_logical() || !PropertyId::NonCustom(id).enabled_for_all_content() {
+            continue;
+        }
+        let name = lh.name();
+        if name.starts_with("-x-") || name.starts_with("-servo-") || name.starts_with("-moz-") {
+            continue;
+        }
+        out.push(lh);
+    }
+    out
+}
+
+/// `name \t inherited \t initial-value`, computed (unresolved) form:
+/// `currentcolor` stays a keyword, the style adjuster has not run.
+fn dump_longhands() {
+    let initial = ComputedValues::initial_values_with_font_override(
+        style::properties::style_structs::Font::initial_values(),
+    );
+    for lh in content_longhands() {
+        let mut v = String::new();
+        initial
+            .computed_or_resolved_value(lh, None, &mut v)
+            .expect("serialize");
+        println!("{}\t{}\t{}", lh.name(), lh.inherited() as u8, v);
+    }
 }
 
 fn main() {
@@ -124,6 +145,10 @@ fn main() {
     let path = env::args()
         .nth(1)
         .unwrap_or_else(|| "fixtures/tiny.stylebench".into());
+    if path == "--longhands" {
+        dump_longhands();
+        return;
+    }
     let text = fs::read_to_string(&path).expect("read fixture");
     let fix = Fixture::parse(&text).expect("parse fixture");
 
@@ -228,24 +253,20 @@ fn main() {
         "# TIME_MS={ms:.3} TIME_MUT_MS={mut_ms:.3} elements={}",
         doc.live_count()
     );
+    let longhands = content_longhands();
     let line = |idx: usize, tag: &str, id: &str, style: &ComputedValues| -> String {
-        let (r, g, b, a) = bg_rgba(style);
-        format!(
-            "{}\t{}\tid={}\tdisp={}\tpos={}\tw={}\th={}\tminw={}\tfs={}\tlh={}\tfw={}\tvis={}\tcolor={}\tbg={r},{g},{b},{a}",
-            idx,
-            tag,
-            id,
-            style.clone_display().to_css_string(),
-            style.clone_position().to_css_string(),
-            style.clone_width().to_css_string(),
-            style.clone_height().to_css_string(),
-            style.clone_min_width().to_css_string(),
-            style.clone_font_size().to_css_string(),
-            style.clone_line_height().to_css_string(),
-            style.clone_font_weight().to_css_string(),
-            style.clone_visibility().to_css_string(),
-            style.clone_color().to_css_string(),
-        )
+        let mut out = format!("{}\t{}\tid={}", idx, tag, id);
+        for lh in &longhands {
+            out.push('\t');
+            out.push_str(lh.name());
+            out.push('=');
+            let mut v = String::new();
+            style
+                .computed_or_resolved_value(*lh, None, &mut v)
+                .expect("serialize");
+            out.push_str(&v);
+        }
+        out
     };
     doc.each_element(|el| {
         let data = el.borrow_data().expect("styled");
@@ -263,11 +284,7 @@ fn main() {
         for pseudo in [PseudoElement::Before, PseudoElement::After] {
             if let Some(ps) = data.styles.pseudos.get(&pseudo) {
                 let tag = if pseudo == PseudoElement::Before { "::before" } else { "::after" };
-                println!(
-                    "{}\tcontent={}",
-                    line(idx, tag, id, ps),
-                    ps.clone_content().to_css_string()
-                );
+                println!("{}", line(idx, tag, id, ps));
             }
         }
     });

@@ -37,24 +37,29 @@ if [ ! -f "$ROOT/stylo/Cargo.toml" ]; then
     exit 1
 fi
 
-mkdir -p "$FIXTURES" "$RECEIPTS"
+# Full dumps (70-200 MB at 189 longhands) land in receipts/full/, gitignored;
+# the committed receipt is the header plus a digest of the body.
+FULL="$RECEIPTS/full"
+mkdir -p "$FIXTURES" "$FULL"
 echo "== generate $SUITE 20k =="
 "$CARGO" run -q -p stylebench-gen --release -- "$GEN" > "$FIX"
 
 echo "== stylo release =="
 "$CARGO" run -q --release --manifest-path "$ROOT/stylo-runner/Cargo.toml" -- \
-    "$FIX" > "$RECEIPTS/$OUT.stylo.txt"
+    "$FIX" > "$FULL/$OUT.stylo.txt"
 
 echo "== cc -O (warm) =="
 "$CCC" build run -O "$ROOT/engine/stylebench_cc.ccs" -- "$FIX" > /dev/null
 echo "== cc -O =="
 "$CCC" build run -O "$ROOT/engine/stylebench_cc.ccs" -- "$FIX" \
-    > "$RECEIPTS/$OUT.cc.txt"
+    > "$FULL/$OUT.cc.txt"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-grep -v '^#' "$RECEIPTS/$OUT.stylo.txt" > "$tmp/stylo"
-grep -v '^#' "$RECEIPTS/$OUT.cc.txt" > "$tmp/cc"
+grep -v '^#' "$FULL/$OUT.stylo.txt" > "$tmp/stylo"
+grep -v '^#' "$FULL/$OUT.cc.txt" > "$tmp/cc"
 cmp "$tmp/stylo" "$tmp/cc"
 echo "OK $OUT"
+"$ROOT/scripts/receipt.sh" "$FULL/$OUT.stylo.txt" "$RECEIPTS/$OUT.stylo.txt"
+"$ROOT/scripts/receipt.sh" "$FULL/$OUT.cc.txt" "$RECEIPTS/$OUT.cc.txt"
 grep '^# TIME' "$RECEIPTS/$OUT.stylo.txt" "$RECEIPTS/$OUT.cc.txt"

@@ -6,7 +6,7 @@ RECEIPTS ?= receipts
 FIXTURES ?= fixtures
 CCC ?= ccc
 
-.PHONY: setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media test build release bench help
+.PHONY: longhands setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media test build release bench help
 
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
@@ -24,10 +24,16 @@ help:
 	@echo "bench-nth       nth 20k/5k, same shape as bench-sibling"
 	@echo "bench-ba        before/after 20k/5k, same shape as bench-sibling"
 	@echo "bench-media     media queries 5k/5k, 55 resizes, same shape as bench-sibling"
+	@echo "longhands       regenerate engine/longhands.cch from Stylo's --longhands dump + longhands.toml"
 	@echo "test            upstream cargo test --workspace"
 
 setup:
 	git submodule update --init --depth 1
+
+# Stylo's content-longhand list -> the table the engine's @comptime block walks.
+longhands: $(STYLO)/Cargo.toml
+	$(CARGO) run -q --release --manifest-path stylo-runner/Cargo.toml -- --longhands \
+		| $(CCC) scripts/gen-longhands.shcc $(STYLO)/style/properties/longhands.toml > engine/longhands.cch
 
 fixture: $(STYLO)/Cargo.toml
 	mkdir -p $(FIXTURES)
@@ -139,16 +145,20 @@ compare-local:
 	done
 
 # First restyle + StyleBench mutation steps (class / attr / leaf), then cmp.
+# Full 20k dumps (70-200 MB at 189 longhands) go under receipts/full/
+# (gitignored); the committed receipt is the header + a body digest.
 bench-style: fixture-default
-	mkdir -p $(RECEIPTS)
+	mkdir -p $(RECEIPTS)/full
 	$(CARGO) run -q --release --manifest-path stylo-runner/Cargo.toml -- \
-		$(FIXTURES)/default.stylebench > $(RECEIPTS)/default.stylo.txt
+		$(FIXTURES)/default.stylebench > $(RECEIPTS)/full/default.stylo.txt
 	$(CCC) build run -O engine/stylebench_cc.ccs -- \
-		$(FIXTURES)/default.stylebench > $(RECEIPTS)/default.cc.txt
-	@grep -v '^#' $(RECEIPTS)/default.stylo.txt > /tmp/stylo.styles
-	@grep -v '^#' $(RECEIPTS)/default.cc.txt > /tmp/cc.styles
+		$(FIXTURES)/default.stylebench > $(RECEIPTS)/full/default.cc.txt
+	@grep -v '^#' $(RECEIPTS)/full/default.stylo.txt > /tmp/stylo.styles
+	@grep -v '^#' $(RECEIPTS)/full/default.cc.txt > /tmp/cc.styles
 	cmp /tmp/stylo.styles /tmp/cc.styles
 	@echo OK
+	@./scripts/receipt.sh $(RECEIPTS)/full/default.stylo.txt $(RECEIPTS)/default.stylo.txt
+	@./scripts/receipt.sh $(RECEIPTS)/full/default.cc.txt $(RECEIPTS)/default.cc.txt
 	@grep '^# TIME' $(RECEIPTS)/default.stylo.txt $(RECEIPTS)/default.cc.txt
 
 # Same shape as bench-style, one generated suite each.

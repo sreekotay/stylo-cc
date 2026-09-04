@@ -29,89 +29,20 @@
 #define MAX_SELCOMP 16
 #define MAX_SHARDS  64
 #define SIB_SLOTS   8
-#define PX_AUTO   (-1)
-#define PX_NORMAL (-2)
-#define INIT_FS_PX 16
-#define INIT_FW    400
-#define UNIT_PX    0
-#define UNIT_EM    1
-#define UNIT_PCT   2
-#define UNIT_REM   3
 
-/* Specified values live on the rule. Used on the node is proto pointers
- * (initial / parent / this node's slot). Miss: inherit → parent struct,
- * reset → initial. fill_rule / inherit_one / dump stay handwritten. */
-typedef struct {
-    int r;
-    int g;
-    int b;
-    int a;
-} CssRgba;
-
-typedef struct {
-    int r;
-    int g;
-    int b;
-} CssRgb;
-
-typedef struct {
-    CssRgba bg;
-} StyBg;
-
-typedef struct {
-    int height_px;
-    int minw_px;
-    int width_px;
-    CCSlice display;
-    CCSlice position;
-    CCSlice content;
-} StyBox;
-
-typedef struct {
-    int fs_px;
-    int lh_px;
-    int fw;
-    CssRgb color;
-    CCSlice visibility;
-} StyFont;
-
-typedef struct {
-    StyBg bg;
-    StyBox box;
-    StyFont font;
-} Specified;
-
-typedef struct {
-    StyBg* bg;
-    StyBox* box;
-    StyFont* font;
-} Used;
-
-/* P_* by group so N_BG / N_BOX / N_FONT are counts. String reflect —
- * type_of in @comptime { } still fails in this TU. */
+/* The property layer is generated at compile time from Stylo's own
+ * longhand table (engine/longhands.cch, written by
+ * scripts/gen-longhands.shcc from `stylo-runner --longhands`): one typed
+ * struct per Stylo style struct, initial values, and the per-family
+ * inherit / resolve / compare / dump code, all straight-line C spliced
+ * here. See engine/sty_emit.cch. A node views one struct per family
+ * (StyRefs) and owns a pool slot only for families a declaration wrote;
+ * everything else is a pointer to the initial struct or to the parent's. */
+#include "cssval.cch"
+#include "sty_emit.cch"
 @comptime {
-    const char* groups[3] = { "StyBg", "StyBox", "StyFont" };
-    const char* nnames[3] = { "N_BG", "N_BOX", "N_FONT" };
-    int idx = 0;
-    cc_emit_format(CC_EMIT_AFTER_PRELUDE, "enum {\n");
-    for (int g = 0; g < 3; g++) {
-        int n = cc_reflect_field_count(groups[g]);
-        for (int i = 0; i < n; i++) {
-            char nm[128];
-            cc_reflect_field_name(groups[g], i, nm, sizeof(nm));
-            cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    P_%s = %d,\n", nm, idx);
-            idx++;
-        }
-        cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    %s = %d,\n", nnames[g], n);
-    }
-    cc_emit_format(CC_EMIT_AFTER_PRELUDE, "    NPROP = %d\n};\n", idx);
+    cc_emit_cstr(CC_EMIT_AT_COMPTIME_SITE, sty_build());
 }
-
-static const Specified SPEC_INIT = {
-    .bg = {{0, 0, 0, 0}},
-    .box = {PX_AUTO, PX_AUTO, PX_AUTO, {0}, {0}, {0}},
-    .font = {INIT_FS_PX, PX_NORMAL, INIT_FW, {0, 0, 0}, {0}},
-};
 
 @grammar(rules) Css {~~~~
     top: stylesheet
@@ -234,12 +165,17 @@ typedef struct {
     uint64_t w[BLOOM_WORDS];
 } Bloom;
 
+typedef struct Rule Rule;
+
 typedef struct {
     int parent;
     int nclass, nattr;
     int cap_class, cap_attr;
     int dead;
     int dirty;
+    /* Clean node whose parent's inherited struct changed this restyle:
+     * re-inherit only, no match. */
+    int inh_dirty;
     int inv_gen;
     int bloom_gen;
     unsigned pos;
@@ -247,16 +183,14 @@ typedef struct {
     int sib_hit[SIB_SLOTS];
     int first_child, last_child, next_sib, prev_sib;
     int depth;
-    unsigned specified;
-    int spec_a[NPROP];
-    int spec_b[NPROP];
-    int spec_c[NPROP];
-    int win_order[NPROP];
-    int win_rank[NPROP];
-    int fs_spec;
-    int fs_unit;
-    int bg_current;
-    Used used;
+    /* Which longhands a declaration set on this node (holes inherit). */
+    uint64_t specified[PS_WORDS];
+    /* One struct per family: initial, the parent's, or this node's own
+     * pool slot (bit set in `own`). */
+    StyRefs sty;
+    unsigned own;
+    /* The style attribute, parsed once when set. */
+    Rule* inline_rule;
     CCSlice tag;
     CCSlice dom_id;
     CCSlice* classes;
@@ -331,13 +265,13 @@ static int cc_map_key_eq_AtomPair(AtomPair a, AtomPair b) {
 
 enum { ORIGIN_UA = 0, ORIGIN_AUTHOR = 1, ORIGIN_STYLE = 2 };
 
-typedef struct {
+struct Rule {
     int n, sa, sb, sc, order, origin;
-    unsigned props;
-    unsigned imp;
-    int fs_unit;
-    int bg_current;
-    Specified spec;
+    /* The declaration block: longhands only (shorthands expanded at
+     * parse), each with its value cell and importance. */
+    CssDecl* decls;
+    int ndecl;
+    int has_imp;
     Compound* c;
     Comb* comb;
     /* Union of the needs of the trailing run of ancestor compounds (those
@@ -351,7 +285,20 @@ typedef struct {
      * currently false for the viewport: an off rule matches nothing. */
     int mq;
     int off;
-} Rule;
+};
+
+/* One matched rule on its way into the cascade: origin, specificity and
+ * order packed so a sort puts the declarations in cascade order. */
+typedef struct {
+    uint64_t key;
+    int rule;
+} Hit;
+#define HIT_CAP 4096
+typedef struct {
+    Hit* h[3];
+    int n[3];
+    int dropped;
+} Hits;
 
 /* One `@media (min|max-width: Npx)` condition; rules point at a row. */
 typedef struct {
@@ -461,13 +408,26 @@ typedef struct {
     int* share_of;
     ShareEnt* share_ents;
     int ncanon;
-    CCSlice ident_inline, ident_block, ident_div, ident_static, ident_visible;
-    StyBg bg_init;
-    StyBox box_init, box_block, box_inline;
-    StyFont font_init;
-    StyBg* bg_pool;
-    StyBox* box_pool;
-    StyFont* font_pool;
+    /* Atoms: interned value texts; ids below N_STATIC_ATOMS are the
+     * compile-time constants (A_block, ...). */
+    CCSlice* atoms;
+    int natoms, cap_atoms;
+    Map::[CCSlice, int] atom_id;
+    /* One pool per family the sheet declares: 3 * cap_nodes slots
+     * (element, ::before, ::after). Undeclared families stay NULL. */
+    void* fpool[N_FAM];
+    unsigned fam_used;
+    /* `div` without a display declaration is a block: the one UA fact. */
+    Sty_box box_block;
+    CCSlice ident_div;
+    int root;
+    /* Per-arm match scratch (Hits) and per-dirty-node inherited-struct
+     * snapshots for the changed-children test. */
+    Hit* hit_scratch;
+    int max_arms;
+    StySnap* snaps;
+    int* snap_of;
+    long cnt_hits_dropped;
     double t_levels, t_share, t_match, t_inherit;
     int last_dirty, sum_dirty;
     double sum_sig, sum_canon, sum_match, sum_copy, sum_inherit;
@@ -480,13 +440,12 @@ typedef struct {
  * cannot restyle. Same object, narrower names.
  * https://github.com/sreekotay/concurrent-c/blob/main/docs/typehooks-typeviews.md */
 @typeview Match on Engine {
-    r: intern, match_from, apply_rule, apply_specified, apply_bucket, apply_pair,
-       apply_pairs, apply_pairs_other, style_one, inherit_one, paint_levels,
-       paint_blooms, copy_specified, own_bg, own_box, own_font, seal_box,
-       ident_inline, ident_block, ident_div, ident_static, ident_visible,
-       bg_init, box_init, font_init, box_block, box_inline,
-       bg_pool, box_pool, font_pool,
-       nnodes, nrules, rules, share_of,
+    r: intern, match_from, apply_rule, apply_bucket, apply_pair,
+       apply_pairs, apply_pairs_other, style_one, cascade, inherit_one,
+       inherit_pseudo, mark_children, paint_levels,
+       paint_blooms, copy_specified, box_block, ident_div, root, fpool, atoms,
+       hit_scratch, snaps, snap_of,
+       nnodes, nrules, rules, share_of, cap_nodes, pnodes,
        by_id, by_class, by_type, by_parent_id, by_parent_class, by_parent_type,
        child_pairs, desc_pairs, universal, level_ids, level_off, max_depth;
     rw: nodes;
@@ -495,7 +454,7 @@ typedef struct {
 @typeview Mutate on Engine {
     r: intern, fill_node, insert_child, dirty_following, ensure_class_cap,
        ensure_attr_cap, apply_mut, log_change, log_pos, repos_family,
-       note_leaf_op, push_bucket, store, cap_nodes, cap_changes,
+       note_leaf_op, push_bucket, set_inline_rule, store, cap_nodes, cap_changes,
        has_sib_comb, pseudo_used;
     rw: nodes, nnodes, nchanges, changes, levels_stale, leaf_ops, leaf_op_parent,
         nleaf_ops, cap_leaf_ops;
@@ -513,6 +472,37 @@ static void Engine_dirty_desc(Engine* e, int src);
 static void Engine_dirty_following(Engine* e, int src);
 static void Engine_reset_pseudo(Engine* e, int i);
 static void Engine_inherit_pseudo(Engine* e, int i, int p);
+static void Engine_set_inline_rule(Engine* e, Node* n);
+static CCSlice Engine_intern(Engine* e, CCSlice src);
+static int fill_rule(Engine* e, CssNode* nd, Rule* r);
+static void !>(CCError) Engine_alloc_pools(Engine* e);
+
+/* Value texts interned to small ids; the first N_STATIC_ATOMS are fixed. */
+static int Engine_atom(Engine* e, CCSlice text) {
+    text = text.trim();
+    if (!text.len) text = @slice("normal");
+    int* hit = e->atom_id->get_ptr(text);
+    if (hit) return *hit;
+    CCSlice owned = e->intern(text);
+    if (e->natoms >= e->cap_atoms) {
+        int cap = e->cap_atoms ? e->cap_atoms * 2 : 1024;
+        CCSlice* p = e->store.allocT::[CCSlice](cap);
+        if (!p) return A_normal;
+        if (e->natoms) memcpy(p, e->atoms, sizeof(CCSlice) * (size_t)e->natoms);
+        e->atoms = p;
+        e->cap_atoms = cap;
+    }
+    int id = e->natoms;
+    e->atoms[e->natoms++] = owned;
+    e->atom_id->insert(owned, id);
+    return id;
+}
+
+static void Node_reset_style(Node* n) {
+    memset(n->specified, 0, sizeof(n->specified));
+    n->sty = STY_INIT_REFS;
+    n->own = 0;
+}
 
 static CCSlice !>(CCError) CCSlice_read_path(CCSlice* path, CCArena arena) {
     return cc_file_read_path(*path, arena);
@@ -814,291 +804,8 @@ static int fill_selector(Engine* e, CssNode* nd, Rule* r) {
     return 1;
 }
 
-static int take_rgb(CssNode* rgb, Rule* r) {
-    CssNode* a = rgb ? rgb->first() : 0;
-    CssNode* b = a ? a->next(rgb) : 0;
-    CssNode* c = b ? b->next(rgb) : 0;
-    if (!a || !b || !c) return 0;
-    CCSlice sa = a->span();
-    CCSlice sg = b->span();
-    CCSlice sb = c->span();
-    r->bg_current = 0;
-    r->spec.bg.bg.r = (int)(sa.to_i64() ?> 0);
-    r->spec.bg.bg.g = (int)(sg.to_i64() ?> 0);
-    r->spec.bg.bg.b = (int)(sb.to_i64() ?> 0);
-    r->spec.bg.bg.a = 255;
-    r->props |= (1u << P_bg);
-    return 1;
-}
-
-static int take_color(CssNode* rgb, Rule* r) {
-    CssNode* a = rgb ? rgb->first() : 0;
-    CssNode* b = a ? a->next(rgb) : 0;
-    CssNode* c = b ? b->next(rgb) : 0;
-    if (!a || !b || !c) return 0;
-    CCSlice sa = a->span();
-    CCSlice sg = b->span();
-    CCSlice sb = c->span();
-    r->spec.font.color.r = (int)(sa.to_i64() ?> 0);
-    r->spec.font.color.g = (int)(sg.to_i64() ?> 0);
-    r->spec.font.color.b = (int)(sb.to_i64() ?> 0);
-    r->props |= (1u << P_color);
-    return 1;
-}
-
 static CCSlice trim_slice(CCSlice s) {
     return s.trim();
-}
-
-static int parse_px_or_kw(CCSlice s, int* out) {
-    s = trim_slice(s);
-    if (s.eq_cstr("auto")) {
-        *out = PX_AUTO;
-        return 1;
-    }
-    if (s.eq_cstr("normal")) {
-        *out = PX_NORMAL;
-        return 1;
-    }
-    int v = 0, i = 0, sign = 1;
-    if (s.len && s.ptr[0] == '-') { sign = -1; i = 1; }
-    if (i >= (int)s.len || s.ptr[i] < '0' || s.ptr[i] > '9') return 0;
-    for (; i < (int)s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9'; i++)
-        v = v * 10 + (s.ptr[i] - '0');
-    if (i + 2 <= (int)s.len && s.ptr[i] == 'p' && s.ptr[i + 1] == 'x') {
-        *out = v * sign;
-        return 1;
-    }
-    return 0;
-}
-
-static int parse_fs(CCSlice s, int* out, int* unit) {
-    s = trim_slice(s);
-    int v = 0, i = 0, sign = 1;
-    if (s.len && s.ptr[0] == '-') { sign = -1; i = 1; }
-    if (i >= (int)s.len || s.ptr[i] < '0' || s.ptr[i] > '9') return 0;
-    for (; i < (int)s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9'; i++)
-        v = v * 10 + (s.ptr[i] - '0');
-    if (i + 2 <= (int)s.len && s.ptr[i] == 'p' && s.ptr[i + 1] == 'x') {
-        *out = v * sign;
-        *unit = UNIT_PX;
-        return 1;
-    }
-    if (i + 3 <= (int)s.len && s.ptr[i] == 'r' && s.ptr[i + 1] == 'e' &&
-        s.ptr[i + 2] == 'm') {
-        *out = v * sign;
-        *unit = UNIT_REM;
-        return 1;
-    }
-    if (i + 2 <= (int)s.len && s.ptr[i] == 'e' && s.ptr[i + 1] == 'm') {
-        *out = v * sign;
-        *unit = UNIT_EM;
-        return 1;
-    }
-    if (i < (int)s.len && s.ptr[i] == 37) {
-        *out = v * sign;
-        *unit = UNIT_PCT;
-        return 1;
-    }
-    return 0;
-}
-
-static int hex_digit(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static int parse_hex_rgb(CCSlice s, int* r, int* g, int* b);
-
-static int ident_at(CCSlice s, size_t i, const char* w, size_t wlen) {
-    if (i + wlen > s.len || !s.ptr) return 0;
-    {
-        char[:] sub = cc_slice_from_buffer(s.ptr + i, wlen);
-        char[:] word = cc_slice_from_buffer((void *)w, wlen);
-        if (!sub.eq(word)) return 0;
-    }
-    if (i + wlen < s.len) {
-        char c = s.ptr[i + wlen];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_')
-            return 0;
-    }
-    return 1;
-}
-
-static int parse_rgb_at(CCSlice s, size_t i, int* r, int* g, int* b, size_t* used) {
-    if (!s.ptr || i + 4 > s.len) return 0;
-    if (s.ptr[i] != 'r' || s.ptr[i + 1] != 'g' || s.ptr[i + 2] != 'b') return 0;
-    size_t k = i + 3;
-    while (k < s.len && (s.ptr[k] == ' ' || s.ptr[k] == '\t')) k++;
-    if (k >= s.len || s.ptr[k] != '(') return 0;
-    k++;
-    int vals[3] = {0, 0, 0};
-    for (int n = 0; n < 3; n++) {
-        while (k < s.len && (s.ptr[k] == ' ' || s.ptr[k] == '\t')) k++;
-        if (k >= s.len || s.ptr[k] < '0' || s.ptr[k] > '9') return 0;
-        int v = 0;
-        while (k < s.len && s.ptr[k] >= '0' && s.ptr[k] <= '9') {
-            v = v * 10 + (s.ptr[k] - '0');
-            k++;
-        }
-        vals[n] = v;
-        while (k < s.len && (s.ptr[k] == ' ' || s.ptr[k] == '\t')) k++;
-        if (n < 2) {
-            if (k >= s.len || s.ptr[k] != ',') return 0;
-            k++;
-        }
-    }
-    while (k < s.len && (s.ptr[k] == ' ' || s.ptr[k] == '\t')) k++;
-    if (k >= s.len || s.ptr[k] != ')') return 0;
-    k++;
-    *r = vals[0];
-    *g = vals[1];
-    *b = vals[2];
-    *used = k - i;
-    return 1;
-}
-
-static int parse_hex_at(CCSlice s, size_t i, int* r, int* g, int* b, size_t* used) {
-    if (!s.ptr || i >= s.len || s.ptr[i] != '#') return 0;
-    size_t rest = s.len - i;
-    if (rest >= 7) {
-        CCSlice h = cc_slice_from_buffer(s.ptr + i, 7);
-        if (parse_hex_rgb(h, r, g, b)) {
-            if (i + 7 == s.len || s.ptr[i + 7] == ' ' || s.ptr[i + 7] == '\t' ||
-                s.ptr[i + 7] == '\n') {
-                *used = 7;
-                return 1;
-            }
-        }
-    }
-    if (rest >= 4) {
-        CCSlice h = cc_slice_from_buffer(s.ptr + i, 4);
-        if (parse_hex_rgb(h, r, g, b)) {
-            char next = i + 4 < s.len ? s.ptr[i + 4] : ' ';
-            if (!((next >= '0' && next <= '9') || (next >= 'a' && next <= 'f') ||
-                  (next >= 'A' && next <= 'F'))) {
-                *used = 4;
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-/* First color token in a background value (hex / rgb() / currentColor /
- * transparent). none / url(...) / repeat are not colors. */
-static int scan_bg_color(CCSlice s, int* r, int* g, int* b, int* a, int* current) {
-    s = trim_slice(s);
-    *current = 0;
-    *a = 255;
-    if (!s.ptr) return 0;
-    size_t i = 0;
-    int found = 0;
-    while (i < s.len) {
-        while (i < s.len && (s.ptr[i] == ' ' || s.ptr[i] == '\t' || s.ptr[i] == '\n'))
-            i++;
-        if (i >= s.len) break;
-        size_t used = 0;
-        int cr = 0, cg = 0, cb = 0;
-        if (ident_at(s, i, "currentColor", 12) || ident_at(s, i, "currentcolor", 12)) {
-            *current = 1;
-            *a = 255;
-            found = 1;
-            i += 12;
-            continue;
-        }
-        if (ident_at(s, i, "transparent", 11)) {
-            *current = 0;
-            *r = 0;
-            *g = 0;
-            *b = 0;
-            *a = 0;
-            found = 1;
-            i += 11;
-            continue;
-        }
-        if (parse_hex_at(s, i, &cr, &cg, &cb, &used)) {
-            *current = 0;
-            *r = cr;
-            *g = cg;
-            *b = cb;
-            *a = 255;
-            found = 1;
-            i += used;
-            continue;
-        }
-        if (parse_rgb_at(s, i, &cr, &cg, &cb, &used)) {
-            *current = 0;
-            *r = cr;
-            *g = cg;
-            *b = cb;
-            *a = 255;
-            found = 1;
-            i += used;
-            continue;
-        }
-        if (i + 3 <= s.len && s.ptr[i] == 'u' && s.ptr[i + 1] == 'r' &&
-            s.ptr[i + 2] == 'l') {
-            i += 3;
-            while (i < s.len && s.ptr[i] != ')') i++;
-            if (i < s.len) i++;
-            continue;
-        }
-        while (i < s.len && s.ptr[i] != ' ' && s.ptr[i] != '\t' && s.ptr[i] != '\n')
-            i++;
-    }
-    return found;
-}
-
-static int parse_hex_rgb(CCSlice s, int* r, int* g, int* b) {
-    s = trim_slice(s);
-    if (!s.len || !s.ptr || s.ptr[0] != '#') return 0;
-    if (s.len == 4) {
-        int r1 = hex_digit(s.ptr[1]);
-        int g1 = hex_digit(s.ptr[2]);
-        int b1 = hex_digit(s.ptr[3]);
-        if (r1 < 0 || g1 < 0 || b1 < 0) return 0;
-        *r = r1 * 16 + r1;
-        *g = g1 * 16 + g1;
-        *b = b1 * 16 + b1;
-        return 1;
-    }
-    if (s.len == 7) {
-        int r1 = hex_digit(s.ptr[1]);
-        int r2 = hex_digit(s.ptr[2]);
-        int g1 = hex_digit(s.ptr[3]);
-        int g2 = hex_digit(s.ptr[4]);
-        int b1 = hex_digit(s.ptr[5]);
-        int b2 = hex_digit(s.ptr[6]);
-        if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return 0;
-        *r = r1 * 16 + r2;
-        *g = g1 * 16 + g2;
-        *b = b1 * 16 + b2;
-        return 1;
-    }
-    return 0;
-}
-
-static int parse_fw(CCSlice s, int* out) {
-    s = trim_slice(s);
-    if (s.eq_cstr("normal")) {
-        *out = 400;
-        return 1;
-    }
-    if (s.eq_cstr("bold")) {
-        *out = 700;
-        return 1;
-    }
-    int v = 0, i = 0;
-    if (!s.len || s.ptr[0] < '0' || s.ptr[0] > '9') return 0;
-    for (; i < (int)s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9'; i++)
-        v = v * 10 + (s.ptr[i] - '0');
-    if (i != (int)s.len || v < 1 || v > 1000) return 0;
-    *out = v;
-    return 1;
 }
 
 static int cascade_rank(int origin, int imp) {
@@ -1120,124 +827,120 @@ static int decl_important(CssNode* d, CssNode* val) {
     return s.eq_cstr("important") || s.eq_cstr("!important");
 }
 
+#define DECL_SCRATCH 256
+typedef struct {
+    CssDecl d[DECL_SCRATCH];
+    int n;
+} DeclScratch;
+
+/* One longhand declaration into the scratch block. The value is read by
+ * the longhand's cell kind; a CSS-wide keyword is `initial` (kept as a
+ * flag) or inherit / unset, which for an inherited longhand is the same
+ * as saying nothing. A value that does not parse is dropped, as a parser
+ * would drop an invalid declaration. */
+static int Engine_take_longhand(Engine* e, DeclScratch* ds, int prop, CCSlice val, int imp) {
+    if (prop < 0 || ds->n >= DECL_SCRATCH) return 0;
+    CssDecl d;
+    memset(&d, 0, sizeof d);
+    d.prop = (uint16_t)prop;
+    d.imp = (uint8_t)imp;
+    val = trim_slice(val);
+    if (val.eq_cstr("initial")) {
+        d.wide = 1;
+    } else if (val.eq_cstr("inherit") || val.eq_cstr("unset")) {
+        if (PROP_INHERITED[prop]) return 1;
+        if (val.eq_cstr("unset")) d.wide = 1;
+        else return 1; /* inherit on a reset longhand: not modelled */
+    } else if (PROP_KIND[prop] == LH_LEN) {
+        if (prop == P_font_weight && val.eq_cstr("normal")) val = @slice("400");
+        else if (prop == P_font_weight && val.eq_cstr("bold")) val = @slice("700");
+        if (!cssval_parse_len(val.ptr, val.len, &d.v.len)) return 0;
+    } else if (PROP_KIND[prop] == LH_COLOR) {
+        if (!cssval_parse_color(val.ptr, val.len, &d.v.color)) return 0;
+    } else {
+        d.v.atom = e->atom(val);
+    }
+    ds->d[ds->n++] = d;
+    return 1;
+}
+
+/* `background`: every background longhand resets, the color comes from
+ * the first color token (hex / rgb() / currentcolor / transparent). */
+static void Engine_expand_background(Engine* e, DeclScratch* ds, CCSlice val, int imp) {
+    for (int p = 0; p < NPROP; p++) {
+        if (PROP_FAM[p] != FAM_background) continue;
+        if (p == P_background_color) continue;
+        Engine_take_longhand(e, ds, p, @slice("initial"), imp);
+    }
+    val = trim_slice(val);
+    size_t i = 0;
+    int got = 0;
+    while (i < val.len && !got) {
+        while (i < val.len && (val.ptr[i] == ' ' || val.ptr[i] == '\t' || val.ptr[i] == '\n')) i++;
+        if (i >= val.len) break;
+        size_t j = i;
+        if (val.ptr[i] == 'r' || val.ptr[i] == 'R') {
+            while (j < val.len && val.ptr[j] != ')') j++;
+            if (j < val.len) j++;
+        } else {
+            while (j < val.len && val.ptr[j] != ' ' && val.ptr[j] != '\t' && val.ptr[j] != '\n') j++;
+        }
+        CCSlice tok = val.sub(i, j);
+        CssColor c;
+        if (cssval_parse_color(tok.ptr, tok.len, &c) && c.kw != CKW_NONE && c.kw != CKW_AUTO) {
+            Engine_take_longhand(e, ds, P_background_color, tok, imp);
+            got = 1;
+        }
+        i = j;
+    }
+    if (!got) Engine_take_longhand(e, ds, P_background_color, @slice("initial"), imp);
+}
+
+static void Engine_take_decl(Engine* e, DeclScratch* ds, CCSlice name, CCSlice val, int imp) {
+    name = trim_slice(name);
+    if (name.eq_cstr("background")) {
+        Engine_expand_background(e, ds, val, imp);
+        return;
+    }
+    Engine_take_longhand(e, ds, prop_by_name(name.ptr, name.len), val, imp);
+}
+
+static int Engine_fill_decls(Engine* e, CssNode* decls, Rule* r) {
+    DeclScratch ds;
+    ds.n = 0;
+    r->decls = 0;
+    r->ndecl = 0;
+    r->has_imp = 0;
+    if (decls && decls->is_list()) {
+        CssNode* d = decls->first();
+        while (d) {
+            if (d->is_list()) {
+                CssNode* prop = d->first();
+                CssNode* val = prop ? prop->next(d) : 0;
+                if (prop && val)
+                    Engine_take_decl(e, &ds, prop->span(), val->span(), decl_important(d, val));
+            }
+            d = d->next(decls);
+        }
+    }
+    if (!ds.n) return 0;
+    r->decls = e->store.allocT::[CssDecl](ds.n);
+    if (!r->decls) return 0;
+    memcpy(r->decls, ds.d, sizeof(CssDecl) * (size_t)ds.n);
+    r->ndecl = ds.n;
+    for (int k = 0; k < ds.n; k++)
+        if (ds.d[k].imp) r->has_imp = 1;
+    return 1;
+}
+
 static int fill_rule(Engine* e, CssNode* nd, Rule* r) {
     memset(r, 0, sizeof(*r));
-    r->spec = SPEC_INIT;
     r->mq = -1;
     if (!nd || !nd->is_list()) return 0;
     CssNode* sel = nd->first();
     CssNode* decls = sel ? sel->next(nd) : 0;
     if (!fill_selector(e, sel, r)) return 0;
-    if (decls && decls->is_list()) {
-    CssNode* d = decls->first();
-    while (d) {
-            if (d->is_list()) {
-                CssNode* prop = d->first();
-                CssNode* val = prop ? prop->next(d) : 0;
-                if (prop && val) {
-                    int imp = decl_important(d, val);
-                    CCSlice name = trim_slice(prop->span());
-                    unsigned bit = 0;
-                    if (name.eq_cstr("background-color") || name.eq_cstr("background")) {
-                        int shorthand = name.eq_cstr("background");
-                        int hr = 0, hg = 0, hb = 0, ha = 255, cur = 0;
-                        CCSlice raw = trim_slice(val->span());
-                        if (val->is_list() && val->id() == Css_KEEP_rgb) {
-                            take_rgb(val, r);
-                            bit = 1u << P_bg;
-                        } else if (scan_bg_color(raw, &hr, &hg, &hb, &ha, &cur)) {
-                            r->bg_current = cur;
-                            if (!cur) {
-                                r->spec.bg.bg.r = hr;
-                                r->spec.bg.bg.g = hg;
-                                r->spec.bg.bg.b = hb;
-                                r->spec.bg.bg.a = ha;
-                            }
-                            bit = 1u << P_bg;
-                            r->props |= bit;
-                        } else if (shorthand) {
-                            /* Omitted color resets to initial (transparent). */
-                            r->bg_current = 0;
-                            r->spec.bg.bg.r = 0;
-                            r->spec.bg.bg.g = 0;
-                            r->spec.bg.bg.b = 0;
-                            r->spec.bg.bg.a = 0;
-                            bit = 1u << P_bg;
-                            r->props |= bit;
-                        }
-                    } else if (name.eq_cstr("color")) {
-                        int hr = 0, hg = 0, hb = 0;
-                        size_t used = 0;
-                        CCSlice raw = trim_slice(val->span());
-                        if (val->is_list() && val->id() == Css_KEEP_rgb) {
-                            take_color(val, r);
-                            bit = 1u << P_color;
-                        } else if (parse_hex_rgb(raw, &hr, &hg, &hb)) {
-                            r->spec.font.color.r = hr;
-                            r->spec.font.color.g = hg;
-                            r->spec.font.color.b = hb;
-                            bit = 1u << P_color;
-                            r->props |= bit;
-                        } else if (parse_rgb_at(raw, 0, &hr, &hg, &hb, &used)) {
-                            r->spec.font.color.r = hr;
-                            r->spec.font.color.g = hg;
-                            r->spec.font.color.b = hb;
-                            bit = 1u << P_color;
-                            r->props |= bit;
-                        }
-                    } else {
-                        CCSlice raw = trim_slice(val->span());
-                        int px = 0, fw = 0, unit = UNIT_PX;
-                        if (name.eq_cstr("display")) {
-                            r->spec.box.display = e->intern(raw);
-                            bit = 1u << P_display;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("content")) {
-                            r->spec.box.content = e->intern(raw);
-                            bit = 1u << P_content;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("position")) {
-                            r->spec.box.position = e->intern(raw);
-                            bit = 1u << P_position;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("visibility")) {
-                            r->spec.font.visibility = e->intern(raw);
-                            bit = 1u << P_visibility;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("height") && parse_px_or_kw(raw, &px)) {
-                            r->spec.box.height_px = px;
-                            bit = 1u << P_height_px;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("width") && parse_px_or_kw(raw, &px)) {
-                            r->spec.box.width_px = px;
-                            bit = 1u << P_width_px;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("min-width") && parse_px_or_kw(raw, &px)) {
-                            r->spec.box.minw_px = px;
-                            bit = 1u << P_minw_px;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("font-size") && parse_fs(raw, &px, &unit)) {
-                            r->spec.font.fs_px = px;
-                            r->fs_unit = unit;
-                            bit = 1u << P_fs_px;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("line-height") && parse_px_or_kw(raw, &px)) {
-                            r->spec.font.lh_px = px;
-                            bit = 1u << P_lh_px;
-                            r->props |= bit;
-                        } else if (name.eq_cstr("font-weight") && parse_fw(raw, &fw)) {
-                            r->spec.font.fw = fw;
-                            bit = 1u << P_fw;
-                            r->props |= bit;
-                        }
-                    }
-                    if (bit && imp) r->imp |= bit;
-                }
-            }
-            d = d->next(decls);
-        }
-    }
-    return r->props != 0;
+    return Engine_fill_decls(e, decls, r);
 }
 
 static int count_char(char[:] s, char c) {
@@ -1348,15 +1051,8 @@ static int Engine_fill_node(Engine* e, Node* nd, int parent, CCSlice tag, CCSlic
             nd->nattr++;
         }
     }
-    nd->specified = 0;
-    nd->used.bg = &e->bg_init;
-    nd->used.box = &e->box_init;
-    nd->used.font = &e->font_init;
-    for (int p = 0; p < NPROP; p++) {
-        nd->spec_a[p] = nd->spec_b[p] = nd->spec_c[p] = -1;
-        nd->win_order[p] = -1;
-        nd->win_rank[p] = -1;
-    }
+    Node_reset_style(nd);
+    e->set_inline_rule(nd);
     int id = (int)(nd - e->nodes);
     nd->first_child = -1;
     nd->last_child = -1;
@@ -1533,7 +1229,7 @@ static void !>(CCError) Engine_index_rules(Engine* e) {
          * in the revalidation set only. style_one applies the recorded hits. */
         if (r->n >= 2 &&
             (r->comb[r->n - 2] == COMB_NEXT || r->comb[r->n - 2] == COMB_SUBSEQ)) {
-            if (!r->props) continue;
+            if (!r->ndecl) continue;
             ok = !compound_open(s) &&
                  e->push_keyed(s, k, e->sib_by_id, e->sib_by_class, e->sib_by_type);
             if (!ok) {
@@ -1874,10 +1570,15 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->level_off = e->store.allocT::[int](64);
     e->share_of = e->store.allocT::[int](e->cap_nodes);
     e->share_ents = e->store.allocT::[ShareEnt](e->cap_nodes);
-    e->bg_pool = e->store.allocT::[StyBg](3 * e->cap_nodes);
-    e->box_pool = e->store.allocT::[StyBox](3 * e->cap_nodes);
-    e->font_pool = e->store.allocT::[StyFont](3 * e->cap_nodes);
     e->pnodes = e->store.allocT::[Node](2 * e->cap_nodes);
+    e->snaps = e->store.allocT::[StySnap](e->cap_nodes);
+    e->snap_of = e->store.allocT::[int](e->cap_nodes);
+    e->max_arms = 0;
+    e->hit_scratch = 0;
+    e->atom_id = map_new::[CCSlice, int](e->store);
+    e->cap_atoms = N_STATIC_ATOMS + 4 * e->cap_rules + 1024;
+    e->atoms = e->store.allocT::[CCSlice](e->cap_atoms);
+    e->natoms = 0;
     e->viewport_w = 800;
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
@@ -1887,33 +1588,80 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
         !e->leaf_ops || !e->leaf_op_parent || !e->fo_ids || !e->fo_off ||
         !e->fo_job || !e->fo_sig || !e->fo_rules || !e->fo_jobs ||
         !e->level_ids || !e->level_off ||
-        !e->share_of || !e->share_ents || !e->bg_pool || !e->box_pool || !e->font_pool ||
-        !e->pnodes)
+        !e->share_of || !e->share_ents || !e->pnodes || !e->snaps || !e->snap_of ||
+        !e->atom_id || !e->atoms)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "engine tables");
-    e->bg_init = SPEC_INIT.bg;
-    e->box_init = SPEC_INIT.box;
-    e->font_init = SPEC_INIT.font;
-    e->ident_inline = e->intern(@slice("inline"));
-    e->ident_block = e->intern(@slice("block"));
+    /* Static atoms first, in table order, so A_* ids hold at runtime. */
+    Sty_init_values();
+    for (int k = 0; k < N_STATIC_ATOMS; k++) {
+        CCSlice t = cc_slice_from_buffer((void*)ATOM_TEXT[k], strlen(ATOM_TEXT[k]));
+        if (e->atom(t) != k) return cc_err(CC_ERR_INVALID_ARG, "atom table order");
+    }
     e->ident_div = e->intern(@slice("div"));
-    e->ident_static = e->intern(@slice("static"));
-    e->ident_visible = e->intern(@slice("visible"));
-    e->box_block = e->box_init;
-    e->box_block.display = e->ident_block;
-    e->box_block.position = e->ident_static;
-    e->box_inline = e->box_init;
-    e->box_inline.display = e->ident_inline;
-    e->box_inline.position = e->ident_static;
-    e->font_init.visibility = e->ident_visible;
+    e->box_block = Sty_box_INIT;
+    e->box_block.display = A_block;
     e->npred = 0;
+    e->root = 0;
 
     e->ingest_css(base_s, ORIGIN_UA) !>(err) { return cc_err(err); };
     e->ingest_css(css_s, ORIGIN_AUTHOR) !>(err) { return cc_err(err); };
     e->index_rules() !>(err) { return cc_err(err); };
     e->ingest_tree(tree_s) !>(err) { return cc_err(err); };
     if (mut_s.len) e->ingest_muts(mut_s) !>(err) { return cc_err(err); };
+    e->alloc_pools() !>(err) { return cc_err(err); };
     e->paint_blooms();
     for (int i = 0; i < e->cap_nodes; i++) e->reset_pseudo(i);
+    return cc_ok();
+}
+
+/* Families any declaration can reach: sheet rules, style attributes on
+ * the tree, style attributes the mutations will set. A pool per family,
+ * three slots per element (the element and its two pseudo boxes). */
+static void !>(CCError) Engine_alloc_pools(Engine* e) {
+    unsigned used = 0;
+    for (int k = 0; k < e->nrules; k++)
+        for (int d = 0; d < e->rules[k].ndecl; d++)
+            used |= 1u << PROP_FAM[e->rules[k].decls[d].prop];
+    for (int i = 0; i < e->nnodes; i++) {
+        Rule* r = e->nodes[i].inline_rule;
+        if (!r) continue;
+        for (int d = 0; d < r->ndecl; d++)
+            used |= 1u << PROP_FAM[r->decls[d].prop];
+    }
+    for (int m = 0; m < e->nmuts; m++) {
+        MutOp* op = &e->muts[m];
+        CCSlice style = cc_slice_empty();
+        if (op->kind == MUT_SET_ATTR && op->a.eq_cstr("style")) style = op->b;
+        if (op->kind == MUT_ADD_LEAF && op->attrs.len) {
+            CCSlice attr_buf[MAX_ATTR];
+            int na = split_commas(op->attrs, attr_buf, MAX_ATTR);
+            for (int k = 0; k < na; k++) {
+                CCSlice a = attr_buf[k];
+                size_t eq = 0;
+                while (eq < a.len && a.ptr[eq] != '=') eq++;
+                CCSlice an = a.sub(0, eq);
+                if (an.eq_cstr("style") && eq < a.len) style = a.sub(eq + 1, a.len);
+            }
+        }
+        if (!style.len) continue;
+        Node tmp;
+        memset(&tmp, 0, sizeof tmp);
+        Attr at = { @slice("style"), style, 1 };
+        tmp.attrs = &at;
+        tmp.nattr = 1;
+        e->set_inline_rule(&tmp);
+        if (tmp.inline_rule)
+            for (int d = 0; d < tmp.inline_rule->ndecl; d++)
+                used |= 1u << PROP_FAM[tmp.inline_rule->decls[d].prop];
+    }
+    e->fam_used = used;
+    size_t slots = 3u * (size_t)e->cap_nodes;
+    for (int f = 0; f < N_FAM; f++) {
+        e->fpool[f] = 0;
+        if (!(used & (1u << f))) continue;
+        e->fpool[f] = cc_arena_alloc(e->store, FAM_SIZEOF[f] * slots, 16);
+        if (!e->fpool[f]) return cc_err(CC_ERR_OUT_OF_MEMORY, "family pool");
+    }
     return cc_ok();
 }
 
@@ -2043,59 +1791,6 @@ static int Engine_match_from_join(Engine* e, int idx, const Rule* r, int ci) {
     return 0;
 }
 
-static int better_prop(const Rule* r, const Node* n, int p) {
-    if (n->spec_a[p] < 0) return 1;
-    int nr = cascade_rank(r->origin, (int)((r->imp >> p) & 1u));
-    if (nr != n->win_rank[p]) return nr > n->win_rank[p];
-    if (r->sa != n->spec_a[p]) return r->sa > n->spec_a[p];
-    if (r->sb != n->spec_b[p]) return r->sb > n->spec_b[p];
-    if (r->sc != n->spec_c[p]) return r->sc > n->spec_c[p];
-    return r->order >= n->win_order[p];
-}
-
-static void Node_win_prop(Node* n, const Rule* r, int p) {
-    n->spec_a[p] = r->sa;
-    n->spec_b[p] = r->sb;
-    n->spec_c[p] = r->sc;
-    n->win_order[p] = r->order;
-    n->win_rank[p] = cascade_rank(r->origin, (int)((r->imp >> p) & 1u));
-    n->specified |= (1u << p);
-    if (p == P_fs_px) {
-        n->fs_spec = r->spec.font.fs_px;
-        n->fs_unit = r->fs_unit;
-    }
-    if (p == P_bg)
-        n->bg_current = r->bg_current;
-}
-
-/* Smallest fact: this node owns a unique slot. Do not copy the proto —
- * specified fields are written here; holes are sealed from initial. */
-static void Engine_own_bg(Engine* e, Node* n, int i) {
-    if (n->used.bg != &e->bg_pool[i])
-        n->used.bg = &e->bg_pool[i];
-}
-
-static void Engine_own_box(Engine* e, Node* n, int i) {
-    if (n->used.box != &e->box_pool[i])
-        n->used.box = &e->box_pool[i];
-}
-
-static void Engine_own_font(Engine* e, Node* n, int i) {
-    if (n->used.font != &e->font_pool[i])
-        n->used.font = &e->font_pool[i];
-}
-
-static void Engine_seal_box(Engine* e, Node* n, int i) {
-    if (n->used.box != &e->box_pool[i]) return;
-    StyBox* b = n->used.box;
-    if (!(n->specified & (1u << P_height_px))) b->height_px = PX_AUTO;
-    if (!(n->specified & (1u << P_minw_px))) b->minw_px = PX_AUTO;
-    if (!(n->specified & (1u << P_width_px))) b->width_px = PX_AUTO;
-    if (!(n->specified & (1u << P_display))) b->display = cc_slice_empty();
-    if (!(n->specified & (1u << P_position))) b->position = cc_slice_empty();
-    if (!(n->specified & (1u << P_content))) b->content = cc_slice_empty();
-}
-
 /* A ::before / ::after exists only with effective content (Stylo drops
  * the box otherwise). Every generated pseudo rule sets `content: ''`. */
 static int content_effective(CCSlice c) {
@@ -2104,74 +1799,19 @@ static int content_effective(CCSlice c) {
 
 static int Engine_pseudo_live(Engine* e, int i, int p) {
     Node* pn = &e->pnodes[2 * i + p];
-    return (pn->specified & (1u << P_content)) && content_effective(pn->used.box->content);
+    return PS_HAS(pn->specified, P_content) &&
+           content_effective(e->atoms[pn->sty.counters->content]);
 }
 
 /* Fresh cascade state for one pseudo box: nothing specified, protos. */
 static void Engine_reset_pseudo(Engine* e, int i) {
-    for (int p = 0; p < 2; p++) {
-        Node* pn = &e->pnodes[2 * i + p];
-        pn->specified = 0;
-        pn->fs_spec = 0;
-        pn->fs_unit = 0;
-        pn->bg_current = 0;
-        pn->used.bg = &e->bg_init;
-        pn->used.box = &e->box_init;
-        pn->used.font = &e->font_init;
-        for (int q = 0; q < NPROP; q++) {
-            pn->spec_a[q] = pn->spec_b[q] = pn->spec_c[q] = -1;
-            pn->win_order[q] = -1;
-            pn->win_rank[q] = -1;
-        }
-    }
+    for (int p = 0; p < 2; p++)
+        Node_reset_style(&e->pnodes[2 * i + p]);
 }
 
-static void Engine_apply_specified(Engine* e, int i, Node* n, Rule* r) {
-    @comptime for (f in type_of(StyBg).fields) {
-        if ((r->props & (1u << f.index)) && better_prop(r, n, (int)f.index)) {
-            e->own_bg(n, i);
-            n->used.bg->f = r->spec.bg.f;
-            n->win_prop(r, (int)f.index);
-        }
-    }
-    @comptime for (f in type_of(StyBox).fields) {
-        if ((r->props & (1u << (N_BG + (int)f.index))) &&
-            better_prop(r, n, N_BG + (int)f.index)) {
-            e->own_box(n, i);
-            n->used.box->f = r->spec.box.f;
-            n->win_prop(r, N_BG + (int)f.index);
-        }
-    }
-    @comptime for (f in type_of(StyFont).fields) {
-        if ((r->props & (1u << (N_BG + N_BOX + (int)f.index))) &&
-            better_prop(r, n, N_BG + N_BOX + (int)f.index)) {
-            e->own_font(n, i);
-            n->used.font->f = r->spec.font.f;
-            n->win_prop(r, N_BG + N_BOX + (int)f.index);
-        }
-    }
-}
-
-/* A rule's target: the element, or one of its two pseudo boxes. The
- * pseudo box is a Node record cascaded with the same code; its pool slot
- * follows the elements' (cap_nodes + 2*i + p). */
-static void Engine_apply_target(Engine* e, int i, Node* n, Rule* r) {
-    if (!r->pelem) {
-        e->apply_specified(i, n, r);
-        return;
-    }
-    int p = 2 * i + r->pelem - 1;
-    e->apply_specified(e->cap_nodes + p, &e->pnodes[p], r);
-}
-
-static void Engine_apply_rule(Engine* e, int i, Node* n, int k) {
-    Rule* r = &e->rules[k];
-    if (!r->n || !r->props || r->off || !e->match_from(i, r, r->n - 1))
-        return;
-    e->apply_target(i, n, r);
-}
-
-static int parse_style_decls(Engine* e, Node* n, Rule* r) {
+/* The style attribute, parsed when set; applied as an origin-STYLE rule. */
+static void Engine_set_inline_rule(Engine* e, Node* n) {
+    n->inline_rule = 0;
     CCSlice style = cc_slice_empty();
     for (int a = 0; a < n->nattr; a++) {
         if (n->attrs[a].name.eq_cstr("style")) {
@@ -2179,48 +1819,77 @@ static int parse_style_decls(Engine* e, Node* n, Rule* r) {
             break;
         }
     }
-    if (!style.len) return 0;
+    if (!style.len) return;
     CCSlice wrap = e->store.alloc_slice_bytes(style.len + 3);
-    if (!wrap.ptr) return 0;
+    if (!wrap.ptr) return;
     CCSlice head = wrap.sub(0, 2);
     CCSlice mid = wrap.sub(2, 2 + style.len);
     CCSlice tail = wrap.sub(2 + style.len, wrap.len);
-    head.copy(@slice("x{")) !>(err) { return 0; };
-    mid.copy(style) !>(err) { return 0; };
-    tail.copy(@slice("}")) !>(err) { return 0; };
+    head.copy(@slice("x{")) !>(err) { return; };
+    mid.copy(style) !>(err) { return; };
+    tail.copy(@slice("}")) !>(err) { return; };
     CssNode* root = Css.parse(wrap.ptr, wrap.len, e->store);
-    if (!root) return 0;
+    if (!root) return;
     CssNode* sheet = root->first();
     if (sheet && sheet->is_list() && sheet->id() == Css_KEEP_stylesheet)
         root = sheet;
-    if (!root->is_list()) return 0;
+    if (!root->is_list()) return;
     CssNode* ch = root->first();
     while (ch) {
         if (ch->is_list() && ch->id() == Css_KEEP_rule) {
-            if (!fill_rule(e, ch, r)) return 0;
+            Rule* r = e->store.allocT::[Rule](1);
+            if (!r || !fill_rule(e, ch, r)) return;
             r->origin = ORIGIN_STYLE;
             r->sa = 1;
             r->sb = 0;
             r->sc = 0;
             r->n = 0;
             r->order = 1 << 20;
-            return 1;
+            n->inline_rule = r;
+            return;
         }
         ch = ch->next(root);
     }
-    return 0;
 }
 
-static void Engine_apply_bucket(Engine* e, int i, Node* n, Map::[CCSlice, Vec::[int]] m, CCSlice key) {
+static uint64_t rule_key(const Rule* r) {
+    uint64_t sa = r->sa > 255 ? 255 : (uint64_t)r->sa;
+    uint64_t sb = r->sb > 255 ? 255 : (uint64_t)r->sb;
+    uint64_t sc = r->sc > 255 ? 255 : (uint64_t)r->sc;
+    return ((uint64_t)r->origin << 56) | (sa << 48) | (sb << 40) | (sc << 32) |
+           (uint64_t)(uint32_t)r->order;
+}
+
+/* A matched rule joins the target's hit list (the element, or one of its
+ * pseudo boxes). Order is decided once, at cascade. */
+static void Engine_hit(Engine* e, Hits* hs, const Rule* r, int k) {
+    int t = r->pelem;
+    if (hs->n[t] >= HIT_CAP) {
+        hs->dropped++;
+        return;
+    }
+    hs->h[t][hs->n[t]].key = rule_key(r);
+    hs->h[t][hs->n[t]].rule = k;
+    hs->n[t]++;
+}
+
+static void Engine_apply_rule(Engine* e, int i, Node* n, Hits* hs, int k) {
+    Rule* r = &e->rules[k];
+    if (!r->n || !r->ndecl || r->off || !e->match_from(i, r, r->n - 1))
+        return;
+    Engine_hit(e, hs, r, k);
+}
+
+static void Engine_apply_bucket(Engine* e, int i, Node* n, Hits* hs, Map::[CCSlice, Vec::[int]] m, CCSlice key) {
     if (!m || !key.len) return;
     Vec::[int]* b = m->get_ptr(key);
     if (!b || !b->data) return;
     Vec::[int] rules = *b;
     @for (rule_idx in rules)
-        e->apply_rule(i, n, rule_idx);
+        e->apply_rule(i, n, hs, rule_idx);
 }
 
-static void Engine_apply_pair(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[int]] m, CCSlice subj, CCSlice left) {
+static void Engine_apply_pair(Engine* e, int i, Node* n, Hits* hs, Map::[AtomPair, Vec::[int]] m, CCSlice subj, CCSlice left) {
     if (!m || !subj.ptr || !left.ptr) return;
     AtomPair key;
     key.subj = subj.ptr;
@@ -2229,24 +1898,24 @@ static void Engine_apply_pair(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[i
     if (!b || !b->data) return;
     Vec::[int] rules = *b;
     @for (rule_idx in rules)
-        e->apply_rule(i, n, rule_idx);
+        e->apply_rule(i, n, hs, rule_idx);
 }
 
-static void Engine_apply_pairs_other(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[int]] m, CCSlice subj, Node* other) {
+static void Engine_apply_pairs_other(Engine* e, int i, Node* n, Hits* hs, Map::[AtomPair, Vec::[int]] m, CCSlice subj, Node* other) {
     if (!subj.len) return;
     if (other->dom_id.len)
-        e->apply_pair(i, n, m, subj, other->dom_id);
+        e->apply_pair(i, n, hs, m, subj, other->dom_id);
     for (int c = 0; c < other->nclass; c++)
-        e->apply_pair(i, n, m, subj, other->classes[c]);
-    e->apply_pair(i, n, m, subj, other->tag);
+        e->apply_pair(i, n, hs, m, subj, other->classes[c]);
+    e->apply_pair(i, n, hs, m, subj, other->tag);
 }
 
-static void Engine_apply_pairs(Engine* e, int i, Node* n, Map::[AtomPair, Vec::[int]] m, Node* other) {
+static void Engine_apply_pairs(Engine* e, int i, Node* n, Hits* hs, Map::[AtomPair, Vec::[int]] m, Node* other) {
     if (n->dom_id.len)
-        e->apply_pairs_other(i, n, m, n->dom_id, other);
+        e->apply_pairs_other(i, n, hs, m, n->dom_id, other);
     for (int c = 0; c < n->nclass; c++)
-        e->apply_pairs_other(i, n, m, n->classes[c], other);
-    e->apply_pairs_other(i, n, m, n->tag, other);
+        e->apply_pairs_other(i, n, hs, m, n->classes[c], other);
+    e->apply_pairs_other(i, n, hs, m, n->tag, other);
 }
 
 /* Revalidation. Parent + identity proves two nodes match the same rules
@@ -2283,69 +1952,114 @@ static void Engine_sib_sig(Engine* e, int i) {
 }
 
 /* Overflowed revalidation: no recorded list, match the buckets here. */
-static void Engine_apply_sib_bucket(Engine* e, int i, Node* n, Vec::[int]* b) {
+static void Engine_apply_sib_bucket(Engine* e, int i, Node* n, Hits* hs, Vec::[int]* b) {
     if (!b || !b->data) return;
     Vec::[int] rules = *b;
     @for (k in rules)
-        e->apply_rule(i, n, k);
+        e->apply_rule(i, n, hs, k);
 }
 
-static void Engine_apply_sib(Engine* e, int i, Node* n) {
+static void Engine_apply_sib(Engine* e, int i, Node* n, Hits* hs) {
     if (n->sib_n >= 0) {
         for (int k = 0; k < n->sib_n; k++)
-            e->apply_target(i, n, &e->rules[n->sib_hit[k]]);
+            Engine_hit(e, hs, &e->rules[n->sib_hit[k]], n->sib_hit[k]);
         return;
     }
     if (n->dom_id.len)
-        Engine_apply_sib_bucket(e, i, n, e->sib_by_id->get_ptr(n->dom_id));
+        Engine_apply_sib_bucket(e, i, n, hs, e->sib_by_id->get_ptr(n->dom_id));
     for (int c = 0; c < n->nclass; c++)
-        Engine_apply_sib_bucket(e, i, n, e->sib_by_class->get_ptr(n->classes[c]));
-    Engine_apply_sib_bucket(e, i, n, e->sib_by_type->get_ptr(n->tag));
-    Engine_apply_sib_bucket(e, i, n, &e->sib_universal);
+        Engine_apply_sib_bucket(e, i, n, hs, e->sib_by_class->get_ptr(n->classes[c]));
+    Engine_apply_sib_bucket(e, i, n, hs, e->sib_by_type->get_ptr(n->tag));
+    Engine_apply_sib_bucket(e, i, n, hs, &e->sib_universal);
 }
 
-static void Engine_style_one(Engine* e, int i) {
+static void hits_sort(Hit* h, int n) {
+    for (int i = 1; i < n; i++) {
+        Hit x = h[i];
+        int j = i - 1;
+        while (j >= 0 && h[j].key > x.key) {
+            h[j + 1] = h[j];
+            j--;
+        }
+        h[j + 1] = x;
+    }
+}
+
+static void Engine_apply_decls(Engine* e, Node* n, int slot, const Rule* r, int imp) {
+    for (int d = 0; d < r->ndecl; d++) {
+        const CssDecl* dc = &r->decls[d];
+        if ((int)dc->imp != imp) continue;
+        Sty_apply(&n->sty, &n->own, e->fpool, slot, dc);
+        PS_SET(n->specified, dc->prop);
+    }
+}
+
+/* The cascade for one target: matched rules in (origin, specificity,
+ * order); normal declarations UA < author < style, then important ones
+ * author < style < UA. Later writes win, so each field is assigned in
+ * cascade order and the last assignment stands. */
+static void Engine_cascade(Engine* e, Node* n, int slot, Hit* h, int nh, const Rule* inl) {
+    hits_sort(h, nh);
+    for (int k = 0; k < nh; k++)
+        e->apply_decls(n, slot, &e->rules[h[k].rule], 0);
+    if (inl) e->apply_decls(n, slot, inl, 0);
+    for (int k = 0; k < nh; k++) {
+        const Rule* r = &e->rules[h[k].rule];
+        if (r->has_imp && r->origin == ORIGIN_AUTHOR) e->apply_decls(n, slot, r, 1);
+    }
+    if (inl && inl->has_imp) e->apply_decls(n, slot, inl, 1);
+    for (int k = 0; k < nh; k++) {
+        const Rule* r = &e->rules[h[k].rule];
+        if (r->has_imp && r->origin == ORIGIN_UA) e->apply_decls(n, slot, r, 1);
+    }
+}
+
+static void Engine_style_one(Engine* e, int i, Hits* hs) {
     Node* n = &e->nodes[i];
     if (n->dead) return;
+    hs->n[0] = hs->n[1] = hs->n[2] = 0;
     if (n->dom_id.len)
-        e->apply_bucket(i, n, e->by_id, n->dom_id);
+        e->apply_bucket(i, n, hs, e->by_id, n->dom_id);
     for (int c = 0; c < n->nclass; c++)
-        e->apply_bucket(i, n, e->by_class, n->classes[c]);
-    e->apply_bucket(i, n, e->by_type, n->tag);
+        e->apply_bucket(i, n, hs, e->by_class, n->classes[c]);
+    e->apply_bucket(i, n, hs, e->by_type, n->tag);
     if (n->parent >= 0) {
         Node* par = &e->nodes[n->parent];
         if (par->dom_id.len)
-            e->apply_bucket(i, n, e->by_parent_id, par->dom_id);
+            e->apply_bucket(i, n, hs, e->by_parent_id, par->dom_id);
         for (int c = 0; c < par->nclass; c++)
-            e->apply_bucket(i, n, e->by_parent_class, par->classes[c]);
-        e->apply_bucket(i, n, e->by_parent_type, par->tag);
-        e->apply_pairs(i, n, e->child_pairs, par);
+            e->apply_bucket(i, n, hs, e->by_parent_class, par->classes[c]);
+        e->apply_bucket(i, n, hs, e->by_parent_type, par->tag);
+        e->apply_pairs(i, n, hs, e->child_pairs, par);
         int p = par->parent;
         while (p >= 0) {
-            e->apply_pairs(i, n, e->desc_pairs, &e->nodes[p]);
+            e->apply_pairs(i, n, hs, e->desc_pairs, &e->nodes[p]);
             p = e->nodes[p].parent;
         }
-        e->apply_pairs(i, n, e->desc_pairs, par);
+        e->apply_pairs(i, n, hs, e->desc_pairs, par);
     }
     Vec::[int]* u = &e->universal;
     if (u->data) {
         Vec::[int] rules = *u;
         @for (rule_idx in rules)
-            e->apply_rule(i, n, rule_idx);
+            e->apply_rule(i, n, hs, rule_idx);
     }
-    Engine_apply_sib(e, i, n);
-    e->seal_box(n, i);
+    Engine_apply_sib(e, i, n, hs);
+    e->cascade(n, i, hs->h[0], hs->n[0], n->inline_rule);
     for (int p = 0; p < 2; p++)
-        e->seal_box(&e->pnodes[2 * i + p], e->cap_nodes + 2 * i + p);
+        e->cascade(&e->pnodes[2 * i + p], e->cap_nodes + 2 * i + p, hs->h[1 + p], hs->n[1 + p], 0);
 }
+
 
 static void Engine_paint_levels(Engine* e) {
     int maxd = 0;
+    int root = -1;
     for (int i = 0; i < e->nnodes; i++) {
         if (e->nodes[i].dead) {
             e->nodes[i].depth = -1;
             continue;
         }
+        if (root < 0 && e->nodes[i].parent < 0) root = i;
         int d = 0, p = e->nodes[i].parent;
         while (p >= 0) {
             d++;
@@ -2355,6 +2069,7 @@ static void Engine_paint_levels(Engine* e) {
         if (d > maxd) maxd = d;
     }
     e->max_depth = maxd;
+    e->root = root < 0 ? 0 : root;
     for (int d = 0; d <= maxd + 1 && d < 64; d++)
         e->level_off[d] = 0;
     for (int i = 0; i < e->nnodes; i++)
@@ -2373,58 +2088,22 @@ static void Engine_paint_levels(Engine* e) {
     }
 }
 
+/* Inheritance and resolution for one element, from its parent's structs.
+ * Idempotent: a clean node whose parent's inherited struct changed runs
+ * the same code to re-inherit. */
 static void Engine_inherit_one(Engine* e, int i) {
     Node* n = &e->nodes[i];
     if (n->dead) return;
-    unsigned box_bits = ((1u << N_BOX) - 1u) << N_BG;
-    unsigned font_bits = ((1u << N_FONT) - 1u) << (N_BG + N_BOX);
-    if (!(n->specified & (1u << P_display)) || !n->used.box->display.len) {
-        if (!(n->specified & box_bits)) {
-            n->used.box = slices_eq(&n->tag, &e->ident_div) ? &e->box_block : &e->box_inline;
-        } else {
-            n->used.box->display = slices_eq(&n->tag, &e->ident_div) ? e->ident_block : e->ident_inline;
-        }
+    const StyRefs* par = n->parent >= 0 ? &e->nodes[n->parent].sty : &STY_INIT_REFS;
+    if (!PS_HAS(n->specified, P_display) && slices_eq(&n->tag, &e->ident_div)) {
+        if (n->own & (1u << FAM_box)) ((Sty_box*)n->sty.box)->display = A_block;
+        else n->sty.box = &e->box_block;
     }
-    if ((!(n->specified & (1u << P_position)) || !n->used.box->position.len) &&
-        n->used.box != &e->box_init && n->used.box != &e->box_block &&
-        n->used.box != &e->box_inline)
-        n->used.box->position = e->ident_static;
-    StyFont* src = n->parent >= 0 ? e->nodes[n->parent].used.font : &e->font_init;
-    if (!(n->specified & font_bits))
-        n->used.font = src;
-    else {
-        if (!(n->specified & (1u << P_fs_px)))
-            n->used.font->fs_px = src->fs_px;
-        else if (n->fs_unit == UNIT_EM)
-            n->used.font->fs_px = src->fs_px * n->fs_spec;
-        else if (n->fs_unit == UNIT_PCT)
-            n->used.font->fs_px = src->fs_px * n->fs_spec / 100;
-        else if (n->fs_unit == UNIT_REM) {
-            int base = INIT_FS_PX;
-            if (n->parent >= 0) {
-                int ri = n->parent;
-                while (e->nodes[ri].parent >= 0)
-                    ri = e->nodes[ri].parent;
-                base = e->nodes[ri].used.font->fs_px;
-            }
-            n->used.font->fs_px = base * n->fs_spec;
-        }
-        if (!(n->specified & (1u << P_lh_px)))
-            n->used.font->lh_px = src->lh_px;
-        if (!(n->specified & (1u << P_fw)))
-            n->used.font->fw = src->fw;
-        if (!(n->specified & (1u << P_visibility)))
-            n->used.font->visibility = src->visibility;
-        if (!(n->specified & (1u << P_color)))
-            n->used.font->color = src->color;
-    }
-    if ((n->specified & (1u << P_bg)) && n->bg_current) {
-        e->own_bg(n, i);
-        n->used.bg->bg.r = n->used.font->color.r;
-        n->used.bg->bg.g = n->used.font->color.g;
-        n->used.bg->bg.b = n->used.font->color.b;
-        n->used.bg->bg.a = 255;
-    }
+    Sty_inherit_all(&n->sty, par, n->own, n->specified);
+    float parent_fs = par->font->font_size.px;
+    float root_fs = e->nodes[e->root].sty.font->font_size.px;
+    if (n->parent < 0) root_fs = parent_fs;
+    Sty_resolve_all(&n->sty, n->own, parent_fs, root_fs);
     for (int p = 0; p < 2; p++)
         if (e->pseudo_live(i, p)) e->inherit_pseudo(i, p);
 }
@@ -2434,44 +2113,16 @@ static void Engine_inherit_one(Engine* e, int i) {
 static void Engine_inherit_pseudo(Engine* e, int i, int p) {
     Node* el = &e->nodes[i];
     Node* n = &e->pnodes[2 * i + p];
-    int pi = e->cap_nodes + 2 * i + p;
-    unsigned box_bits = ((1u << N_BOX) - 1u) << N_BG;
-    unsigned font_bits = ((1u << N_FONT) - 1u) << (N_BG + N_BOX);
-    if (!(n->specified & (1u << P_display)) || !n->used.box->display.len) {
-        if (!(n->specified & box_bits)) n->used.box = &e->box_inline;
-        else n->used.box->display = e->ident_inline;
-    }
-    if ((!(n->specified & (1u << P_position)) || !n->used.box->position.len) &&
-        n->used.box != &e->box_init && n->used.box != &e->box_block &&
-        n->used.box != &e->box_inline)
-        n->used.box->position = e->ident_static;
-    StyFont* src = el->used.font;
-    if (!(n->specified & font_bits))
-        n->used.font = src;
-    else {
-        if (!(n->specified & (1u << P_fs_px)))
-            n->used.font->fs_px = src->fs_px;
-        else if (n->fs_unit == UNIT_EM)
-            n->used.font->fs_px = src->fs_px * n->fs_spec;
-        else if (n->fs_unit == UNIT_PCT)
-            n->used.font->fs_px = src->fs_px * n->fs_spec / 100;
-        else if (n->fs_unit == UNIT_REM) {
-            int ri = i;
-            while (e->nodes[ri].parent >= 0) ri = e->nodes[ri].parent;
-            n->used.font->fs_px = e->nodes[ri].used.font->fs_px * n->fs_spec;
-        }
-        if (!(n->specified & (1u << P_lh_px))) n->used.font->lh_px = src->lh_px;
-        if (!(n->specified & (1u << P_fw))) n->used.font->fw = src->fw;
-        if (!(n->specified & (1u << P_visibility))) n->used.font->visibility = src->visibility;
-        if (!(n->specified & (1u << P_color))) n->used.font->color = src->color;
-    }
-    if ((n->specified & (1u << P_bg)) && n->bg_current) {
-        e->own_bg(n, pi);
-        n->used.bg->bg.r = n->used.font->color.r;
-        n->used.bg->bg.g = n->used.font->color.g;
-        n->used.bg->bg.b = n->used.font->color.b;
-        n->used.bg->bg.a = 255;
-    }
+    Sty_inherit_all(&n->sty, &el->sty, n->own, n->specified);
+    float parent_fs = el->sty.font->font_size.px;
+    float root_fs = e->nodes[e->root].sty.font->font_size.px;
+    Sty_resolve_all(&n->sty, n->own, parent_fs, root_fs);
+}
+
+/* The children of a node whose inherited structs changed: re-inherit. */
+static void Engine_mark_children(Engine* e, int i) {
+    for (int c = e->nodes[i].first_child; c >= 0; c = e->nodes[c].next_sib)
+        if (!e->nodes[c].dead) e->nodes[c].inh_dirty = 1;
 }
 
 static uint64_t node_share_hash(const Node* n) {
@@ -3085,67 +2736,46 @@ static void Engine_media_dirty(Engine* eng) {
 }
 
 static void Engine_clear_dirty(Engine* e) {
-    for (int i = 0; i < e->nnodes; i++)
+    for (int i = 0; i < e->nnodes; i++) {
         e->nodes[i].dirty = 0;
+        e->nodes[i].inh_dirty = 0;
+    }
 }
 
+/* Dirty nodes start over. Their inherited structs are snapshotted first:
+ * after the restyle, a node whose inherited values came out different
+ * sends its clean children through inherit again. */
 static void Engine_reset_dirty(Engine* e) {
+    int k = 0;
     for (int i = 0; i < e->nnodes; i++) {
         Node* n = &e->nodes[i];
         if (!n->dirty) continue;
-        n->specified = 0;
-        n->fs_spec = 0;
-        n->fs_unit = 0;
-        n->bg_current = 0;
-        n->used.bg = &e->bg_init;
-        n->used.box = &e->box_init;
-        n->used.font = &e->font_init;
-        for (int p = 0; p < NPROP; p++) {
-            n->spec_a[p] = n->spec_b[p] = n->spec_c[p] = -1;
-            n->win_order[p] = -1;
-            n->win_rank[p] = -1;
-        }
+        Sty_snap(&n->sty, n->own, &e->snaps[k]);
+        e->snap_of[i] = k++;
+        Node_reset_style(n);
         e->reset_pseudo(i);
     }
 }
 
-/* Twin's pseudo boxes come along with its element cascade; values are
- * cloned into dst's own pool slots for the same reason as below. */
-static void Engine_copy_pseudo(Engine* e, int dst, int src) {
+/* A sharer takes the canon's owned structs by value into its own slots
+ * and its views by pointer. Clone, not alias: incremental inherit is
+ * dirty-only, and a dirty node writing into a struct a clean twin still
+ * views would change the twin's computed style. Stylo pays an Arc here. */
+static void Engine_copy_specified(Engine* e, int dst, int src) {
+    Node* d = &e->nodes[dst];
+    Node* s = &e->nodes[src];
+    Sty_clone(&d->sty, &s->sty, s->own, e->fpool, dst);
+    d->own = s->own;
+    memcpy(d->specified, s->specified, sizeof(d->specified));
     for (int p = 0; p < 2; p++) {
-        Node* d = &e->pnodes[2 * dst + p];
-        Node* s = &e->pnodes[2 * src + p];
-        int di = e->cap_nodes + 2 * dst + p;
-        e->bg_pool[di] = *s->used.bg;
-        e->box_pool[di] = *s->used.box;
-        e->font_pool[di] = *s->used.font;
-        d->used.bg = &e->bg_pool[di];
-        d->used.box = &e->box_pool[di];
-        d->used.font = &e->font_pool[di];
-        d->specified = s->specified;
-        d->fs_spec = s->fs_spec;
-        d->fs_unit = s->fs_unit;
-        d->bg_current = s->bg_current;
+        Node* dp = &e->pnodes[2 * dst + p];
+        Node* sp = &e->pnodes[2 * src + p];
+        Sty_clone(&dp->sty, &sp->sty, sp->own, e->fpool, e->cap_nodes + 2 * dst + p);
+        dp->own = sp->own;
+        memcpy(dp->specified, sp->specified, sizeof(dp->specified));
     }
 }
 
-static void Engine_copy_specified(Engine* e, int dst, int src) {
-    /* Clone into dst's pool. Pointer-sharing is fine on a full restyle
-     * (every sharer inherits and writes the same values). Incremental
-     * inherit is dirty-only: a dirty copy writing through a clean
-     * canon's StyBg / StyBox / StyFont corrupts the clean dump. */
-    e->bg_pool[dst] = *e->nodes[src].used.bg;
-    e->box_pool[dst] = *e->nodes[src].used.box;
-    e->font_pool[dst] = *e->nodes[src].used.font;
-    e->nodes[dst].used.bg = &e->bg_pool[dst];
-    e->nodes[dst].used.box = &e->box_pool[dst];
-    e->nodes[dst].used.font = &e->font_pool[dst];
-    e->nodes[dst].specified = e->nodes[src].specified;
-    e->nodes[dst].fs_spec = e->nodes[src].fs_spec;
-    e->nodes[dst].fs_unit = e->nodes[src].fs_unit;
-    e->nodes[dst].bg_current = e->nodes[src].bg_current;
-    e->copy_pseudo(dst, src);
-}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -3178,15 +2808,33 @@ static void Engine_sig_arm(Engine* e, const int* ids, int n, int arm) {
         Engine_sib_sig(e, ids ? ids[k] : k);
 }
 
+/* One hit list per arm. The worker count is only known once the
+ * scheduler runs, so the scratch grows to the arm count at the call. */
+static int Engine_ensure_hits(Engine* e, int na) {
+    if (na <= e->max_arms) return 1;
+    Hit* scratch = (Hit*)cc_arena_alloc(e->store, sizeof(Hit) * (size_t)na * 3 * HIT_CAP, 16);
+    if (!scratch) return 0;
+    e->hit_scratch = scratch;
+    e->max_arms = na;
+    return 1;
+}
+
 static void Engine_style_arm(Engine* e, int n, int arm, int dirty_only) {
     int sz = arm_size(n);
     int lo = arm * sz;
     int hi = lo + sz < n ? lo + sz : n;
+    Hits hs;
+    for (int t = 0; t < 3; t++) {
+        hs.h[t] = e->hit_scratch + ((size_t)arm * 3 + (size_t)t) * HIT_CAP;
+        hs.n[t] = 0;
+    }
+    hs.dropped = 0;
     for (int k = lo; k < hi; k++) {
         int i = e->share_ents[k].i;
         if (!dirty_only || e->nodes[i].dirty)
-            e->style_one(i);
+            e->style_one(i, &hs);
     }
+    if (hs.dropped) e->cnt_hits_dropped += hs.dropped;
 }
 
 static void !>(CCError) Engine_style_all(Engine* eng) {
@@ -3211,6 +2859,7 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     int nc = eng->ncanon;
     t0 = now_ms();
     na = arm_count(nc);
+    if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
     @parallel for (a in 0..na) {
         Engine_style_arm(eng, nc, a, 0);
     } !>.wait()!>;
@@ -3219,13 +2868,6 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
             m->copy_specified(i, eng->share_of[i]);
     }
     eng->t_match = now_ms() - t0;
-    for (int si = 0; si < eng->nnodes; si++) {
-        if (eng->nodes[si].dead) continue;
-        Rule sr;
-        if (parse_style_decls(eng, &eng->nodes[si], &sr))
-            m->apply_specified(si, &eng->nodes[si], &sr);
-        m->seal_box(&eng->nodes[si], si);
-    }
     t0 = now_ms();
     int maxd = eng->max_depth;
     int hi = (maxd + 1 < 64) ? eng->level_off[maxd + 1] : 0;
@@ -3265,6 +2907,7 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
     int nc = eng->ncanon;
     t0 = now_ms();
     na = arm_count(nc);
+    if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
     @parallel for (a in 0..na) {
         Engine_style_arm(eng, nc, a, 1);
     } !>.wait()!>;
@@ -3277,33 +2920,30 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
     }
     eng->sum_copy += now_ms() - t1;
     eng->t_match = now_ms() - t0;
-    for (int si = 0; si < eng->nnodes; si++) {
-        if (eng->nodes[si].dead || !eng->nodes[si].dirty) continue;
-        Rule sr;
-        if (parse_style_decls(eng, &eng->nodes[si], &sr))
-            m->apply_specified(si, &eng->nodes[si], &sr);
-        m->seal_box(&eng->nodes[si], si);
-    }
     t0 = now_ms();
+    /* Top-down. A dirty node re-inherits after its match; a clean node
+     * re-inherits when its parent's inherited structs came out changed
+     * (inh_dirty). A node that views an inherited family through its
+     * parent changed with it; one that owns the family compares values.
+     * Either way, a change here marks the children before their level. */
     int maxd = eng->max_depth;
     int hi = (maxd + 1 < 64) ? eng->level_off[maxd + 1] : 0;
     for (int k = 0; k < hi; k++) {
         int i = eng->level_ids[k];
-        if (eng->nodes[i].dirty)
-            m->inherit_one(i);
+        Node* n = &eng->nodes[i];
+        if (!n->dirty && !n->inh_dirty) continue;
+        StySnap before;
+        const StySnap* snap = &before;
+        if (n->dirty) snap = &eng->snaps[eng->snap_of[i]];
+        else Sty_snap(&n->sty, n->own, &before);
+        m->inherit_one(i);
+        int views = (n->inh_dirty && (~n->own & INH_FAM_MASK)) != 0;
+        if (views || Sty_snap_differs(&n->sty, snap))
+            m->mark_children(i);
     }
     eng->t_inherit = now_ms() - t0;
     eng->sum_inherit += eng->t_inherit;
     return cc_ok();
-}
-
-static CCSlice fmt_px(int v, CCSlice auto_s, char* buf, size_t cap) {
-    if (v == PX_AUTO) return auto_s;
-    if (v == PX_NORMAL) return @slice("normal");
-    int n = snprintf(buf, cap, "%dpx", v);
-    if (n < 0) n = 0;
-    if ((size_t)n >= cap) n = (int)cap - 1;
-    return cc_slice_from_buffer(buf, (size_t)n);
 }
 
 static int split_tabs(CCSlice line, CCSlice* out, int cap) {
@@ -3493,6 +3133,7 @@ static void Engine_apply_mut(Engine* e, MutOp* m) {
                 n->dirty = 1;
                 e->log_change(m->id, CH_SET_ATTR, name, old, val);
                 if (e->nchanges) e->changes[e->nchanges - 1].idx = i;
+                if (name.eq_cstr("style")) e->set_inline_rule(n);
                 return;
             }
         }
@@ -3503,6 +3144,7 @@ static void Engine_apply_mut(Engine* e, MutOp* m) {
         n->dirty = 1;
         e->log_change(m->id, CH_SET_ATTR, name, cc_slice_empty(), val);
         if (e->nchanges) e->changes[e->nchanges - 1].idx = -1;
+        if (name.eq_cstr("style")) e->set_inline_rule(n);
     } else if (m->kind == MUT_REMOVE_ATTR) {
         /* Every entry with the name goes. One log record per entry, in
          * decreasing slot order: redo (forward) removes from the top so
@@ -3523,6 +3165,7 @@ static void Engine_apply_mut(Engine* e, MutOp* m) {
         }
         n->nattr = w;
         n->dirty = 1;
+        if (name.eq_cstr("style")) e->set_inline_rule(n);
     }
 }
 
@@ -3638,38 +3281,25 @@ int main(int argc, char** argv) {
         if (!eng.nodes[i].dead) live++;
 
     io.println(@string(`# runner=cc fixture=${path}`, @scratch));
-    io.println(@string(`# TIME_MS=${ms} TIME_MUT_MS=${mut_ms} elements=${live} TIME_LEVELS=${eng.t0_levels} TIME_SHARE=${eng.t0_share} TIME_MATCH=${eng.t0_match} TIME_INHERIT=${eng.t0_inherit} LAST_MATCH=${eng.t_match} LAST_SHARE=${eng.t_share} LAST_INHERIT=${eng.t_inherit} LAST_DIRTY=${eng.last_dirty} SUM_DIRTY=${eng.sum_dirty} WORKERS=${st0.workers}/${st1.workers} MUT_FANOUT=${eng.sum_fanout} SRC=${eng.cnt_src} CAND=${eng.cnt_cand} RULES=${eng.cnt_rules} MUT_BLOOMS=${eng.sum_blooms} MUT_SIG=${eng.sum_sig} MUT_CANON=${eng.sum_canon} MUT_MATCH=${eng.sum_match} MUT_COPY=${eng.sum_copy} MUT_INHERIT=${eng.sum_inherit} canons=${ncanon0} depth=${eng.max_depth} rules=${eng.nrules} univ=${eng.universal.len}`, @scratch));
+    io.println(@string(`# TIME_MS=${ms} TIME_MUT_MS=${mut_ms} elements=${live} TIME_LEVELS=${eng.t0_levels} TIME_SHARE=${eng.t0_share} TIME_MATCH=${eng.t0_match} TIME_INHERIT=${eng.t0_inherit} LAST_MATCH=${eng.t_match} LAST_SHARE=${eng.t_share} LAST_INHERIT=${eng.t_inherit} LAST_DIRTY=${eng.last_dirty} SUM_DIRTY=${eng.sum_dirty} WORKERS=${st0.workers}/${st1.workers} MUT_FANOUT=${eng.sum_fanout} SRC=${eng.cnt_src} CAND=${eng.cnt_cand} RULES=${eng.cnt_rules} MUT_BLOOMS=${eng.sum_blooms} MUT_SIG=${eng.sum_sig} MUT_CANON=${eng.sum_canon} MUT_MATCH=${eng.sum_match} MUT_COPY=${eng.sum_copy} MUT_INHERIT=${eng.sum_inherit} canons=${ncanon0} depth=${eng.max_depth} rules=${eng.nrules} univ=${eng.universal.len} hits_dropped=${eng.cnt_hits_dropped}`, @scratch));
+    /* One row per live element, then its live pseudo boxes: Stylo's
+     * `name=value` for every content longhand, in Stylo's id order. */
+    static char linebuf[1 << 16];
     for (int i = 0; i < eng.nnodes; i++) {
         Node* n = &eng.nodes[i];
         if (n->dead) continue;
-        CCSlice tag = n->tag;
         CCSlice id = n->dom_id.len ? n->dom_id : @slice("-");
-        CCSlice disp = n->used.box->display.len ? n->used.box->display : @slice("inline");
-        CCSlice pos = n->used.box->position.len ? n->used.box->position : @slice("static");
-        CCSlice vis = n->used.font->visibility.len ? n->used.font->visibility : @slice("visible");
-        char wbuf[16], hbuf[16], minwbuf[16], fsbuf[16], lhbuf[16];
-        CCSlice w = fmt_px(n->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
-        CCSlice h = fmt_px(n->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
-        CCSlice minw = fmt_px(n->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
-        CCSlice fs = fmt_px(n->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
-        CCSlice lh = fmt_px(n->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
-        io.println(@string(`${i}\t${tag}\tid=${id}\tdisp=${disp}\tpos=${pos}\tw=${w}\th=${h}\tminw=${minw}\tfs=${fs}\tlh=${lh}\tfw=${n->used.font->fw}\tvis=${vis}\tcolor=rgb(${n->used.font->color.r}, ${n->used.font->color.g}, ${n->used.font->color.b})\tbg=${n->used.bg->bg.r},${n->used.bg->bg.g},${n->used.bg->bg.b},${n->used.bg->bg.a}`, @scratch));
-        for (int p = 0; p < 2; p++) {
-            if (!eng.pseudo_live(i, p)) continue;
-            Node* q = &eng.pnodes[2 * i + p];
-            CCSlice ptag = p == 0 ? @slice("::before") : @slice("::after");
-            CCSlice pdisp = q->used.box->display.len ? q->used.box->display : @slice("inline");
-            CCSlice ppos = q->used.box->position.len ? q->used.box->position : @slice("static");
-            CCSlice pvis = q->used.font->visibility.len ? q->used.font->visibility : @slice("visible");
-            CCSlice pw = fmt_px(q->used.box->width_px, @slice("auto"), wbuf, sizeof(wbuf));
-            CCSlice ph = fmt_px(q->used.box->height_px, @slice("auto"), hbuf, sizeof(hbuf));
-            CCSlice pminw = fmt_px(q->used.box->minw_px, @slice("auto"), minwbuf, sizeof(minwbuf));
-            CCSlice pfs = fmt_px(q->used.font->fs_px, @slice("16px"), fsbuf, sizeof(fsbuf));
-            CCSlice plh = fmt_px(q->used.font->lh_px, @slice("normal"), lhbuf, sizeof(lhbuf));
-            /* Stylo serializes a string `content` in double quotes. */
-            CCSlice c = q->used.box->content;
-            CCSlice content = (c.eq_cstr("''") || c.eq_cstr("\"\"")) ? @slice("\"\"") : c;
-            io.println(@string(`${i}\t${ptag}\tid=${id}\tdisp=${pdisp}\tpos=${ppos}\tw=${pw}\th=${ph}\tminw=${pminw}\tfs=${pfs}\tlh=${plh}\tfw=${q->used.font->fw}\tvis=${pvis}\tcolor=rgb(${q->used.font->color.r}, ${q->used.font->color.g}, ${q->used.font->color.b})\tbg=${q->used.bg->bg.r},${q->used.bg->bg.g},${q->used.bg->bg.b},${q->used.bg->bg.a}\tcontent=${content}`, @scratch));
+        for (int t = 0; t < 3; t++) {
+            const Node* q = t == 0 ? n : &eng.pnodes[2 * i + t - 1];
+            if (t && !eng.pseudo_live(i, t - 1)) continue;
+            CCSlice tag = t == 0 ? n->tag : t == 1 ? @slice("::before") : @slice("::after");
+            CssOut o = { linebuf, 0, sizeof linebuf };
+            int hn = snprintf(linebuf, sizeof linebuf, "%d\t%.*s\tid=%.*s", i,
+                              (int)tag.len, tag.ptr, (int)id.len, id.ptr);
+            o.n = hn > 0 ? (size_t)hn : 0;
+            Sty_dump(&q->sty, eng.atoms, &o);
+            css_out_str(&o, "\n");
+            io.write_all(cc_slice_from_buffer(linebuf, o.n)) !>;
         }
     }
     return 0;

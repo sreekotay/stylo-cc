@@ -1,0 +1,365 @@
+/* Compile-time emitter for the property layer. `sty_build` runs during
+ * translation (a @comptime function), walks Stylo's longhand table and
+ * returns the C for:
+ *
+ *   FAM_* / P_* / A_*         families, longhands, static atoms
+ *   Sty_<fam>                 one typed struct per Stylo style struct
+ *   Sty_<fam>_INIT            initial values (atoms baked; lengths and
+ *                             colors filled once by Sty_init_values with
+ *                             the same parser that reads declarations)
+ *   StyRefs                   a node's view: one pointer per family
+ *   Sty_apply                 write one declaration into its field (own on write)
+ *   Sty_<fam>_inherit / _eq   hole fill from the parent; value compare
+ *   Sty_<fam>_resolve         em / rem / % to px
+ *   Sty_inherit_all / Sty_resolve_all / Sty_clone / Sty_snap* / Sty_dump
+ *   prop_by_name              declaration name to P_*
+ *
+ * The engine splices it with one line:
+ *   @comptime { cc_emit_cstr(CC_EMIT_AT_COMPTIME_SITE, sty_build()); }
+ *
+ * Same move as Stylo's mako over longhands.toml: the table is data, the
+ * per-property code is straight-line C with no runtime kind dispatch.
+ * Adding a longhand is a row in longhands.cch and nothing else. */
+
+/* CSS name to C identifier; `float` is the one longhand that is a C keyword. */
+@comptime static void sty_cname(const char* s, char* out, size_t cap) {
+    size_t k = 0;
+    if (*s == '-') s++;
+    for (; *s && k + 1 < cap; s++)
+        out[k++] = ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+                    (*s >= '0' && *s <= '9')) ? *s : '_';
+    out[k] = 0;
+    if (!strcmp(out, "float") && k + 1 < cap) { out[k++] = '_'; out[k] = 0; }
+}
+
+@comptime static int sty_is_ident(const char* s) {
+    if (!*s) return 0;
+    if (*s == '-') s++;
+    if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) return 0;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+              (*s >= '0' && *s <= '9') || *s == '-' || *s == '_'))
+            return 0;
+    return 1;
+}
+
+@comptime static const char* sty_build(void) {
+    #include "longhands.cch"
+    enum { MAX_FAM = 32, MAX_ATOM = 512, BUF = 1 << 20 };
+    static char buf[BUF];
+    size_t n = 0;
+#define EM(...) (n += (size_t)snprintf(buf + n, n < BUF ? BUF - n : 0, __VA_ARGS__))
+
+    /* The keywords the engine itself reasons about, interned first so
+     * their ids are compile-time constants. */
+    static const char* const extra[] = {
+        "inline", "block", "inline-block", "none", "normal", "auto", "static",
+        "visible", "hidden", "bold", "initial", "inherit", "unset", 0
+    };
+    const char* fams[MAX_FAM];
+    int fam_inh[MAX_FAM];
+    int nfam = 0;
+    const char* atoms[MAX_ATOM];
+    int natom = 0;
+    int prop_fam[N_LONGHANDS];
+    int fs_fam = -1;
+    int f, i, a;
+
+#define ATOM_OF(out, text) do { \
+        const char* t_ = (text); \
+        for ((out) = 0; (out) < natom; (out)++) if (!strcmp(atoms[(out)], t_)) break; \
+        if ((out) == natom && natom < MAX_ATOM) atoms[natom++] = t_; \
+    } while (0)
+#define ATOM_ENUM(idx, en) do { \
+        if (sty_is_ident(atoms[idx])) { char nm_[128]; sty_cname(atoms[idx], nm_, sizeof nm_); snprintf(en, sizeof en, "A_%s", nm_); } \
+        else snprintf(en, sizeof en, "A__%d", (int)(idx)); \
+    } while (0)
+#define CTYPE(k) ((k) == LH_LEN ? "CssLen" : (k) == LH_COLOR ? "CssColor" : "int")
+#define CELL(k)  ((k) == LH_LEN ? "len" : (k) == LH_COLOR ? "color" : "atom")
+
+    for (i = 0; extra[i]; i++) ATOM_OF(a, extra[i]);
+    for (i = 0; i < N_LONGHANDS; i++) {
+        const LonghandRow* r = &LONGHANDS[i];
+        for (f = 0; f < nfam; f++) if (!strcmp(fams[f], r->fam)) break;
+        if (f == nfam) {
+            fams[nfam] = r->fam;
+            fam_inh[nfam] = r->inherited;
+            nfam++;
+        }
+        prop_fam[i] = f;
+        if (r->kind == LH_ATOM) ATOM_OF(a, r->init);
+        if (!strcmp(r->name, "font-size")) fs_fam = f;
+    }
+
+    /* ---- enums and tables ---- */
+    EM("enum {\n");
+    for (f = 0; f < nfam; f++) EM("    FAM_%s,\n", fams[f]);
+    EM("    N_FAM\n};\n");
+    EM("static const uint8_t FAM_INHERITED[N_FAM] = {");
+    for (f = 0; f < nfam; f++) EM(" %d,", fam_inh[f]);
+    EM(" };\n");
+    {
+        unsigned m = 0;
+        for (f = 0; f < nfam; f++) if (fam_inh[f]) m |= 1u << f;
+        EM("#define INH_FAM_MASK 0x%xu\n", m);
+    }
+    EM("static const char* const FAM_NAME[N_FAM] = {");
+    for (f = 0; f < nfam; f++) EM(" \"%s\",", fams[f]);
+    EM(" };\n");
+    EM("enum {\n");
+    for (i = 0; i < N_LONGHANDS; i++) {
+        char nm[128];
+        sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+        EM("    P_%s,\n", nm);
+    }
+    EM("    NPROP\n};\n");
+    EM("#define PS_WORDS ((NPROP + 63) / 64)\n");
+    EM("#define PS_HAS(w, p) (((w)[(p) >> 6] >> ((p) & 63)) & 1u)\n");
+    EM("#define PS_SET(w, p) ((w)[(p) >> 6] |= 1ull << ((p) & 63))\n");
+    EM("static const uint8_t PROP_FAM[NPROP] = {");
+    for (i = 0; i < N_LONGHANDS; i++) EM(" FAM_%s,", LONGHANDS[i].fam);
+    EM(" };\n");
+    EM("static const uint8_t PROP_INHERITED[NPROP] = {");
+    for (i = 0; i < N_LONGHANDS; i++) EM(" %d,", LONGHANDS[i].inherited);
+    EM(" };\n");
+    EM("enum { LH_ATOM = %d, LH_LEN = %d, LH_COLOR = %d };\n", LH_ATOM, LH_LEN, LH_COLOR);
+    EM("static const uint8_t PROP_KIND[NPROP] = {");
+    for (i = 0; i < N_LONGHANDS; i++) EM(" %d,", LONGHANDS[i].kind);
+    EM(" };\n");
+    EM("static const char* const PROP_NAME[NPROP] = {");
+    for (i = 0; i < N_LONGHANDS; i++) EM(" \"%s\",", LONGHANDS[i].name);
+    EM(" };\n");
+    EM("enum {\n");
+    for (a = 0; a < natom; a++) {
+        char en[160];
+        ATOM_ENUM(a, en);
+        EM("    %s,\n", en);
+    }
+    EM("    N_STATIC_ATOMS\n};\n");
+    EM("static const char* const ATOM_TEXT[N_STATIC_ATOMS] = {\n");
+    for (a = 0; a < natom; a++) EM("    \"%s\",\n", atoms[a]);
+    EM("};\n");
+
+    /* ---- structs and initial values ---- */
+    for (f = 0; f < nfam; f++) {
+        EM("typedef struct {\n");
+        for (i = 0; i < N_LONGHANDS; i++) {
+            if (prop_fam[i] != f) continue;
+            char nm[128];
+            sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+            EM("    %s %s;\n", CTYPE(LONGHANDS[i].kind), nm);
+        }
+        EM("} Sty_%s;\n", fams[f]);
+        EM("static Sty_%s Sty_%s_INIT = {\n", fams[f], fams[f]);
+        for (i = 0; i < N_LONGHANDS; i++) {
+            if (prop_fam[i] != f || LONGHANDS[i].kind != LH_ATOM) continue;
+            char nm[128], en[160];
+            sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+            ATOM_OF(a, LONGHANDS[i].init);
+            ATOM_ENUM(a, en);
+            EM("    .%s = %s,\n", nm, en);
+        }
+        EM("};\n");
+    }
+    EM("static void Sty_init_values(void) {\n");
+    for (i = 0; i < N_LONGHANDS; i++) {
+        const LonghandRow* r = &LONGHANDS[i];
+        if (r->kind == LH_ATOM) continue;
+        char nm[128];
+        sty_cname(r->name, nm, sizeof nm);
+        EM("    cssval_parse_%s(\"%s\", %zu, &Sty_%s_INIT.%s);\n",
+           r->kind == LH_LEN ? "len" : "color", r->init, strlen(r->init), fams[prop_fam[i]], nm);
+    }
+    EM("}\n");
+    EM("typedef struct {\n");
+    for (f = 0; f < nfam; f++) EM("    const Sty_%s* %s;\n", fams[f], fams[f]);
+    EM("} StyRefs;\n");
+    EM("static const StyRefs STY_INIT_REFS = {");
+    for (f = 0; f < nfam; f++) EM(" &Sty_%s_INIT,", fams[f]);
+    EM(" };\n");
+    EM("static const size_t FAM_SIZEOF[N_FAM] = {");
+    for (f = 0; f < nfam; f++) EM(" sizeof(Sty_%s),", fams[f]);
+    EM(" };\n");
+
+    /* ---- name lookup ---- */
+    EM("static int prop_by_name(const char* p, size_t n) {\n    switch (n) {\n");
+    for (size_t len = 1; len < 64; len++) {
+        int any = 0;
+        for (i = 0; i < N_LONGHANDS; i++) {
+            if (strlen(LONGHANDS[i].name) != len) continue;
+            char nm[128];
+            sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+            if (!any) EM("    case %zu:\n", len);
+            any = 1;
+            EM("        if (!memcmp(p, \"%s\", %zu)) return P_%s;\n", LONGHANDS[i].name, len, nm);
+        }
+        if (any) EM("        break;\n");
+    }
+    EM("    default: break;\n    }\n    return -1;\n}\n");
+
+    /* ---- own on write ----
+     * The node's slot for this family takes a copy of whatever the node
+     * was viewing (initial, or an inherited struct), then the field lands.
+     * A family with no pool was never declared in this sheet. */
+    for (f = 0; f < nfam; f++) {
+        const char* F = fams[f];
+        EM("static inline Sty_%s* Sty_own_%s(StyRefs* s, unsigned* own, void* const* pools, int slot) {\n", F, F);
+        EM("    if (*own & (1u << FAM_%s)) return (Sty_%s*)s->%s;\n", F, F, F);
+        EM("    Sty_%s* o = (Sty_%s*)pools[FAM_%s];\n", F, F, F);
+        EM("    if (!o) return 0;\n    o += slot;\n    *o = *s->%s;\n    s->%s = o;\n", F, F);
+        EM("    *own |= 1u << FAM_%s;\n    return o;\n}\n", F);
+    }
+    EM("static void Sty_apply(StyRefs* s, unsigned* own, void* const* pools, int slot, const CssDecl* d) {\n");
+    EM("    switch (d->prop) {\n");
+    for (i = 0; i < N_LONGHANDS; i++) {
+        const LonghandRow* r = &LONGHANDS[i];
+        const char* F = fams[prop_fam[i]];
+        char nm[128];
+        sty_cname(r->name, nm, sizeof nm);
+        EM("    case P_%s: {\n        Sty_%s* t = Sty_own_%s(s, own, pools, slot);\n", nm, F, F);
+        EM("        if (t) t->%s = d->wide ? Sty_%s_INIT.%s : d->v.%s;\n    } break;\n",
+           nm, F, nm, CELL(r->kind));
+    }
+    EM("    default: break;\n    }\n}\n");
+
+    /* ---- per family: inherit holes, compare, resolve lengths ---- */
+    for (f = 0; f < nfam; f++) {
+        const char* F = fams[f];
+        int has_len = 0;
+        for (i = 0; i < N_LONGHANDS; i++)
+            if (prop_fam[i] == f && LONGHANDS[i].kind == LH_LEN) has_len = 1;
+        if (fam_inh[f]) {
+            EM("static void Sty_%s_inherit(Sty_%s* d, const Sty_%s* p, const uint64_t* spec) {\n", F, F, F);
+            for (i = 0; i < N_LONGHANDS; i++) {
+                if (prop_fam[i] != f) continue;
+                char nm[128];
+                sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+                EM("    if (!PS_HAS(spec, P_%s)) d->%s = p->%s;\n", nm, nm, nm);
+                /* `color: currentcolor` is the inherited color */
+                if (!strcmp(LONGHANDS[i].name, "color"))
+                    EM("    else if (d->color.kw == CKW_CURRENT) d->color = p->color;\n");
+            }
+            EM("}\n");
+            EM("static int Sty_%s_eq(const Sty_%s* a, const Sty_%s* b) {\n", F, F, F);
+            for (i = 0; i < N_LONGHANDS; i++) {
+                if (prop_fam[i] != f) continue;
+                char nm[128];
+                sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+                if (LONGHANDS[i].kind == LH_LEN)
+                    EM("    if (!cssval_len_eq(&a->%s, &b->%s)) return 0;\n", nm, nm);
+                else if (LONGHANDS[i].kind == LH_COLOR)
+                    EM("    if (!cssval_color_eq(&a->%s, &b->%s)) return 0;\n", nm, nm);
+                else
+                    EM("    if (a->%s != b->%s) return 0;\n", nm, nm);
+            }
+            EM("    return 1;\n}\n");
+        }
+        if (has_len) {
+            EM("static void Sty_%s_resolve(Sty_%s* d, float parent_fs, float root_fs, float* fs_out) {\n", F, F);
+            if (f == fs_fam) {
+                /* font-size resolves against the parent's and feeds the rest */
+                EM("    cssval_resolve(&d->font_size, parent_fs, root_fs, 1);\n");
+                EM("    float fs = d->font_size.kw ? parent_fs : d->font_size.px;\n");
+            } else {
+                EM("    float fs = parent_fs;\n");
+            }
+            for (i = 0; i < N_LONGHANDS; i++) {
+                if (prop_fam[i] != f || LONGHANDS[i].kind != LH_LEN) continue;
+                if (!strcmp(LONGHANDS[i].name, "font-size")) continue;
+                char nm[128];
+                sty_cname(LONGHANDS[i].name, nm, sizeof nm);
+                EM("    cssval_resolve(&d->%s, fs, root_fs, 0);\n", nm);
+            }
+            EM("    if (fs_out) *fs_out = fs;\n}\n");
+        }
+    }
+
+    /* ---- whole node ---- */
+    EM("static void Sty_clone(StyRefs* d, const StyRefs* s, unsigned own, void* const* pools, int slot) {\n");
+    for (f = 0; f < nfam; f++) {
+        const char* F = fams[f];
+        EM("    if (own & (1u << FAM_%s)) { Sty_%s* o = (Sty_%s*)pools[FAM_%s] + slot; *o = *s->%s; d->%s = o; }\n",
+           F, F, F, F, F, F);
+        EM("    else d->%s = s->%s;\n", F, F);
+    }
+    EM("}\n");
+    EM("static void Sty_inherit_all(StyRefs* n, const StyRefs* p, unsigned own, const uint64_t* spec) {\n");
+    for (f = 0; f < nfam; f++) {
+        if (!fam_inh[f]) continue;
+        const char* F = fams[f];
+        EM("    if (own & (1u << FAM_%s)) Sty_%s_inherit((Sty_%s*)n->%s, p->%s, spec);\n", F, F, F, F, F);
+        EM("    else n->%s = p->%s;\n", F, F);
+    }
+    EM("}\n");
+    EM("static void Sty_resolve_all(StyRefs* n, unsigned own, float parent_fs, float root_fs) {\n");
+    EM("    float fs = parent_fs;\n");
+    if (fs_fam >= 0) {
+        const char* F = fams[fs_fam];
+        EM("    if (own & (1u << FAM_%s)) Sty_%s_resolve((Sty_%s*)n->%s, parent_fs, root_fs, &fs);\n", F, F, F, F);
+        EM("    else fs = n->%s->font_size.kw ? parent_fs : n->%s->font_size.px;\n", F, F);
+    }
+    for (f = 0; f < nfam; f++) {
+        int has_len = 0;
+        for (i = 0; i < N_LONGHANDS; i++)
+            if (prop_fam[i] == f && LONGHANDS[i].kind == LH_LEN) has_len = 1;
+        if (f == fs_fam || !has_len) continue;
+        const char* F = fams[f];
+        EM("    if (own & (1u << FAM_%s)) Sty_%s_resolve((Sty_%s*)n->%s, fs, root_fs, 0);\n", F, F, F, F);
+    }
+    EM("}\n");
+    /* Snapshot of a node's inherited families, taken before a restyle so
+     * the result can be compared. Owned slots are rewritten in place, so
+     * those are copied by value; a viewed struct (initial, or an
+     * ancestor's slot) is stable while the view lasts, so its pointer is
+     * enough and a changed pointer is compared by value. */
+    EM("typedef struct {\n    unsigned own;\n");
+    for (f = 0; f < nfam; f++)
+        if (fam_inh[f]) EM("    const Sty_%s* p_%s;\n    Sty_%s v_%s;\n", fams[f], fams[f], fams[f], fams[f]);
+    EM("} StySnap;\n");
+    EM("static void Sty_snap(const StyRefs* s, unsigned own, StySnap* o) {\n    o->own = own;\n");
+    for (f = 0; f < nfam; f++) {
+        if (!fam_inh[f]) continue;
+        const char* F = fams[f];
+        EM("    o->p_%s = s->%s;\n    if (own & (1u << FAM_%s)) o->v_%s = *s->%s;\n", F, F, F, F, F);
+    }
+    EM("}\n");
+    EM("static int Sty_snap_differs(const StyRefs* s, const StySnap* o) {\n");
+    for (f = 0; f < nfam; f++) {
+        if (!fam_inh[f]) continue;
+        const char* F = fams[f];
+        EM("    if (s->%s != o->p_%s) { if (!Sty_%s_eq(s->%s, o->p_%s)) return 1; }\n", F, F, F, F, F);
+        EM("    else if ((o->own & (1u << FAM_%s)) && !Sty_%s_eq(s->%s, &o->v_%s)) return 1;\n", F, F, F, F);
+    }
+    EM("    return 0;\n}\n");
+
+    /* Stylo's id order, `\tname=value` per longhand. */
+    EM("static void Sty_dump(const StyRefs* s, const CCSlice* atoms, CssOut* o) {\n");
+    for (i = 0; i < N_LONGHANDS; i++) {
+        const LonghandRow* r = &LONGHANDS[i];
+        const char* F = fams[prop_fam[i]];
+        char nm[128];
+        sty_cname(r->name, nm, sizeof nm);
+        EM("    css_out_str(o, \"\\t%s=\");\n", r->name);
+        if (r->kind == LH_LEN && !strcmp(r->name, "font-size"))
+            EM("    css_out_num(o, s->%s->%s.px); css_out_str(o, \"px\");\n", F, nm);
+        else if (r->kind == LH_LEN)
+            EM("    css_out_len(o, &s->%s->%s);\n", F, nm);
+        else if (r->kind == LH_COLOR)
+            EM("    css_out_color(o, &s->%s->%s);\n", F, nm);
+        else if (!strcmp(r->name, "content"))
+            EM("    css_out_content(o, atoms[s->%s->%s].ptr, atoms[s->%s->%s].len);\n", F, nm, F, nm);
+        else
+            EM("    css_out_bytes(o, atoms[s->%s->%s].ptr, atoms[s->%s->%s].len);\n", F, nm, F, nm);
+    }
+    EM("}\n");
+
+    if (n >= BUF) {
+        EM("#error \"sty_build: fragment buffer overflow\"\n");
+    }
+#undef EM
+#undef ATOM_OF
+#undef ATOM_ENUM
+#undef CTYPE
+#undef CELL
+    return buf;
+}

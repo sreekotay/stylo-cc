@@ -342,6 +342,21 @@ impl HostDoc {
         }
     }
 
+    /// Gecko `nsStyledElement::SetInlineStyleDeclaration`: the style
+    /// attribute is not a selector input, so no snapshot reaches it; the
+    /// host posts the hint that replaces that one cascade level.
+    fn style_attr_changed(&self, sid: u32) {
+        if sid == 0 || sid as usize >= self.slots.len() || self.slots[sid as usize].dead.get() {
+            return;
+        }
+        self.slots[sid as usize]
+            .data
+            .borrow_mut()
+            .hint
+            .insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
+        self.note_dirty_path(sid as i32 - 1);
+    }
+
     /// Gecko `PostRestyleEvent(element, RestyleSubtree)`.
     fn restyle_subtree_slot(&self, sid: u32) {
         if sid == 0 || sid as usize >= self.slots.len() || self.slots[sid as usize].dead.get() {
@@ -521,9 +536,10 @@ impl HostDoc {
                     }
                 }
                 if let Some(i) = (*id as u32).checked_add(1).map(|x| x as usize) {
-                    if i < self.slots.len() {
+                    if i < self.slots.len() && &**name == "style" {
                         let pdb = parse_inline_style(&self.slots[i].attrs, &self.lock);
                         self.slots[i].style_attr = pdb;
+                        self.style_attr_changed(i as u32);
                     }
                 }
             }
@@ -534,9 +550,10 @@ impl HostDoc {
                     s.attrs.retain(|(n, _)| n != &ln);
                 }
                 if let Some(i) = (*id as u32).checked_add(1).map(|x| x as usize) {
-                    if i < self.slots.len() {
+                    if i < self.slots.len() && &**name == "style" {
                         let pdb = parse_inline_style(&self.slots[i].attrs, &self.lock);
                         self.slots[i].style_attr = pdb;
+                        self.style_attr_changed(i as u32);
                     }
                 }
             }

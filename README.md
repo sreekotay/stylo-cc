@@ -16,6 +16,31 @@ receipts/           last cmp-clean receipts, both runners: full dumps for tiny /
 
 Style only. No layout. No paint. No browser. Stylo submodule tracks `origin/main` (`b3e6425`).
 
+## In short
+
+**The test.** WebKit's StyleBench, frozen: a 5 000-rule stylesheet, a 20 000-element tree, and 25 rounds of DOM edits (add / remove classes, change attributes, add / remove leaves), each followed by a restyle. Six variants cover what real sheets do — plain descendant / child selectors, sibling combinators, `:first-child`-style structural selectors, `:nth-*` selectors, `::before` / `::after` pseudo-elements, and `@media` queries driven by 55 viewport resizes. Same seeds, same tree, same edits on both sides.
+
+**The two engines.** Stylo — Firefox's and Servo's real style crate, release build, its thread pool and style sharing on — and this engine, written in Concurrent-C. Each takes the fixture text, styles the tree, runs the edits, and prints the computed style of every live element.
+
+**The gate.** The two printouts must be byte-identical before any time is recorded. A row is one element (or `::before` / `::after` box) and all 189 CSS longhands Stylo exposes to `getComputedStyle`, in Stylo's order and Stylo's serialization — not just the properties the benchmark sheet happens to set. Every suite, every size, plus a set of hand-written fixtures (cascade order, `!important`, `em` / `rem` / `%`, `currentcolor`, `style=` attributes, inherited changes reaching untouched descendants) passes `cmp` clean.
+
+**Completeness.** The property list is Stylo's own (`stylo-runner --longhands`), turned into code at compile time by a `@comptime` generator, so every element carries the full computed-style width: each of Stylo's 20 style structs is inherited or reset, every length resolved, every value printed. What the engine does not do is the rest of CSS — `calc()`, `var()`, value lists, `:not` / `:is`, user-action pseudo-classes, layout-time semantics. On these fixtures none of that is exercised, so the output is the same; on arbitrary CSS it would not be.
+
+**The results** (Apple M5, wall clock, ms; lower is better):
+
+| suite | Stylo first restyle | CC first restyle | Stylo 25 edits (55 resizes) | CC 25 edits (55 resizes) |
+|---|---|---|---|---|
+| default | 26.7 | **9.8** | 23.4 | **15.6** |
+| sibling `+` `~` | 57.1 | **18.5** | 144.6 | **72.9** |
+| structural `:first-child` … | 36.7 | **8.5** | 135.4 | **16.5** |
+| nth `:nth-child(2n+1)` … | 39.9 | **10.1** | 166.1 | **38.1** |
+| before / after | 36.3 | **11.0** | 57.5 | **18.7** |
+| media (5 k elements) | 11.4 | **1.5** | 425.3 | **14.3** |
+
+CC is 2.7–7.6× faster on the first restyle and 1.5–30× faster on the edit rounds, with identical output; the smallest margin is the default suite's edit rounds (1.5×), the largest is media resizes (30×), where Stylo restyles every element on each resize and CC restyles only those a flipped rule touches. Widening the dump from 11 properties to all 189 cost CC about half a millisecond per column; Stylo already computed all of them.
+
+**What this is not.** A Firefox speedup. Stylo here runs on a small host (`stylo-runner/`) rather than in a browser, and our engine implements StyleBench's CSS, not CSS. The claim is narrower: on this workload, doing the same job to the same output, this shape is faster. The rest of this file is the detail — what each suite exercises, how each side matches and invalidates, what was corrected to make the race fair, and how to run it.
+
 The gate is `cmp` of the style dump for every live element. Timings are wall clock after receipts match.
 
 This is a StyleBench race against Stylo the crate, not a Firefox hook. A win here is not “faster Firefox.”

@@ -56,6 +56,19 @@ Ladybird's column is the **Conservative** runner; stock StyleBench is in parenth
 
 A style-only probe on the same page (`--split`: force a full style flush, then `getBoundingClientRect` for layout) puts Chrome's default edit rounds at ~88 ms style / ~15 ms layout and the initial resolution StyleBench leaves untimed at ~37 ms, against Stylo's 26.7 and our 9.8 on the same tree. The probe is stable on the default suite and noisy elsewhere (WebKit's clock is 1 ms-granular), so only that row is quoted; full output is in `receipts/browser-chrome.txt` / `receipts/browser-webkit.txt`.
 
+**Ladybird's own style clock.** Ladybird is the one browser here that times its style pass itself: with `--expose-internals-object`, `internals.getStyleInvalidationCounters().styleUpdateMicroseconds` brackets `Document::update_style` (style only, never layout), and sub-counters split it into the Rust `StyleEngine` (matching, invalidation, cascade identities) and the C++ recompute that materializes `ComputedValues`. `scripts/browser-bench.sh ladybird 5 --internals` samples those counters around every step and around a flush forced right after `createBenchmark()`, which is the initial resolution. That gives the first like-for-like column against Stylo and CC — same tree, same sheet, same edits, style only — with the caveat that Ladybird's pass still carries the UA sheet, full-grammar CSS and the layout-facing `ComputedValues` groups (min over 5 iterations, ms; `receipts/browser-ladybird-internals.txt`):
+
+| suite | Ladybird first restyle | Stylo | CC | Ladybird 25 edits (55 resizes) | *of which Rust engine* | Stylo | CC |
+|---|---|---|---|---|---|---|---|
+| default | 92 | 26.7 | **9.8** | 103 | *88* | 23.4 | **15.6** |
+| sibling | 102 | 57.1 | **18.5** | 182 | *165* | 144.6 | **72.9** |
+| structural | 97 | 36.7 | **8.5** | 137 | *125* | 135.4 | **16.5** |
+| nth | 105 | 39.9 | **10.1** | 292 | *257* | 166.1 | **38.1** |
+| before / after | 129 | 36.3 | **11.0** | 132 | *100* | 57.5 | **18.7** |
+| media (5 k elements) | 148 | 11.4 | **1.5** | 55 | *16* | 425.3 | **14.3** |
+
+On the edit rounds Ladybird's style pass lands between 1.0× (structural) and 4.4× (default) of Stylo's time, and 8× faster than Stylo on media, where like CC it only restyles what a flipped rule touches. CC is 2.5–8× faster than Ladybird's style pass on the edits and 5.5–100× on the first restyle. The rest of Ladybird's StyleBench step — the gap between the `style` column and the sync column in the receipt — is JS and layout.
+
 **What this is not.** A Firefox speedup. Stylo here runs on a small host (`stylo-runner/`) rather than in a browser, and our engine implements StyleBench's CSS, not CSS. The claim is narrower: on this workload, doing the same job to the same output, this shape is faster. The rest of this file is the detail — what each suite exercises, how each side matches and invalidates, what was corrected to make the race fair, and how to run it.
 
 The gate is `cmp` of the style dump for every live element. Timings are wall clock after receipts match.
@@ -256,6 +269,7 @@ make longhands        # regenerate engine/longhands.cch from Stylo (--longhands 
 scripts/browser-bench.sh all 5   # StyleBench in Chrome + Playwright WebKit (+ Safari if remote automation is on)
 scripts/browser-bench.sh ladybird-build          # build the ladybird/ submodule (Distribution; 30+ min first time)
 scripts/browser-bench.sh ladybird 5 --conservative   # StyleBench in Ladybird; drop --conservative for the stock runner
+scripts/browser-bench.sh ladybird 5 --internals      # + Ladybird's own update_style clock per step and for the initial resolution
 ```
 
 `CC_STYLE_WORKERS=n` caps the CC worker pool (default: all cores).

@@ -6,6 +6,7 @@
 #   scripts/browser-bench.sh webkit [N]      # Playwright's WebKit build (stand-in; not Safari's WebCore)
 #   scripts/browser-bench.sh safari          # safaridriver if "Allow Remote Automation" is on, else manual instructions
 #   scripts/browser-bench.sh ladybird [N]    # Ladybird from the ladybird/ submodule (see `ladybird-build`), headless=manual
+#                                            #   --conservative: +getComputedStyle flush per step; --internals: + Ladybird's own style clock
 #   scripts/browser-bench.sh ladybird-build  # build the submodule's Distribution preset (30+ min first time; needs brew tools)
 #   scripts/browser-bench.sh serve           # just serve StyleBench for a manual run
 #   scripts/browser-bench.sh fetch           # (re)fetch StyleBench from WebKit main (sparse clone)
@@ -116,6 +117,7 @@ case "$cmd" in
     if [ -x "$LB_BIN" ]; then
       ladybird "${1:-5}" --json results/ladybird.json "${@:2}"
       ladybird "${1:-5}" --conservative --json results/ladybird-conservative.json "${@:2}"
+      ladybird "${1:-5}" --internals --json results/ladybird-internals.json "${@:2}"
     else
       echo "(no Ladybird build; run: $0 ladybird-build)"
     fi

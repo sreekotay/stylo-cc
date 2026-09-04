@@ -6,16 +6,18 @@ RECEIPTS ?= receipts
 FIXTURES ?= fixtures
 CCC ?= ccc
 
-.PHONY: setup fixture fixture-default fixture-sibling-tiny stylo-run cc-run compare compare-local compare-sibling bench-style bench-sibling test build release bench help
+.PHONY: setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural bench-style bench-sibling bench-structural test build release bench help
 
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
 	@echo "fixture-default StyleBench default (20k / 5k)"
-	@echo "compare         tiny + sibling-tiny + fixtures/local: cmp styles"
+	@echo "compare         tiny + sibling-tiny + structural-tiny + fixtures/local: cmp styles"
 	@echo "compare-local   every fixtures/local/*.stylebench vs Stylo"
 	@echo "compare-sibling generated tiny sibling combinators vs Stylo"
+	@echo "compare-structural generated tiny structural pseudo-classes vs Stylo"
 	@echo "bench-style     default suite, release Stylo + CC -O, cmp then times"
 	@echo "bench-sibling   sibling 20k/5k, release Stylo + warm CC -O, cmp then times"
+	@echo "bench-structural structural 20k/5k, same shape as bench-sibling"
 	@echo "test            upstream cargo test --workspace"
 
 setup:
@@ -41,6 +43,10 @@ fixture-sibling-tiny: $(STYLO)/Cargo.toml
 	mkdir -p $(FIXTURES)
 	$(CARGO) run -q -p stylebench-gen -- --tiny --sibling > $(FIXTURES)/tiny_sibling.stylebench
 
+fixture-structural-tiny: $(STYLO)/Cargo.toml
+	mkdir -p $(FIXTURES)
+	$(CARGO) run -q -p stylebench-gen -- --tiny --structural > $(FIXTURES)/tiny_structural.stylebench
+
 compare-sibling: fixture-sibling-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_sibling.stylebench > $(RECEIPTS)/tiny_sibling.stylo.txt
@@ -51,7 +57,17 @@ compare-sibling: fixture-sibling-tiny
 	@echo OK tiny-sibling
 	@grep '^# TIME' $(RECEIPTS)/tiny_sibling.stylo.txt $(RECEIPTS)/tiny_sibling.cc.txt
 
-compare: stylo-run cc-run compare-local compare-sibling
+compare-structural: fixture-structural-tiny
+	mkdir -p $(RECEIPTS)
+	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_structural.stylebench > $(RECEIPTS)/tiny_structural.stylo.txt
+	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_structural.stylebench > $(RECEIPTS)/tiny_structural.cc.txt
+	@grep -v '^#' $(RECEIPTS)/tiny_structural.stylo.txt > /tmp/stylo.str
+	@grep -v '^#' $(RECEIPTS)/tiny_structural.cc.txt > /tmp/cc.str
+	cmp /tmp/stylo.str /tmp/cc.str
+	@echo OK tiny-structural
+	@grep '^# TIME' $(RECEIPTS)/tiny_structural.stylo.txt $(RECEIPTS)/tiny_structural.cc.txt
+
+compare: stylo-run cc-run compare-local compare-sibling compare-structural
 	@grep -v '^#' $(RECEIPTS)/tiny.stylo.txt > /tmp/stylo.styles
 	@grep -v '^#' $(RECEIPTS)/tiny.cc.txt > /tmp/cc.styles
 	cmp /tmp/stylo.styles /tmp/cc.styles
@@ -87,9 +103,12 @@ bench-style: fixture-default
 	@echo OK
 	@grep '^# TIME' $(RECEIPTS)/default.stylo.txt $(RECEIPTS)/default.cc.txt
 
-# Same shape as bench-style. Not on that target until the sibling race is worth recording.
+# Same shape as bench-style, one generated suite each.
 bench-sibling: $(STYLO)/Cargo.toml
-	./scripts/bench-sibling.sh
+	./scripts/bench-suite.sh sibling
+
+bench-structural: $(STYLO)/Cargo.toml
+	./scripts/bench-suite.sh structural
 
 build: $(STYLO)/Cargo.toml
 	cd $(STYLO) && $(CARGO) build --workspace

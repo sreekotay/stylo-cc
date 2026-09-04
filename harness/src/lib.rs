@@ -71,6 +71,8 @@ pub struct Config {
     pub element_attribute_chance: f64,
     pub element_maximum_attributes: i32,
     pub combinators: Vec<String>,
+    pub pseudo_classes: Vec<String>,
+    pub pseudo_class_chance: f64,
     pub maximum_selector_length: i32,
     pub rule_count: i32,
     pub element_count: i32,
@@ -84,6 +86,15 @@ pub struct Config {
     pub step_count: i32,
     pub mutations_per_step: i32,
 }
+
+const STRUCTURAL_PSEUDOS: [&str; 6] = [
+    "first-child",
+    "last-child",
+    "first-of-type",
+    "last-of-type",
+    "only-of-type",
+    "empty",
+];
 
 impl Config {
     /// StyleBench `defaultConfiguration` (20k / 5k).
@@ -105,6 +116,8 @@ impl Config {
             element_attribute_chance: 0.2,
             element_maximum_attributes: 3,
             combinators: vec![" ".into(), ">".into()],
+            pseudo_classes: vec![],
+            pseudo_class_chance: 0.0,
             maximum_selector_length: 6,
             rule_count: 5000,
             element_count: 20000,
@@ -149,6 +162,24 @@ impl Config {
             "~".into(),
             "+".into(),
         ];
+        c
+    }
+
+    /// StyleBench `structuralPseudoClassConfiguration`. Same seeds as default.
+    pub fn structural_suite() -> Self {
+        let mut c = Self::default_suite();
+        c.name = "Structural".into();
+        c.pseudo_class_chance = 0.1;
+        c.pseudo_classes = STRUCTURAL_PSEUDOS.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    /// Tiny tree / sheet with the structural pseudo-class mix.
+    pub fn tiny_structural() -> Self {
+        let mut c = Self::tiny();
+        c.name = "TinyStructural".into();
+        c.pseudo_class_chance = 0.1;
+        c.pseudo_classes = STRUCTURAL_PSEUDOS.iter().map(|s| s.to_string()).collect();
         c
     }
 
@@ -279,10 +310,23 @@ fn make_selector(cfg: &Config, rng: &mut Random) -> String {
     result
 }
 
+/// StyleBench `randomPseudoClass`: `:empty` only on the subject, redraw otherwise.
+fn random_pseudo_class(cfg: &Config, rng: &mut Random, is_last: bool) -> String {
+    let pc = &cfg.pseudo_classes[rng.number(cfg.pseudo_classes.len() as i32) as usize];
+    if !is_last && pc == "empty" {
+        return random_pseudo_class(cfg, rng, is_last);
+    }
+    pc.clone()
+}
+
 fn make_compound_selector(cfg: &Config, rng: &mut Random, index: i32, length: i32) -> String {
     let is_first = index == 0;
+    let is_last = index == length - 1;
+    // JS `chance(p) && list.length`: the draw happens first; chance(0) draws nothing.
+    let use_pseudo_class = rng.chance(cfg.pseudo_class_chance) && !cfg.pseudo_classes.is_empty();
     let use_id = is_first && rng.chance(cfg.id_chance);
-    let use_element = !use_id && rng.chance(cfg.element_chance);
+    // :nth-of-type etc only make sense with an element.
+    let use_element = !use_id && (use_pseudo_class || rng.chance(cfg.element_chance));
     let use_attribute = !use_id && rng.chance(cfg.attribute_chance);
     let use_id_element_or_attribute = use_id || use_element || use_attribute;
     let use_star = !use_id_element_or_attribute && !is_first && rng.chance(cfg.star_chance);
@@ -312,6 +356,10 @@ fn make_compound_selector(cfg: &Config, rng: &mut Random, index: i32, length: i3
     }
     if use_attribute {
         result.push_str(&random_attribute_selector(cfg, rng));
+    }
+    if use_pseudo_class {
+        result.push(':');
+        result.push_str(&random_pseudo_class(cfg, rng, is_last));
     }
     result
 }

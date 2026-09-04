@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::matching::{ElementSelectorFlags, MatchingContext};
@@ -130,7 +130,7 @@ struct Slot {
     data: ElementDataWrapper,
     dirty_descendants: AtomicBool,
     children_to_process: AtomicIsize,
-    selector_flags: Cell<ElementSelectorFlags>,
+    selector_flags: AtomicUsize,
     has_snapshot: Cell<bool>,
     handled_snapshot: Cell<bool>,
     dead: Cell<bool>,
@@ -164,7 +164,7 @@ impl HostDoc {
             data: ElementDataWrapper::default(),
             dirty_descendants: AtomicBool::new(false),
             children_to_process: AtomicIsize::new(0),
-            selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            selector_flags: AtomicUsize::new(0),
             has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
@@ -199,7 +199,7 @@ impl HostDoc {
                 data,
                 dirty_descendants: AtomicBool::new(true),
                 children_to_process: AtomicIsize::new(0),
-                selector_flags: Cell::new(ElementSelectorFlags::empty()),
+                selector_flags: AtomicUsize::new(0),
                 has_snapshot: Cell::new(false),
                 handled_snapshot: Cell::new(true),
                 dead: Cell::new(false),
@@ -342,24 +342,148 @@ impl HostDoc {
         }
     }
 
-    fn dirty_following_subtrees(&self, fixture_id: i32) {
-        let Some(id) = (fixture_id as u32).checked_add(1) else {
-            return;
-        };
-        if id as usize >= self.slots.len() {
+    /// Gecko `PostRestyleEvent(element, RestyleSubtree)`.
+    fn restyle_subtree_slot(&self, sid: u32) {
+        if sid == 0 || sid as usize >= self.slots.len() || self.slots[sid as usize].dead.get() {
             return;
         }
-        let mut n = self.slots[id as usize].next;
-        while let Some(sid) = n {
-            if !self.slots[sid as usize].dead.get() {
-                self.slots[sid as usize].data.borrow_mut().hint = RestyleHint::restyle_subtree();
-                self.note_dirty_path(sid as i32 - 1);
+        self.slots[sid as usize].data.borrow_mut().hint = RestyleHint::restyle_subtree();
+        self.note_dirty_path(sid as i32 - 1);
+    }
+
+    fn slot_flags(&self, sid: u32) -> ElementSelectorFlags {
+        ElementSelectorFlags::from_bits_retain(
+            self.slots[sid as usize].selector_flags.load(Ordering::Relaxed),
+        )
+    }
+
+    fn live_prev(&self, sid: u32) -> Option<u32> {
+        let mut p = self.slots[sid as usize].prev;
+        while let Some(x) = p {
+            if !self.slots[x as usize].dead.get() {
+                return Some(x);
             }
+            p = self.slots[x as usize].prev;
+        }
+        None
+    }
+
+    fn live_next(&self, sid: u32) -> Option<u32> {
+        let mut n = self.slots[sid as usize].next;
+        while let Some(x) = n {
+            if !self.slots[x as usize].dead.get() {
+                return Some(x);
+            }
+            n = self.slots[x as usize].next;
+        }
+        None
+    }
+
+    /// Gecko `RestyleSiblingsStartingWith`.
+    fn restyle_siblings_from(&self, mut n: Option<u32>) {
+        while let Some(sid) = n {
+            self.restyle_subtree_slot(sid);
             n = self.slots[sid as usize].next;
         }
     }
 
-    pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap, sibling_combs: bool) {
+    /// Gecko `RestyleForEmptyChange`.
+    fn restyle_for_empty_change(&self, container: u32) {
+        self.restyle_subtree_slot(container);
+        if let Some(gp) = self.slots[container as usize].parent {
+            if self
+                .slot_flags(gp)
+                .contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS)
+            {
+                self.restyle_siblings_from(self.slots[container as usize].next);
+            }
+        }
+    }
+
+    /// Gecko `RestyleManager::RestyleForInsertOrChange`. The leaf is linked in.
+    /// Every child here is an element, so "significant sibling" is "live sibling".
+    fn restyle_for_insert(&self, child: u32) {
+        let Some(container) = self.slots[child as usize].parent else {
+            return;
+        };
+        if container == 0 {
+            return;
+        }
+        let flags = self.slot_flags(container);
+        if flags.contains(ElementSelectorFlags::HAS_EMPTY_SELECTOR)
+            && self.live_prev(child).is_none()
+            && self.live_next(child).is_none()
+        {
+            self.restyle_for_empty_change(container);
+            return;
+        }
+        if flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR) {
+            self.restyle_subtree_slot(container);
+            return;
+        }
+        if flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
+            self.restyle_siblings_from(self.slots[child as usize].next);
+        }
+        if flags.contains(ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR) {
+            // MaybeRestyleForEdgeChildChange: the previously-first element is
+            // after the new child iff the child is now first; same for last.
+            if self.live_prev(child).is_none() {
+                if let Some(n) = self.live_next(child) {
+                    self.restyle_subtree_slot(n);
+                }
+            }
+            if self.live_next(child).is_none() {
+                if let Some(p) = self.live_prev(child) {
+                    self.restyle_subtree_slot(p);
+                }
+            }
+        }
+    }
+
+    /// Gecko `RestyleManager::ContentWillBeRemoved`. Called before unlinking.
+    fn restyle_for_remove(&self, old: u32) {
+        let Some(container) = self.slots[old as usize].parent else {
+            return;
+        };
+        if container == 0 {
+            return;
+        }
+        let flags = self.slot_flags(container);
+        let prev = self.live_prev(old);
+        let next = self.live_next(old);
+        if flags.contains(ElementSelectorFlags::HAS_EMPTY_SELECTOR)
+            && prev.is_none()
+            && next.is_none()
+        {
+            self.restyle_for_empty_change(container);
+            return;
+        }
+        let whole = flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR)
+            || (flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS)
+                && prev.is_none());
+        if whole {
+            self.restyle_subtree_slot(container);
+            return;
+        }
+        if flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
+            self.restyle_siblings_from(self.slots[old as usize].next);
+        }
+        if flags.contains(ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR) {
+            // now-first element child if it was after old; now-last if before.
+            if prev.is_none() {
+                if let Some(n) = next {
+                    self.restyle_subtree_slot(n);
+                }
+            }
+            if next.is_none() {
+                if let Some(p) = prev {
+                    self.restyle_subtree_slot(p);
+                }
+            }
+        }
+    }
+
+    pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap) {
         match m {
             Mut::AddClass { id, class } => {
                 let atom = AtomIdent::from(&**class);
@@ -427,13 +551,12 @@ impl HostDoc {
             } => {
                 self.add_leaf(*id, *parent, *at, tag, dom_id.as_deref(), classes, attrs);
                 self.note_dirty_path(*id);
-                if sibling_combs {
-                    self.dirty_following_subtrees(*id);
-                }
+                self.restyle_for_insert((*id as u32) + 1);
             }
             Mut::RemoveLeaf { id } => {
-                if sibling_combs {
-                    self.dirty_following_subtrees(*id);
+                let sid = (*id as u32) + 1;
+                if (sid as usize) < self.slots.len() && !self.slots[sid as usize].dead.get() {
+                    self.restyle_for_remove(sid);
                 }
                 self.remove_leaf(*id);
             }
@@ -480,7 +603,7 @@ impl HostDoc {
             data,
             dirty_descendants: AtomicBool::new(false),
             children_to_process: AtomicIsize::new(0),
-            selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            selector_flags: AtomicUsize::new(0),
             has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
@@ -808,9 +931,24 @@ impl SelectorsElement for Elem {
     ) -> bool {
         false
     }
+    /// Gecko / Servo split: `for_self` lands on the element, `for_parent`
+    /// (slow / edge-child / later-siblings) on the parent, which is what
+    /// the leaf insert / remove paths in `HostDoc::apply_mut` consult.
     fn apply_selector_flags(&self, flags: ElementSelectorFlags) {
-        let cur = self.slot().selector_flags.get();
-        self.slot().selector_flags.set(cur | flags);
+        let self_flags = flags.for_self();
+        if !self_flags.is_empty() {
+            self.slot()
+                .selector_flags
+                .fetch_or(self_flags.bits(), Ordering::Relaxed);
+        }
+        let parent_flags = flags.for_parent();
+        if !parent_flags.is_empty() {
+            if let Some(p) = self.0.parent_node() {
+                p.slot()
+                    .selector_flags
+                    .fetch_or(parent_flags.bits(), Ordering::Relaxed);
+            }
+        }
     }
     fn is_link(&self) -> bool {
         false
@@ -1033,7 +1171,8 @@ impl TElement for Elem {
         euclid::default::Size2D::new(None, None)
     }
     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
-        self.slot().selector_flags.get().contains(flags)
+        ElementSelectorFlags::from_bits_retain(self.slot().selector_flags.load(Ordering::Relaxed))
+            .contains(flags)
     }
     fn relative_selector_search_direction(&self) -> ElementSelectorFlags {
         ElementSelectorFlags::empty()

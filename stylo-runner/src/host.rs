@@ -22,7 +22,10 @@ use style::dom::{
 };
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::{parse_style_attribute, PropertyDeclarationBlock};
-use style::selector_parser::{AttrValue, Lang, PseudoElement, RestyleDamage};
+use style::selector_parser::{
+    AttrValue, Lang, PseudoElement, RestyleDamage, Snapshot, SnapshotMap,
+};
+use style::servo::attr::{AttrIdentifier, AttrValue as ServoAttrValue};
 use style::shared_lock::{Locked, SharedRwLock};
 use style::stylesheets::{CssRuleType, UrlExtraData};
 use style::stylist::CascadeData;
@@ -52,6 +55,35 @@ fn parse_inline_style(
         CssRuleType::Style,
     );
     Some(Arc::new(lock.wrap(pdb)))
+}
+
+fn attr_ident(name: &str) -> AttrIdentifier {
+    let local = LocalName::from(name);
+    AttrIdentifier {
+        local_name: local.clone(),
+        name: local,
+        namespace: Namespace::from(""),
+        prefix: None,
+    }
+}
+
+fn capture_slot_attrs(s: &Slot) -> Vec<(AttrIdentifier, ServoAttrValue)> {
+    let mut attrs = Vec::new();
+    if let Some(ref id) = s.dom_id {
+        attrs.push((attr_ident("id"), ServoAttrValue::Atom(id.clone())));
+    }
+    if !s.classes.is_empty() {
+        let tokens: Vec<Atom> = s.classes.iter().map(|c| c.0.clone()).collect();
+        attrs.push((attr_ident("class"), ServoAttrValue::from(tokens)));
+    }
+    for (name, val) in &s.attrs {
+        let n = name.as_ref();
+        if n == "id" || n == "class" {
+            continue;
+        }
+        attrs.push((attr_ident(n), ServoAttrValue::String(val.clone())));
+    }
+    attrs
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,6 +131,7 @@ struct Slot {
     dirty_descendants: AtomicBool,
     children_to_process: AtomicIsize,
     selector_flags: Cell<ElementSelectorFlags>,
+    has_snapshot: Cell<bool>,
     handled_snapshot: Cell<bool>,
     dead: Cell<bool>,
 }
@@ -132,6 +165,7 @@ impl HostDoc {
             dirty_descendants: AtomicBool::new(false),
             children_to_process: AtomicIsize::new(0),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
         });
@@ -166,6 +200,7 @@ impl HostDoc {
                 dirty_descendants: AtomicBool::new(true),
                 children_to_process: AtomicIsize::new(0),
                 selector_flags: Cell::new(ElementSelectorFlags::empty()),
+                has_snapshot: Cell::new(false),
                 handled_snapshot: Cell::new(true),
                 dead: Cell::new(false),
             });
@@ -217,34 +252,125 @@ impl HostDoc {
         self.slots.get_mut(i)
     }
 
-    pub fn dirty_all(&self) {
-        for s in &self.slots[1..] {
-            if s.dead.get() {
-                continue;
+    /// Walk dirty-descendant bits from this node’s parent up to `#testroot`
+    /// so `traverse_dom` finds the snapshotted element. Does not plant
+    /// `restyle_subtree` — Stylo’s invalidator chooses the hint.
+    fn note_dirty_path(&self, fixture_id: i32) {
+        let Some(id) = (fixture_id as u32).checked_add(1) else {
+            return;
+        };
+        if id as usize >= self.slots.len() {
+            return;
+        }
+        let s = &self.slots[id as usize];
+        if s.dead.get() {
+            return;
+        }
+        let mut p = s.parent;
+        while let Some(pid) = p {
+            if pid == 0 {
+                break;
             }
-            s.data.borrow_mut().hint = RestyleHint::restyle_subtree();
-            s.dirty_descendants.store(true, Ordering::Relaxed);
+            self.slots[pid as usize]
+                .dirty_descendants
+                .store(true, Ordering::Relaxed);
+            p = self.slots[pid as usize].parent;
         }
     }
 
-    pub fn apply_mut(&mut self, m: &Mut) {
+    fn ensure_snapshot<'a>(
+        &self,
+        snapshots: &'a mut SnapshotMap,
+        slot_id: u32,
+    ) -> &'a mut Snapshot {
+        let key = OpaqueNode(slot_id as usize);
+        let s = &self.slots[slot_id as usize];
+        if s.has_snapshot.get() {
+            return snapshots.get_mut(&key).expect("has_snapshot lied");
+        }
+        let mut snap = Snapshot::new();
+        snap.attrs = Some(capture_slot_attrs(s));
+        snapshots.insert(key, snap);
+        s.has_snapshot.set(true);
+        s.handled_snapshot.set(false);
+        snapshots.get_mut(&key).expect("just inserted")
+    }
+
+    fn snapshot_class(&self, snapshots: &mut SnapshotMap, fixture_id: i32) {
+        let Some(slot_id) = (fixture_id as u32).checked_add(1) else {
+            return;
+        };
+        if slot_id as usize >= self.slots.len() || self.slots[slot_id as usize].dead.get() {
+            return;
+        }
+        let snap = self.ensure_snapshot(snapshots, slot_id);
+        snap.class_changed = true;
+        let class_name = LocalName::from("class");
+        if !snap.changed_attrs.iter().any(|n| n == &class_name) {
+            snap.changed_attrs.push(class_name);
+        }
+        self.note_dirty_path(fixture_id);
+    }
+
+    fn snapshot_attr(&self, snapshots: &mut SnapshotMap, fixture_id: i32, name: &str) {
+        let Some(slot_id) = (fixture_id as u32).checked_add(1) else {
+            return;
+        };
+        if slot_id as usize >= self.slots.len() || self.slots[slot_id as usize].dead.get() {
+            return;
+        }
+        let snap = self.ensure_snapshot(snapshots, slot_id);
+        if name == "id" {
+            snap.id_changed = true;
+        } else if name == "class" {
+            snap.class_changed = true;
+        } else {
+            snap.other_attributes_changed = true;
+        }
+        let ln = LocalName::from(name);
+        if !snap.changed_attrs.iter().any(|n| n == &ln) {
+            snap.changed_attrs.push(ln);
+        }
+        self.note_dirty_path(fixture_id);
+    }
+
+    pub fn clear_restyle_bits(&self) {
+        for s in &self.slots {
+            s.dirty_descendants.store(false, Ordering::Relaxed);
+            s.has_snapshot.set(false);
+            s.handled_snapshot.set(true);
+        }
+    }
+
+    pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap) {
         match m {
             Mut::AddClass { id, class } => {
-                if let Some(s) = self.fixture_slot(*id) {
-                    let atom = AtomIdent::from(&**class);
-                    if !s.classes.iter().any(|c| c == &atom) {
+                let atom = AtomIdent::from(&**class);
+                let will_add = self.fixture_slot(*id).is_some_and(|s| {
+                    !s.dead.get() && !s.classes.iter().any(|c| c == &atom)
+                });
+                if will_add {
+                    self.snapshot_class(snapshots, *id);
+                    if let Some(s) = self.fixture_slot(*id) {
                         s.classes.push(atom);
                     }
                 }
             }
             Mut::RemoveClass { id } => {
-                if let Some(s) = self.fixture_slot(*id) {
-                    if !s.classes.is_empty() {
+                let changed = if let Some(s) = self.fixture_slot(*id) {
+                    !s.classes.is_empty()
+                } else {
+                    false
+                };
+                if changed {
+                    self.snapshot_class(snapshots, *id);
+                    if let Some(s) = self.fixture_slot(*id) {
                         s.classes.remove(0);
                     }
                 }
             }
             Mut::SetAttr { id, name, value } => {
+                self.snapshot_attr(snapshots, *id, name);
                 if let Some(s) = self.fixture_slot(*id) {
                     let ln = WebLocalName::from(&**name);
                     if let Some(a) = s.attrs.iter_mut().find(|(n, _)| n == &ln) {
@@ -261,6 +387,7 @@ impl HostDoc {
                 }
             }
             Mut::RemoveAttr { id, name } => {
+                self.snapshot_attr(snapshots, *id, name);
                 if let Some(s) = self.fixture_slot(*id) {
                     let ln = WebLocalName::from(&**name);
                     s.attrs.retain(|(n, _)| n != &ln);
@@ -282,6 +409,7 @@ impl HostDoc {
                 attrs,
             } => {
                 self.add_leaf(*id, *parent, *at, tag, dom_id.as_deref(), classes, attrs);
+                self.note_dirty_path(*id);
             }
             Mut::RemoveLeaf { id } => self.remove_leaf(*id),
             Mut::Restyle => {}
@@ -325,9 +453,10 @@ impl HostDoc {
                 .collect(),
             style_attr: None,
             data,
-            dirty_descendants: AtomicBool::new(true),
+            dirty_descendants: AtomicBool::new(false),
             children_to_process: AtomicIsize::new(0),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
         });
@@ -793,7 +922,7 @@ impl TElement for Elem {
         self.slot().dirty_descendants.load(Ordering::Relaxed)
     }
     fn has_snapshot(&self) -> bool {
-        false
+        self.slot().has_snapshot.get()
     }
     fn handled_snapshot(&self) -> bool {
         self.slot().handled_snapshot.get()

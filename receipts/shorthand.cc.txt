@@ -1,5 +1,5 @@
 # runner=cc fixture=fixtures/local/shorthand.stylebench
-# TIME_MS=0.0820000171661377 TIME_MUT_MS=0.0 elements=14 TIME_LEVELS=0.0010001659393310547 TIME_SHARE=0.0009999275207519531 TIME_MATCH=0.07699990272521973 TIME_INHERIT=0.0 LAST_MATCH=0.07699990272521973 canons=14 depth=1 rules=17 univ=1
+# TIME_MS=0.13399982452392578 TIME_MUT_MS=0.0 elements=14 TIME_LEVELS=0.0009999275207519531 TIME_SHARE=0.0009999275207519531 TIME_MATCH=0.12899994850158691 TIME_INHERIT=0.0 LAST_MATCH=0.12899994850158691 canons=14 depth=1 rules=17 univ=1
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(17, 17, 17)	bg=0,0,0,0
 1	span	id=hex	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(17, 17, 17)	bg=204,0,0,255
 2	span	id=rgbv	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(17, 17, 17)	bg=0,255,0,255

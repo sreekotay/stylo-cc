@@ -25,7 +25,7 @@ Both runners eat the same text fixture and must print the same style dump.
 
 **Tree.** Same LCG as WebKit (`styleSeed=1`, `domSeed=2`). Default is 20 000 generated elements plus `#testroot` (20 001 nodes). Tags, ids, classes, and attributes are the StyleBench random draw (class pool 200, id chance 0.05, …).
 
-**First restyle (`TIME_MS`).** Match live nodes and cascade the dumped properties. Stylo: `recalc_style_at` via `traverse_dom` on Servo’s `STYLE_THREAD_POOL` (cap 6), 32-entry sharing LRU on. CC: subject / pair inverted maps, ancestor bloom; exact sibling share (same parent + interned tag / id / classes / attrs) then `@parallel for` over canons; inherited properties hop the parent in one serial depth walk.
+**First restyle (`TIME_MS`).** Match live nodes and cascade the dumped properties. Stylo: `recalc_style_at` via `traverse_dom` on Servo’s `STYLE_THREAD_POOL` (cap 6), 32-entry sharing LRU on. CC: subject / pair inverted maps, ancestor bloom; exact sibling share (same parent + interned tag / id / classes / attrs) then `@parallel for` over canons; inherited properties hop the parent in one serial depth walk. After that, a dirty restyle re-resolves share from the sibling list and skips `paint_levels` unless a leaf was added.
 
 **Mutations (`TIME_MUT_MS`).** The official StyleBench step loop, frozen in the fixture (same DOM LCG, same skip rules):
 
@@ -43,9 +43,9 @@ for step in 0..5:          # tiny: 1 step, 8 ops each
     restyle
 ```
 
-That is 25 restyles on default (5 on tiny). Each restyle still walks the live tree (Stylo sharing LRU; CC sibling canons). Neither side does mutation-local invalidation (Stylo snapshots / restyle hints, or a CC dirty set). `TIME_MUT_MS` is the sum of those restyles only — applying the DOM edits is outside the clock.
+That is 25 restyles on default (5 on tiny). After each batch Stylo snapshots the old class / attr set, walks dirty bits up to `#testroot`, and lets `invalidate_style_if_needed` choose `RESTYLE_SELF` vs descendants. CC records the changed interned atom at `apply_mut` and dirties a descendant only if `match_from` for a rule that uses that atom as a left compound flips with vs without the one added or removed instance (duplicate classes keep the leftover copy). Sibling share copies specified values into the node’s own slots so inherit cannot write through a clean canon. `TIME_MUT_MS` is the sum of those restyles — applying the DOM edits is outside the clock.
 
-**Not measured.** Layout, paint, resize, sibling / structural / nth suites, `::before` / `::after`, incremental invalidation.
+**Not measured.** Layout, paint, resize, sibling / structural / nth suites, `::before` / `::after`. CC invalidation is a serial change-log flip of `match_from`, not Stylo snapshots and not concurrent with rematch.
 
 **Correctness.** After the last mutation restyle, both runners print
 
@@ -106,26 +106,26 @@ Stylo does not walk every longhand. Unused properties stay on a **proto** (paren
 
 ## Recorded times
 
-Default suite, release, wall clock, Apple M5, 2026-08-31. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial. `ccc` 0.3.4-279 (`-O`). Stylo `0.20.0` (`b3e6425`). `cmp` clean.
+Default suite, release, wall clock, Apple M5, 2026-09-03. Live after mutations: 20 002. Sharing on both sides. Inherit on CC is serial. Stylo: snapshots + invalidation map. CC: change log → `match_from` flip on rules keyed by the changed atom; dirty restyle re-resolves share from the sibling list. `ccc` 0.3.4-315 (`-O`). Stylo `0.20.0` (`b3e6425`). `cmp` clean.
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 31.0 ms | 667 ms |
+| Stylo (6 threads, sharing LRU on) | 31.6 ms | 25.0 ms |
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
-| CC (`ccc -O`, sibling canons + used protos) | 7.6 ms | 242 ms |
+| CC (`ccc -O`, sibling canons + used protos) | 10.7 ms | 14.2 ms |
 
-Sharing-off is from `receipts/default_2026_08_29.txt` (not re-run). Sharing-on / CC are `make bench-style` this rebuild (`receipts/default.stylo.txt`, `receipts/default.cc.txt`). Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers.
+Sharing-off is from `receipts/default_2026_08_29.txt` (full rematch, not re-run). Sharing-on / CC are this rebuild (`receipts/default.stylo.txt`, `receipts/default.cc.txt`). Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers. Warm `-O` first-restyle `TIME_MS` is noisy if the binary is cold — record the second run.
 
-CC split (this run): match ~6.2, last match ~7.5, inherit ~0.08, **12854 canons / 20002**.
+CC split (warm `-O`): match ~8.6, last match ~0.02, inherit ~0.23, **12302 canons** on the first walk. Dirty restyle does not qsort the slab or rebuild levels unless a leaf was added.
 
 ## Fairness
 
 Corrected relative to the first receipts (RGB-only dump, Stylo sharing off, CC dropping the base sheet, fake-parallel inherit):
 
 - **Same dump.** Eleven properties, including unexercised initials (`position`, `width`, `font-weight`, `visibility`, `color`). Base sheet is cascaded on both sides. `cmp` is the gate.
-- **Sharing on.** Stylo’s 32-entry LRU (sibling + cousin after revalidation). CC exact same-parent identity (12 854 canons of 20 002 on default).
+- **Sharing on.** Stylo’s 32-entry LRU (sibling + cousin after revalidation). CC exact same-parent identity (12 302 canons of 20 002 on default).
 - **Inherit is a parent hop.** Specified match stays `@parallel for` over canons. Inherited props copy in one serial depth walk — not one `@parallel for` per level.
-- **Same mutation script.** Full rematch after each batch. No incremental invalidation on either side.
+- **Same mutation script.** Stylo takes element snapshots and runs the crate invalidator. CC logs the changed atom at mutate and rematches a descendant only if `match_from` flips for a rule that uses that atom on the left.
 - **Competitor is Stylo the crate**, not the `TElement` host (`host.rs` is glue, like the CC fixture load).
 
 Still not the same program:

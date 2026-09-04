@@ -1,5 +1,5 @@
 # runner=cc fixture=fixtures/default.stylebench
-# TIME_MS=7.575999975204468 TIME_MUT_MS=241.69599986076355 elements=20002 TIME_LEVELS=0.127000093460083 TIME_SHARE=0.9919998645782471 TIME_MATCH=6.187000036239624 TIME_INHERIT=0.08299994468688965 LAST_MATCH=7.4730000495910645 canons=12854 depth=6 rules=5002 univ=93
+# TIME_MS=10.703999996185303 TIME_MUT_MS=14.245999574661255 elements=20002 TIME_LEVELS=0.12600016593933105 TIME_SHARE=0.9869999885559082 TIME_MATCH=8.562999963760376 TIME_INHERIT=0.22799992561340332 LAST_MATCH=0.017000198364257812 canons=12302 depth=6 rules=5002 univ=93
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
 1	elem9	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=34,96,48,255
 2	elem2	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=213,40,106,255

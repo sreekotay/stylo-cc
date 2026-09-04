@@ -154,48 +154,51 @@ fn main() {
         stylist.flush(&StylesheetGuards::same(&guard));
     }
 
-    let snapshots = SnapshotMap::new();
+    let mut snapshots = SnapshotMap::new();
     let painters = NoPainters;
     let guard = lock.read();
-    let shared = SharedStyleContext {
-        stylist: &stylist,
-        visited_styles_enabled: false,
-        options: StyleSystemOptions::default(),
-        guards: StylesheetGuards::same(&guard),
-        current_time_for_animations: 0.0,
-        traversal_flags: TraversalFlags::empty(),
-        snapshot_map: &snapshots,
-        animations: DocumentAnimationSet::default(),
-        registered_speculative_painters: &painters,
-    };
-    let traversal = Recalc { shared };
-    let root = doc.root_elem();
-    let token = Recalc::pre_traverse(root, traversal.shared_context());
-
     let threads = STYLE_THREAD_POOL.num_threads.unwrap_or(1);
     let pool = STYLE_THREAD_POOL.pool();
+
+    let restyle = |doc: &HostDoc, snapshots: &SnapshotMap| {
+        let shared = SharedStyleContext {
+            stylist: &stylist,
+            visited_styles_enabled: false,
+            options: StyleSystemOptions::default(),
+            guards: StylesheetGuards::same(&guard),
+            current_time_for_animations: 0.0,
+            traversal_flags: TraversalFlags::empty(),
+            snapshot_map: snapshots,
+            animations: DocumentAnimationSet::default(),
+            registered_speculative_painters: &painters,
+        };
+        let traversal = Recalc { shared };
+        let token = Recalc::pre_traverse(doc.root_elem(), traversal.shared_context());
+        if token.should_traverse() {
+            driver::traverse_dom(&traversal, token, pool.as_ref());
+        }
+    };
+
     let t0 = Instant::now();
-    if token.should_traverse() {
-        driver::traverse_dom(&traversal, token, pool.as_ref());
-    }
+    restyle(&doc, &snapshots);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    snapshots.clear();
+    doc.clear_restyle_bits();
 
     let mut mut_ms = 0.0;
     let mut pending = false;
     for m in &fix.mutations {
         if matches!(m, Mut::Restyle) {
             if pending {
-                doc.dirty_all();
-                let token = Recalc::pre_traverse(doc.root_elem(), traversal.shared_context());
                 let t1 = Instant::now();
-                if token.should_traverse() {
-                    driver::traverse_dom(&traversal, token, pool.as_ref());
-                }
+                restyle(&doc, &snapshots);
                 mut_ms += t1.elapsed().as_secs_f64() * 1000.0;
+                snapshots.clear();
+                doc.clear_restyle_bits();
                 pending = false;
             }
         } else {
-            doc.apply_mut(m);
+            doc.apply_mut(m, &mut snapshots);
             pending = true;
         }
     }

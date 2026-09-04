@@ -1,5 +1,5 @@
 # runner=cc fixture=fixtures/local/cascade.stylebench
-# TIME_MS=0.051999807357788086 TIME_MUT_MS=0.0 elements=5 TIME_LEVELS=0.0 TIME_SHARE=0.0009999275207519531 TIME_MATCH=0.05099987983703613 TIME_INHERIT=0.0 LAST_MATCH=0.05099987983703613 canons=4 depth=2 rules=6 univ=1
+# TIME_MS=0.04699993133544922 TIME_MUT_MS=0.0 elements=5 TIME_LEVELS=0.0009999275207519531 TIME_SHARE=0.0 TIME_MATCH=0.046000003814697266 TIME_INHERIT=0.0 LAST_MATCH=0.046000003814697266 canons=4 depth=2 rules=6 univ=1
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(17, 17, 17)	bg=0,0,0,0
 1	span	id=a	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=20px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0
 2	span	id=b	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=20px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 255)	bg=0,255,0,255

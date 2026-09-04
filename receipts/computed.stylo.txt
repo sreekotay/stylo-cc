@@ -1,5 +1,5 @@
 # runner=stylo fixture=fixtures/local/computed.stylebench threads=6
-# TIME_MS=1.328 TIME_MUT_MS=0.000 elements=6
+# TIME_MS=1.216 TIME_MUT_MS=0.000 elements=6
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0
 1	span	id=pct	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=20px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0
 2	span	id=half	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(204, 0, 0)	bg=0,0,0,0

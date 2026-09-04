@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# 20k race for one generated suite: sibling (` ` `>` `+` `~`) or
+# 20k race for one generated suite: sibling (` ` `>` `+` `~`),
 # structural (adds :first-child / :last-child / :first-of-type /
-# :last-of-type / :only-of-type / :empty). Not on make bench-style.
+# :last-of-type / :only-of-type / :empty) or nth (:nth-child(2n+1) /
+# :nth-last-child(3n) / :nth-of-type(3n) / :nth-last-of-type(4n)).
+# Not on make bench-style.
 #
 #   ./scripts/bench-suite.sh sibling
 #   ./scripts/bench-suite.sh structural
+#   ./scripts/bench-suite.sh nth
 set -euo pipefail
 
 SUITE="${1:-}"
 case "$SUITE" in
-    sibling|structural) ;;
-    *) echo "usage: $0 sibling|structural" >&2; exit 2 ;;
+    sibling|structural|nth) ;;
+    *) echo "usage: $0 sibling|structural|nth" >&2; exit 2 ;;
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

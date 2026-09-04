@@ -96,6 +96,13 @@ const STRUCTURAL_PSEUDOS: [&str; 6] = [
     "empty",
 ];
 
+const NTH_PSEUDOS: [&str; 4] = [
+    "nth-child(2n+1)",
+    "nth-last-child(3n)",
+    "nth-of-type(3n)",
+    "nth-last-of-type(4n)",
+];
+
 impl Config {
     /// StyleBench `defaultConfiguration` (20k / 5k).
     pub fn default_suite() -> Self {
@@ -171,6 +178,24 @@ impl Config {
         c.name = "Structural".into();
         c.pseudo_class_chance = 0.1;
         c.pseudo_classes = STRUCTURAL_PSEUDOS.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    /// StyleBench `nthPseudoClassConfiguration`. Same seeds as default.
+    pub fn nth_suite() -> Self {
+        let mut c = Self::default_suite();
+        c.name = "Nth".into();
+        c.pseudo_class_chance = 0.1;
+        c.pseudo_classes = NTH_PSEUDOS.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    /// Tiny tree / sheet with the nth pseudo-class mix.
+    pub fn tiny_nth() -> Self {
+        let mut c = Self::tiny();
+        c.name = "TinyNth".into();
+        c.pseudo_class_chance = 0.1;
+        c.pseudo_classes = NTH_PSEUDOS.iter().map(|s| s.to_string()).collect();
         c
     }
 

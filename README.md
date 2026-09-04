@@ -3,13 +3,13 @@
 A Concurrent-C styling engine raced against [Stylo](https://github.com/servo/stylo) on a frozen [StyleBench](https://perftest.netlify.app/stylebench/) workload.
 
 ```
-fixtures/           generated StyleBench races (tiny / default / sibling / structural; gitignored)
+fixtures/           generated StyleBench races (tiny / default / sibling / structural / nth; gitignored)
 fixtures/local/     hand CSS we own — still cmp vs Stylo
 stylo-runner/       real Stylo (`style` crate) on a TElement host
 engine/             idiomatic Concurrent-C engine
 stylo/              git submodule — servo/stylo 0.20.0 (oracle crate + unit tests)
 harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
-scripts/            bench-suite.sh — the 20 k sibling / structural races
+scripts/            bench-suite.sh — the 20 k sibling / structural / nth races
 receipts/           last cmp-clean dumps + TIME lines, both runners
 ```
 
@@ -29,9 +29,11 @@ Both runners eat the same text fixture and must print the same style dump.
 
 **Structural suite.** WebKit’s “Structural pseudo classes” knobs (`--structural`): each compound draws one of `:first-child` / `:last-child` / `:first-of-type` / `:last-of-type` / `:only-of-type` / `:empty` with chance 0.1 (an element type is forced on that compound, as WebKit does). Leaf add / remove is what moves these: the new or gone leaf shifts the edge / only-of-type facts of its siblings and the `:empty` fact of its parent. Tiny structural is on `make compare`; the 20 k race is `make bench-structural`.
 
+**Nth suite.** WebKit’s “Nth pseudo classes” knobs (`--nth`): each compound draws one of `:nth-child(2n+1)` / `:nth-last-child(3n)` / `:nth-of-type(3n)` / `:nth-last-of-type(4n)` with chance 0.1, type forced as above. A leaf add / remove now moves every following sibling’s parity and every same-type sibling’s count, so far more nodes change per mutation than in the structural suite. Tiny nth is on `make compare`; the 20 k race is `make bench-nth`.
+
 **Tree.** Same LCG as WebKit (`styleSeed=1`, `domSeed=2`). Default is 20 000 generated elements plus `#testroot` (20 001 nodes). Tags, ids, classes, and attributes are the StyleBench random draw (class pool 200, id chance 0.05, …).
 
-**First restyle (`TIME_MS`).** Match live nodes and cascade the dumped properties. Stylo: `recalc_style_at` via `traverse_dom` on Servo’s `STYLE_THREAD_POOL` (cap 6), 32-entry sharing LRU on. CC: subject / pair inverted maps; 256-bit blooms for self, ancestors, and preceding siblings so `match_from` short-circuits ` ` / `>` / `~` walks (each rule also carries the union need of its ancestor compounds, one test against the subject’s ancestor bloom before any walk); structural bits per node (`first-child` … `empty`), masked to the pseudos the sheet uses, matched like any other compound fact and part of the share key; exact sibling share (same parent + interned tag / id / classes / attrs + sibling-rule signature) then `@parallel for` over canons in worker-sized arms; inherited properties hop the parent in one serial depth walk. After that, a dirty restyle re-resolves share from the sibling list and skips `paint_levels` unless a leaf was added.
+**First restyle (`TIME_MS`).** Match live nodes and cascade the dumped properties. Stylo: `recalc_style_at` via `traverse_dom` on Servo’s `STYLE_THREAD_POOL` (cap 6), 32-entry sharing LRU on. CC: subject / pair inverted maps; 256-bit blooms for self, ancestors, and preceding siblings so `match_from` short-circuits ` ` / `>` / `~` walks (each rule also carries the union need of its ancestor compounds, one test against the subject’s ancestor bloom before any walk); position bits per node — one per distinct position predicate the sheet uses (`:first-child` is the row `nth-child(0n+1)`; `:nth-child(2n+1)` is another row; at most 32), computed from the node’s four sibling counts, matched like any other compound fact and part of the share key; exact sibling share (same parent + interned tag / id / classes / attrs + sibling-rule signature) then `@parallel for` over canons in worker-sized arms; inherited properties hop the parent in one serial depth walk. After that, a dirty restyle re-resolves share from the sibling list and skips `paint_levels` unless a leaf was added.
 
 **Sibling-rule signature.** Rules whose last combinator is `+` / `~` are indexed apart. Before share, each node records which of those rules match it (up to 8; overflow opts the node out of share). That list is part of the share key, so two twins share only if their sibling context agrees — the same hole Stylo’s revalidation selectors close. No property is special-cased.
 
@@ -51,9 +53,9 @@ for step in 0..5:          # tiny: 1 step, 8 ops each
     restyle
 ```
 
-That is 25 restyles on default, sibling, and structural (5 on tiny). After each batch Stylo snapshots the old class / attr set, walks dirty bits up to `#testroot`, and lets `invalidate_style_if_needed` choose `RESTYLE_SELF` vs descendants; on leaf add / remove the host applies Gecko’s `ElementSelectorFlags` rules (`HAS_SLOW_SELECTOR_LATER_SIBLINGS`, `HAS_EDGE_CHILD_SELECTOR`, `HAS_EMPTY_SELECTOR`) to pick which siblings and parent to restyle. CC records each change at `apply_mut` (atom, slot, old / new value; a position-bit flip on a sibling is a change too), marks the mutated node dirty, then per changed node collects the rules whose left compound holds a changed atom and matched that node — in the one state where the node has the atom — and its candidates (descendants, following siblings, both, by the rule’s reach). Every candidate gets a signature of the rules it matches with the whole batch applied, then again with the whole batch undone; a flip dirties it. The signature passes run `@parallel for` over all candidates of all changed nodes (they only read the tree); staging is serial. Undo / redo is positional — `removeClass` takes `classes[0]` and fixtures carry duplicate attributes, so a set-only inverse would drift. Blooms repaint only what moved: changed nodes (self as a superset of both states, so the undone pass may prune with it), their subtrees, their sibling lists. The batch form matters: two attrs on nested ancestors in one restyle can flip a `[attr] type` join that no single change flips (`fixtures/local/attr-desc-batch.stylebench`). Sibling share copies specified values into the node’s own slots so inherit cannot write through a clean canon. `TIME_MUT_MS` is the sum of those restyles **including invalidation** (change-log flip, bloom repaint) — only applying the DOM edits is outside the clock. Earlier receipts ran CC invalidation off the clock; those numbers are not comparable.
+That is 25 restyles on default, sibling, structural, and nth (5 on tiny). After each batch Stylo snapshots the old class / attr set, walks dirty bits up to `#testroot`, and lets `invalidate_style_if_needed` choose `RESTYLE_SELF` vs descendants; on leaf add / remove the host applies Gecko’s `ElementSelectorFlags` rules (`HAS_SLOW_SELECTOR`, `HAS_SLOW_SELECTOR_LATER_SIBLINGS`, `HAS_EDGE_CHILD_SELECTOR`, `HAS_EMPTY_SELECTOR`) to pick which siblings and parent to restyle. CC records each change at `apply_mut` (atom, slot, old / new value; a position-bit flip on a sibling is a change too), marks the mutated node dirty, groups the log by node, then per changed node with a live child (or with `+` / `~` in the sheet — otherwise nothing below it can flip) collects the rules whose left compound holds a changed atom and matched that node — in the one state where the node has the atom — and its candidates (descendants, following siblings, both, by the rule’s reach). Every candidate gets a signature of the rules it matches with the whole batch applied, then again with the whole batch undone; a flip dirties it. The signature passes run `@parallel for` over all candidates of all changed nodes (they only read the tree); staging is serial. Undo / redo is positional — `removeClass` takes `classes[0]` and fixtures carry duplicate attributes, so a set-only inverse would drift. Blooms repaint only what moved: changed nodes (self as a superset of both states, so the undone pass may prune with it), their subtrees, their sibling lists. The batch form matters: two attrs on nested ancestors in one restyle can flip a `[attr] type` join that no single change flips (`fixtures/local/attr-desc-batch.stylebench`). Sibling share copies specified values into the node’s own slots so inherit cannot write through a clean canon. `TIME_MUT_MS` is the sum of those restyles **including invalidation** (change-log flip, bloom repaint) — only applying the DOM edits is outside the clock. Earlier receipts ran CC invalidation off the clock; those numbers are not comparable.
 
-**Not measured.** Layout, paint, resize, nth suite, `::before` / `::after`. CC invalidation is not Stylo’s snapshot + invalidation map: a change log and a batch `match_from` flip. Under `+` / `~`, adding or removing a leaf dirties its following siblings (their sibling signature may change); the dirty set is then rematched, not diffed.
+**Not measured.** Layout, paint, resize, `::before` / `::after`. CC invalidation is not Stylo’s snapshot + invalidation map: a change log and a batch `match_from` flip. Under `+` / `~`, adding or removing a leaf dirties its following siblings (their sibling signature may change); the dirty set is then rematched, not diffed.
 
 **Correctness.** After the last mutation restyle, both runners print
 
@@ -105,11 +107,11 @@ Fixture comments are `# ` only — a leading `#ident` is a CSS id selector. Tree
 - `currentColor` on `background-color` (resolved after inherit of `color`). On `color`, it inherits.
 - Hex `#rgb` / `#rrggbb` and `transparent` on color / background-color.
 
-Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, child, next-sibling (`+`), subsequent-sibling (`~`), `:first-child` / `:last-child` / `:first-of-type` / `:last-of-type` / `:only-of-type` / `:empty`.
+Selectors: type, `#id`, `.class`, `[attr]` / `[attr=val]`, `*`, descendant, child, next-sibling (`+`), subsequent-sibling (`~`), `:first-child` / `:last-child` / `:first-of-type` / `:last-of-type` / `:only-of-type` / `:empty`, `:nth-child(an+b)` / `:nth-last-child(an+b)` / `:nth-of-type(an+b)` / `:nth-last-of-type(an+b)` (`odd` / `even` too; no whitespace inside the parens, no `of S`).
 
 **Not in this engine.** The rest of CSS. In particular:
 
-- **Selectors:** `:nth-*`, `:only-child`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
+- **Selectors:** `:only-child`, `:nth-*(… of S)`, `:not` / `:is` / `:where`, `:hover` and other user-action, `::before` / `::after`, media / supports, shadow, namespaces.
 - **Properties:** margin, padding, border, flex, grid, transform, animation, `font-family` / `font-style`, text-*, overflow, z-index, opacity, box-sizing, white-space, vertical-align, max-*, min-height, insets, float, …
 - **Values:** `calc()`, `var()`, hsl, `%` on box lengths. Named colors beyond `transparent` / `currentColor`.
 
@@ -123,27 +125,34 @@ Release, wall clock, Apple M5, 2026-09-04. Live after mutations: 20 002. Shari
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 31.3 ms | 24.0 ms |
+| Stylo (6 threads, sharing LRU on) | 31.8 ms | 24.5 ms |
 | Stylo (6 threads, sharing off) | 45.3 ms | 1099 ms |
-| CC (`ccc -O`) | 5.9 ms | 18.0 ms |
+| CC (`ccc -O`) | 7.9 ms | 14.4 ms |
 
 **Sibling** (` ` / `>` / `+` / `~`, `make bench-sibling`):
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 56.7 ms | 140.9 ms |
-| CC (`ccc -O`) | 15.2 ms | 67.0 ms |
+| Stylo (6 threads, sharing LRU on) | 56.8 ms | 144.4 ms |
+| CC (`ccc -O`) | 16.1 ms | 67.6 ms |
 
 **Structural** (` ` / `>` + `:first-child` … `:empty`, `make bench-structural`):
 
 | | first restyle | 25 mutation restyles |
 |---|---|---|
-| Stylo (6 threads, sharing LRU on) | 37.4 ms | 132.2 ms |
-| CC (`ccc -O`) | 7.7 ms | 20.8 ms |
+| Stylo (6 threads, sharing LRU on) | 37.2 ms | 136.5 ms |
+| CC (`ccc -O`) | 7.5 ms | 15.2 ms |
 
-Sharing-off is from `receipts/default_2026_08_29.txt` (full rematch, not re-run). Everything else is this rebuild (`receipts/default.*.txt`, `receipts/sibling20k.*.txt`, `receipts/structural20k.*.txt`). The earlier CC default mutation number (11.7 ms) ran invalidation off the clock; 18.0 is the honest figure. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers. Warm `-O` first-restyle `TIME_MS` is noisy if the binary is cold — `bench-sibling` / `bench-structural` do a warm run first; for `bench-style` record the second run. Run-to-run spread on CC is about ±0.5 ms default / structural, ±2 ms sibling.
+**Nth** (` ` / `>` + `:nth-child(2n+1)` … `:nth-last-of-type(4n)`, `make bench-nth`):
 
-CC split (warm `-O`; the `TIME_*` / `MUT_*` fields in the receipt). Default: first match 4.2, share 1.3, inherit 0.12, **12 302 canons**; the 25 mutation restyles dirty 7 311 nodes in total — invalidation 9.1 (`MUT_FANOUT`: 1 486 changed nodes, 54 348 candidates, 99 347 rule tests staged; the two signature passes are ~3 of it, staging the rest), bloom repaint 1.1, match 2.9, canon 1.7, sig 0.8. Structural: first match 6.2, **13 890 canons** (position bits split some twins); mutations dirty 7 975 nodes — invalidation 9.3, match 4.1. Sibling: first match 5.3, share 10.4, **14 447 canons** (fewer twins agree once sibling context is in the key); mutations dirty 44 526 nodes — sig 24.1, invalidation 16.5, match 13.6, canon 7.1. The signature pass is the cost of `+` / `~` here: it runs on dirty nodes only, but leaf add / remove dirties every following sibling. Dirty restyle does not qsort the slab or rebuild levels unless a leaf was added.
+| | first restyle | 25 mutation restyles |
+|---|---|---|
+| Stylo (6 threads, sharing LRU on) | 41.1 ms | 165.2 ms |
+| CC (`ccc -O`) | 6.6 ms | 32.3 ms |
+
+Sharing-off is from `receipts/default_2026_08_29.txt` (full rematch, not re-run). Everything else is this rebuild (`receipts/default.*.txt`, `receipts/sibling20k.*.txt`, `receipts/structural20k.*.txt`, `receipts/nth20k.*.txt`). The earlier CC default mutation number (11.7 ms) ran invalidation off the clock; 14.4 is the honest figure. Tiny (81/81) is `make compare` (also runs `fixtures/local/`); that target builds Stylo debug, so its `TIME_*` lines are not the recorded numbers. Warm `-O` first-restyle `TIME_MS` is noisy if the binary is cold — `bench-sibling` / `bench-structural` / `bench-nth` do a warm run first; for `bench-style` record the second run. Run-to-run spread on CC is about ±1 ms default / structural / nth, ±3 ms sibling; a busy machine can double a Stylo row, so re-run any row that looks off.
+
+CC split (warm `-O`; the `TIME_*` / `MUT_*` fields in the receipt). Default: first match 5.6, share 1.8, inherit 0.13, **12 302 canons**; the 25 mutation restyles dirty 7 311 nodes in total — invalidation 5.0 (`MUT_FANOUT`: 1 486 changed nodes, of which the 480 with children are staged, 54 348 candidates, 19 583 rule tests; the two signature passes are ~1 of it, staging the rest), bloom repaint 1.1, match 3.3, canon 1.7, sig 0.9. Structural: first match 5.1, **13 890 canons** (position bits split some twins); mutations dirty 7 975 nodes — invalidation 4.9 (497 staged), match 3.8. Nth: first match 4.4, **15 543 canons**; mutations dirty 34 654 nodes (a leaf op flips the parity bit of about half its following siblings, and a flipped node is dirty) — invalidation 10.4 (1 219 staged; flipped leaves have nothing below them), match 9.8, canon 5.9. Sibling: first match 5.3, share 10.4, **14 447 canons** (fewer twins agree once sibling context is in the key); mutations dirty 44 526 nodes — sig 25.3, invalidation 16.4 (every changed node is staged: `+` / `~` reach across), match 13.6, canon 7.1. The signature pass is the cost of `+` / `~` here: it runs on dirty nodes only, but leaf add / remove dirties every following sibling. Dirty restyle does not qsort the slab or rebuild levels unless a leaf was added.
 
 Parallel arms are runs of nodes, not single nodes. `ccc` gates spawn on measured leaf cost (~8 µs); a one-node arm sits on that line and the verdict flips per run, which showed up as ±10 ms on the sibling suite. Arm size is ≥ 32 nodes, else range ÷ (4 × workers).
 
@@ -152,7 +161,7 @@ Parallel arms are runs of nodes, not single nodes. `ccc` gates spawn on measured
 Corrected relative to the first receipts (RGB-only dump, Stylo sharing off, CC dropping the base sheet, fake-parallel inherit):
 
 - **Same dump.** Eleven properties, including unexercised initials (`position`, `width`, `font-weight`, `visibility`, `color`). Base sheet is cascaded on both sides. `cmp` is the gate.
-- **Sharing on.** Stylo’s 32-entry LRU (sibling + cousin after revalidation). CC exact same-parent identity plus the sibling-rule signature (12 302 canons of 20 002 on default, 13 890 on structural, 14 447 on sibling). Share is all-or-nothing on both sides; no property is rematched per node.
+- **Sharing on.** Stylo’s 32-entry LRU (sibling + cousin after revalidation). CC exact same-parent identity plus the sibling-rule signature (12 302 canons of 20 002 on default, 13 890 on structural, 15 543 on nth, 14 447 on sibling). Share is all-or-nothing on both sides; no property is rematched per node.
 - **Inherit is a parent hop.** Specified match stays `@parallel for` over canons. Inherited props copy in one serial depth walk — not one `@parallel for` per level.
 - **Same mutation script, same clock.** Stylo takes element snapshots and runs the crate invalidator inside `TIME_MUT_MS`. CC logs the changes at mutate and, inside the same clock, rematches a descendant or following sibling only if its rule signature flips, batch applied vs batch undone, over rules keyed by the changed atoms. Undo / redo is positional so the applied state is exactly what Stylo’s host sees (first duplicate attribute replaced, `classes[0]` removed).
 - **Competitor is Stylo the crate**, not the `TElement` host (`host.rs` is glue, like the CC fixture load).
@@ -179,13 +188,15 @@ git submodule update --init --depth 1
 
 ```bash
 make fixture          # tiny suite (compile / cmp loop)
-make compare          # tiny + tiny-sibling + tiny-structural + fixtures/local: both runners, cmp styles
+make compare          # tiny + tiny-sibling/structural/nth + fixtures/local: both runners, cmp styles
 make compare-local    # only fixtures/local (no StyleBench regenerate)
 make compare-sibling  # generated tiny sibling combinators vs Stylo
 make compare-structural # generated tiny structural pseudo-classes vs Stylo
+make compare-nth      # generated tiny :nth-* pseudo-classes vs Stylo
 make bench-style      # default 20k/5k + mutations, release Stylo + CC -O, cmp then times
 make bench-sibling    # sibling 20k/5k, release Stylo + warm CC -O, cmp then times
 make bench-structural # structural 20k/5k, same shape
+make bench-nth        # nth 20k/5k, same shape
 ```
 
 `CC_STYLE_WORKERS=n` caps the CC worker pool (default: all cores).

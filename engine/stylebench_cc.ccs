@@ -146,7 +146,8 @@ static const Specified SPEC_INIT = {
     class:      [#'.' keep ident]
     attr:       collect [#'[' ws keep ident ws opt [#'=' ws attr_val] ws #']']
     attr_val:   [string | keep ident]
-    pseudo:     [#':' keep ident]
+    nth_arg:    keep [some complement charset [#')']]
+    pseudo:     collect [#':' keep ident opt [#'(' nth_arg #')']]
 
     compound: collect [
           [type_sel | universal] any [hash | class | attr | pseudo]
@@ -231,7 +232,6 @@ typedef struct {
     int dead;
     int dirty;
     int inv_gen;
-    int src_seen;
     int bloom_gen;
     unsigned pos;
     int sib_n;
@@ -255,25 +255,20 @@ typedef struct {
     Bloom self, anc, prevs;
 } Node;
 
-/* Structural pseudo-classes: a fact about the node's place in its sibling
- * list. Node.pos carries the same bits (masked to the ones the sheet uses),
- * so a compound test is one AND. */
-enum {
-    PS_FIRST_CHILD = 1u << 0,
-    PS_LAST_CHILD = 1u << 1,
-    PS_FIRST_OF_TYPE = 1u << 2,
-    PS_LAST_OF_TYPE = 1u << 3,
-    PS_ONLY_OF_TYPE = 1u << 4,
-    PS_EMPTY = 1u << 5,
-};
-#define NPS 6
-static const char* PS_NAME[NPS] = {
-    "first-child", "last-child", "first-of-type",
-    "last-of-type", "only-of-type", "empty",
-};
-/* One interned atom per pseudo so the change log / left_rules can key on
- * a position flip the same way they key on a class flip. */
-static CCSlice PS_ATOM[NPS];
+/* Position predicates: a fact about the node's place in its sibling list.
+ * Each distinct pseudo the sheet uses is one row — which count it reads
+ * (index from the front / back, among all siblings / same type) and the
+ * an+b it must satisfy. `first-child` is the row (child, 0n+1); the
+ * structural names are the degenerate rows of the same table. Node.pos
+ * carries one bit per row, so a compound test is one AND, and a row's
+ * interned atom lets the change log / left_rules key on a position flip
+ * the same way they key on a class flip. */
+enum { PK_CHILD, PK_LAST_CHILD, PK_OF_TYPE, PK_LAST_OF_TYPE, PK_ONLY_OF_TYPE, PK_EMPTY };
+typedef struct {
+    int kind, a, b;
+    CCSlice atom;
+} PosPred;
+#define MAX_POS 32
 
 typedef struct {
     int star, nclass, nattr;
@@ -358,7 +353,7 @@ typedef struct {
 } SrcJob;
 
 /* Smallest fact from apply_mut: this interned atom changed on this node.
- * CH_POS: a sibling's structural bits flipped (atom is the PS_ATOM). */
+ * CH_POS: a sibling's position bits flipped (atom is the row's atom). */
 enum { CH_ADD_CLASS = 0, CH_DEL_CLASS = 1, CH_SET_ATTR = 2, CH_DEL_ATTR = 3, CH_POS = 4 };
 typedef struct {
     int node;
@@ -388,12 +383,15 @@ typedef struct {
     Map::[AtomPair, Vec::[int]] child_pairs;
     Map::[AtomPair, Vec::[int]] desc_pairs;
     Map::[CCSlice, Vec::[int]] left_rules;
+    PosPred preds[MAX_POS];
+    int npred;
     Vec::[int] universal;
     Map::[CCSlice, Vec::[int]] sib_by_id;
     Map::[CCSlice, Vec::[int]] sib_by_class;
     Map::[CCSlice, Vec::[int]] sib_by_type;
     Vec::[int] sib_universal;
     Change* changes;
+    uint64_t* chg_order;
     int nchanges, cap_changes;
     int* inv_ids;
     int* inv_off;
@@ -401,7 +399,6 @@ typedef struct {
     int* rule_gen;
     int* rule_slot;
     InvRule* inv_rules;
-    int src_gen;
     int bloom_stamp;
     /* Staged invalidation batch (see Engine_stage_src). */
     int* fo_ids;
@@ -542,6 +539,80 @@ static int fill_attr(Engine* e, CssNode* nd, CompoundScratch* c) {
     return 1;
 }
 
+/* `an+b` as CSS spells it: `2n+1`, `3n`, `-n+3`, `n`, `4`, `odd`, `even`.
+ * Whitespace is not drawn by the generator, so none is accepted. */
+static int parse_nth(CCSlice s, int* a, int* b) {
+    if (s.eq_cstr("odd")) { *a = 2; *b = 1; return 1; }
+    if (s.eq_cstr("even")) { *a = 2; *b = 0; return 1; }
+    size_t i = 0;
+    int sign = 1, num = 0, digits = 0;
+    if (i < s.len && (s.ptr[i] == '+' || s.ptr[i] == '-')) sign = s.ptr[i++] == '-' ? -1 : 1;
+    while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9') { num = num * 10 + (s.ptr[i++] - '0'); digits++; }
+    if (i < s.len && s.ptr[i] == 'n') {
+        i++;
+        *a = sign * (digits ? num : 1);
+        if (i == s.len) { *b = 0; return 1; }
+        if (s.ptr[i] != '+' && s.ptr[i] != '-') return 0;
+        int bs = s.ptr[i++] == '-' ? -1 : 1;
+        int bn = 0, bd = 0;
+        while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9') { bn = bn * 10 + (s.ptr[i++] - '0'); bd++; }
+        if (!bd || i != s.len) return 0;
+        *b = bs * bn;
+        return 1;
+    }
+    if (!digits || i != s.len) return 0;
+    *a = 0;
+    *b = sign * num;
+    return 1;
+}
+
+/* Row of the predicate table for this pseudo, adding it on first sight.
+ * -1 when the name is not a position fact this engine knows. */
+static int Engine_pos_row(Engine* e, CCSlice name, CCSlice arg) {
+    int kind, a = 0, b = 1;
+    if (name.eq_cstr("first-child")) kind = PK_CHILD;
+    else if (name.eq_cstr("last-child")) kind = PK_LAST_CHILD;
+    else if (name.eq_cstr("first-of-type")) kind = PK_OF_TYPE;
+    else if (name.eq_cstr("last-of-type")) kind = PK_LAST_OF_TYPE;
+    else if (name.eq_cstr("only-of-type")) kind = PK_ONLY_OF_TYPE;
+    else if (name.eq_cstr("empty")) kind = PK_EMPTY;
+    else if (name.eq_cstr("nth-child")) kind = PK_CHILD;
+    else if (name.eq_cstr("nth-last-child")) kind = PK_LAST_CHILD;
+    else if (name.eq_cstr("nth-of-type")) kind = PK_OF_TYPE;
+    else if (name.eq_cstr("nth-last-of-type")) kind = PK_LAST_OF_TYPE;
+    else return -1;
+    int nth = name.len > 4 && memcmp(name.ptr, "nth-", 4) == 0;
+    if (nth != (arg.len > 0)) return -1;
+    if (nth && !parse_nth(arg, &a, &b)) return -1;
+    for (int p = 0; p < e->npred; p++)
+        if (e->preds[p].kind == kind && e->preds[p].a == a && e->preds[p].b == b) return p;
+    if (e->npred >= MAX_POS) return -1;
+    char buf[64];
+    int len = arg.len
+        ? snprintf(buf, sizeof buf, ":%.*s(%.*s)", (int)name.len, name.ptr, (int)arg.len, arg.ptr)
+        : snprintf(buf, sizeof buf, ":%.*s", (int)name.len, name.ptr);
+    PosPred* pp = &e->preds[e->npred];
+    pp->kind = kind;
+    pp->a = a;
+    pp->b = b;
+    pp->atom = e->intern(cc_slice_from_buffer(buf, (size_t)len));
+    return e->npred++;
+}
+
+static int fill_pseudo(Engine* e, CssNode* nd, CompoundScratch* c) {
+    CssNode* name = nd->first();
+    if (!name) return 0;
+    CssNode* arg = name->next(nd);
+    CCSlice name_s = name->span();
+    CCSlice arg_s = cc_slice_empty();
+    if (arg) arg_s = arg->span();
+    int row = e->pos_row(name_s, arg_s);
+    if (row < 0) return 0;
+    c->pseudo |= 1u << row;
+    c->sb++;
+    return 1;
+}
+
 static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
     memset(c, 0, sizeof(*c));
     if (!nd || !nd->is_list()) return 0;
@@ -550,6 +621,7 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
         int id = ch->id();
         if (ch->is_list()) {
             if (id == Css_KEEP_attr && !fill_attr(e, ch, c)) return 0;
+            if (id == Css_KEEP_pseudo && !fill_pseudo(e, ch, c)) return 0;
         } else {
             CCSlice raw = ch->span();
             CCSlice s = e->intern(raw);
@@ -564,12 +636,6 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
             } else if (id == Css_KEEP_class) {
                 if (c->nclass >= MAX_CLASS) return 0;
                 c->classes[c->nclass++] = s;
-                c->sb++;
-            } else if (id == Css_KEEP_pseudo) {
-                int k = 0;
-                while (k < NPS && !raw.eq_cstr(PS_NAME[k])) k++;
-                if (k >= NPS) return 0; /* not a structural pseudo we know */
-                c->pseudo |= 1u << k;
                 c->sb++;
             }
         }
@@ -1327,28 +1393,9 @@ static void Engine_note_left(Engine* e, const Compound* c, int k, int ci) {
         for (int i = 0; i < c->nattr; i++)
             e->push_left_rule(c->attr_n[i], k, ci);
     }
-    for (int p = 0; p < NPS; p++)
+    for (int p = 0; p < e->npred; p++)
         if (c->pseudo & (1u << p))
-            e->push_left_rule(PS_ATOM[p], k, ci);
-}
-
-static int compound_has_atom(const Compound* c, CCSlice a) {
-    if (!a.ptr || !c) return 0;
-    if (c->type.ptr == a.ptr) return 1;
-    if (c->id.ptr == a.ptr) return 1;
-    if (c->pseudo) {
-        for (int p = 0; p < NPS; p++)
-            if ((c->pseudo & (1u << p)) && PS_ATOM[p].ptr == a.ptr) return 1;
-    }
-    if (c->classes) {
-        for (int i = 0; i < c->nclass; i++)
-            if (c->classes[i].ptr == a.ptr) return 1;
-    }
-    if (c->attr_n) {
-        for (int i = 0; i < c->nattr; i++)
-            if (c->attr_n[i].ptr == a.ptr) return 1;
-    }
-    return 0;
+            e->push_left_rule(e->preds[p].atom, k, ci);
 }
 
 static int Engine_push_pair(Engine* e, Map::[AtomPair, Vec::[int]] m, CCSlice subj, CCSlice left, int rule) {
@@ -1469,30 +1516,47 @@ static void Engine_paint_blooms(Engine* e) {
     }
 }
 
-/* Structural bits for one node from its live sibling list, masked to the
- * pseudos the sheet uses so unused facts never split a share group. A
- * node with no parent has no siblings: first and last of everything. */
+/* Does 1-based index i sit on an+b for some n >= 0? */
+static int nth_hit(int a, int b, int i) {
+    if (a == 0) return i == b;
+    int d = i - b;
+    if (d % a) return 0;
+    return d / a >= 0;
+}
+
+/* Position bits for one node: its four sibling counts against every row
+ * of the table, masked to the rows rules use so unused facts never split
+ * a share group. A node with no parent has no siblings: index 1 of 1. */
 static unsigned Engine_pos_of(Engine* e, int i) {
     Node* n = &e->nodes[i];
     if (!e->pseudo_used) return 0;
-    unsigned pos = 0;
-    int prev = n->prev_sib;
-    while (prev >= 0 && e->nodes[prev].dead) prev = e->nodes[prev].prev_sib;
-    int next = n->next_sib;
-    while (next >= 0 && e->nodes[next].dead) next = e->nodes[next].next_sib;
-    if (prev < 0) pos |= PS_FIRST_CHILD;
-    if (next < 0) pos |= PS_LAST_CHILD;
-    int first_t = 1, last_t = 1;
-    for (int s = prev; s >= 0 && first_t; s = e->nodes[s].prev_sib)
-        if (!e->nodes[s].dead && e->nodes[s].tag.ptr == n->tag.ptr) first_t = 0;
-    for (int s = next; s >= 0 && last_t; s = e->nodes[s].next_sib)
-        if (!e->nodes[s].dead && e->nodes[s].tag.ptr == n->tag.ptr) last_t = 0;
-    if (first_t) pos |= PS_FIRST_OF_TYPE;
-    if (last_t) pos |= PS_LAST_OF_TYPE;
-    if (first_t && last_t) pos |= PS_ONLY_OF_TYPE;
+    int before = 0, after = 0, before_t = 0, after_t = 0;
+    for (int s = n->prev_sib; s >= 0; s = e->nodes[s].prev_sib) {
+        if (e->nodes[s].dead) continue;
+        before++;
+        if (e->nodes[s].tag.ptr == n->tag.ptr) before_t++;
+    }
+    for (int s = n->next_sib; s >= 0; s = e->nodes[s].next_sib) {
+        if (e->nodes[s].dead) continue;
+        after++;
+        if (e->nodes[s].tag.ptr == n->tag.ptr) after_t++;
+    }
     int kid = n->first_child;
     while (kid >= 0 && e->nodes[kid].dead) kid = e->nodes[kid].next_sib;
-    if (kid < 0) pos |= PS_EMPTY;
+    unsigned pos = 0;
+    for (int p = 0; p < e->npred; p++) {
+        const PosPred* pp = &e->preds[p];
+        int hit;
+        switch (pp->kind) {
+        case PK_CHILD: hit = nth_hit(pp->a, pp->b, before + 1); break;
+        case PK_LAST_CHILD: hit = nth_hit(pp->a, pp->b, after + 1); break;
+        case PK_OF_TYPE: hit = nth_hit(pp->a, pp->b, before_t + 1); break;
+        case PK_LAST_OF_TYPE: hit = nth_hit(pp->a, pp->b, after_t + 1); break;
+        case PK_ONLY_OF_TYPE: hit = before_t == 0 && after_t == 0; break;
+        default: hit = kid < 0; break;
+        }
+        if (hit) pos |= 1u << p;
+    }
     return pos & e->pseudo_used;
 }
 
@@ -1514,13 +1578,13 @@ static void Engine_note_leaf_op(Engine* e, int id, int parent) {
  * by that pseudo's atom, so left_rules needs no new path. */
 static void Engine_log_pos(Engine* e, int node, unsigned prev, unsigned next) {
     unsigned diff = prev ^ next;
-    for (int p = 0; p < NPS; p++) {
+    for (int p = 0; p < e->npred; p++) {
         if (!(diff & (1u << p))) continue;
         if (e->nchanges >= e->cap_changes || !e->changes) return;
         Change* ch = &e->changes[e->nchanges++];
         ch->node = node;
         ch->how = CH_POS;
-        ch->atom = PS_ATOM[p];
+        ch->atom = e->preds[p].atom;
         ch->prev = cc_slice_empty();
         ch->next = cc_slice_empty();
         ch->pos_prev = prev;
@@ -1598,9 +1662,11 @@ static void Engine_paint_blooms_dirty(Engine* e) {
         e->nodes[id].anc = p >= 0 ? e->nodes[p].anc : z;
         if (p >= 0) bloom_or(&e->nodes[id].anc, &e->nodes[p].self);
     }
+    /* Position bits are not bloom atoms: a CH_POS moves nothing here. */
     for (int i = 0; i < e->nchanges; i++) {
         Change* ch = &e->changes[i];
         int id = ch->node;
+        if (ch->how == CH_POS) continue;
         if (id < 0 || id >= e->nnodes || e->nodes[id].dead) continue;
         if (e->nodes[id].bloom_gen != e->bloom_stamp) {
             e->nodes[id].bloom_gen = e->bloom_stamp;
@@ -1611,6 +1677,7 @@ static void Engine_paint_blooms_dirty(Engine* e) {
     }
     for (int i = 0; i < e->nchanges; i++) {
         int id = e->changes[i].node;
+        if (e->changes[i].how == CH_POS) continue;
         if (id < 0 || id >= e->nnodes || e->nodes[id].dead) continue;
         if (e->nodes[id].bloom_gen != e->bloom_stamp) continue;
         e->nodes[id].bloom_gen = -e->bloom_stamp;
@@ -1678,8 +1745,11 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->muts = e->store.allocT::[MutOp](e->cap_muts);
     /* Class / attr: one change per op. Position: a leaf op can move every
      * sibling by several bits. */
-    e->cap_changes = e->cap_muts * 4 + 64;
+    /* One restyle's log: its class/attr flips plus, per leaf op, a position
+     * flip for every sibling an nth predicate moves — bounded by the tree. */
+    e->cap_changes = e->cap_muts * 4 + e->cap_nodes * 2 + 64;
     e->changes = e->store.allocT::[Change](e->cap_changes);
+    e->chg_order = e->store.allocT::[uint64_t](e->cap_changes);
     e->nchanges = 0;
     e->inv_ids = e->store.allocT::[int](e->cap_nodes);
     e->inv_off = e->store.allocT::[int](e->cap_nodes);
@@ -1689,7 +1759,6 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->inv_rules = e->store.allocT::[InvRule](e->cap_rules);
     if (e->rule_gen) memset(e->rule_gen, 0, sizeof(int) * (size_t)e->cap_rules);
     e->inv_stamp = 1;
-    e->src_gen = 1;
     e->bloom_stamp = 1;
     /* Candidates repeat across sources (a node under two changed
      * ancestors), so give the batch a few trees' worth; overflow falls
@@ -1740,11 +1809,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->box_inline.display = e->ident_inline;
     e->box_inline.position = e->ident_static;
     e->font_init.visibility = e->ident_visible;
-    for (int p = 0; p < NPS; p++) {
-        char buf[32];
-        int len = snprintf(buf, sizeof buf, ":%s", PS_NAME[p]);
-        PS_ATOM[p] = e->intern(cc_slice_from_buffer(buf, (size_t)len));
-    }
+    e->npred = 0;
 
     e->ingest_css(base_s, ORIGIN_UA) !>(err) { return cc_err(err); };
     e->ingest_css(css_s, ORIGIN_AUTHOR) !>(err) { return cc_err(err); };
@@ -2508,10 +2573,10 @@ static int change_in_state(const Change* ch, int undone) {
  * src in the given state. The compound holding the atom cannot match
  * while src lacks the atom, so each bucket is visited in the state where
  * src has it. Deduped by rule_gen; the reach mask accumulates. */
-static int Engine_rules_for_src_state(Engine* e, int src, InvRule* out, int n, int undone) {
-    for (int i = 0; i < e->nchanges; i++) {
-        Change* ch = &e->changes[i];
-        if (ch->node != src || !ch->atom.len || !e->left_rules) continue;
+static int Engine_rules_for_src_state(Engine* e, int src, int lo, int hi, InvRule* out, int n, int undone) {
+    for (int o = lo; o < hi; o++) {
+        Change* ch = &e->changes[CHG_IDX(e->chg_order[o])];
+        if (!ch->atom.len || !e->left_rules) continue;
         if (!change_in_state(ch, undone)) continue;
         Vec::[int]* rs = e->left_rules->get_ptr(ch->atom);
         if (!rs || !rs->data) continue;
@@ -2538,15 +2603,21 @@ static int Engine_rules_for_src_state(Engine* e, int src, InvRule* out, int n, i
 }
 
 /* Only src's own changes decide whether its compounds match, so the
- * undone-state rule pass flips just those. */
-static void Engine_undo_src(Engine* e, int src) {
-    for (int i = e->nchanges - 1; i >= 0; i--)
-        if (e->changes[i].node == src) e->change_undo(&e->changes[i]);
+ * undone-state rule pass flips just those: chg_order[lo..hi), in log order. */
+static void Engine_undo_src(Engine* e, int lo, int hi) {
+    for (int o = hi - 1; o >= lo; o--) e->change_undo(&e->changes[CHG_IDX(e->chg_order[o])]);
 }
 
-static void Engine_redo_src(Engine* e, int src) {
-    for (int i = 0; i < e->nchanges; i++)
-        if (e->changes[i].node == src) e->change_redo(&e->changes[i]);
+static void Engine_redo_src(Engine* e, int lo, int hi) {
+    for (int o = lo; o < hi; o++) e->change_redo(&e->changes[CHG_IDX(e->chg_order[o])]);
+}
+
+/* Group the log by node, log order within a node, so a source's changes
+ * are one run: chg_order holds (node << 32 | log index), sorted. */
+#define CHG_IDX(k) ((int)((k) & 0xffffffffu))
+static int u64_cmp(const void* a, const void* b) {
+    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
 }
 
 static int inv_rule_cmp(const void* a, const void* b) {
@@ -2622,15 +2693,22 @@ static void Engine_collect_kind(Engine* e, int src, int kind, int deep_kind, int
  * candidates of all sources, since neither pass mutates the tree. */
 /* Rule table and candidate list for one source. Returns 0 when the shared
  * scratch is full, so the caller can fall back to the serial path. */
-static int Engine_stage_src(Engine* e, int src) {
+static int Engine_stage_src(Engine* e, int src, int lo, int hi) {
     if (src < 0 || src >= e->nnodes || e->nodes[src].dead) return 1;
+    /* A left compound reaches down, or (with + / ~ in the sheet) across.
+     * No live child and no sibling combinator: nothing can flip below src. */
+    if (!e->has_sib_comb) {
+        int kid = e->nodes[src].first_child;
+        while (kid >= 0 && e->nodes[kid].dead) kid = e->nodes[kid].next_sib;
+        if (kid < 0) return 1;
+    }
     if (e->fo_njobs >= e->fo_jcap || e->fo_rn + e->cap_rules > e->fo_rcap) return 0;
     e->inv_stamp++;
     InvRule* t = e->fo_rules + e->fo_rn;
-    int nr = Engine_rules_for_src_state(e, src, t, 0, 0);
-    e->undo_src(src);
-    nr = Engine_rules_for_src_state(e, src, t, nr, 1);
-    e->redo_src(src);
+    int nr = Engine_rules_for_src_state(e, src, lo, hi, t, 0, 0);
+    e->undo_src(lo, hi);
+    nr = Engine_rules_for_src_state(e, src, lo, hi, t, nr, 1);
+    e->redo_src(lo, hi);
     if (!nr) { e->cnt_src++; return 1; }
     int grp = 0;
     for (int i = 0; i < nr; i++) grp |= t[i].grp;
@@ -2700,7 +2778,7 @@ static void Engine_dirty_desc(Engine* e, int src) {
 }
 
 /* Dirty N. Join flip is the batch (all changes vs all undone), walked
- * from each changed node once. src_gen dedupes nodes with several changes. */
+ * from each changed node once; the log is grouped by node first. */
 static int arm_size(int n);
 static int arm_count(int n);
 static void Engine_fo_flush(Engine* eng) {
@@ -2743,19 +2821,23 @@ static void Engine_fanout_dirty(Engine* e) {
         if (e->nodes[id].dead) continue;
         e->nodes[id].dirty = 1;
     }
-    e->src_gen++;
     e->fo_n = 0;
     e->fo_rn = 0;
     e->fo_njobs = 0;
-    for (int i = 0; i < e->nchanges; i++) {
-        int id = e->changes[i].node;
-        if (id < 0 || id >= n || e->nodes[id].dead) continue;
-        if (e->nodes[id].src_seen == e->src_gen) continue;
-        e->nodes[id].src_seen = e->src_gen;
-        if (!Engine_stage_src(e, id)) {
-            Engine_fo_flush(e);
-            Engine_stage_src(e, id);
+    for (int i = 0; i < e->nchanges; i++)
+        e->chg_order[i] = ((uint64_t)(uint32_t)e->changes[i].node << 32) | (uint32_t)i;
+    qsort(e->chg_order, (size_t)e->nchanges, sizeof(uint64_t), u64_cmp);
+    for (int lo = 0; lo < e->nchanges;) {
+        int id = e->changes[CHG_IDX(e->chg_order[lo])].node;
+        int hi = lo + 1;
+        while (hi < e->nchanges && (int)(e->chg_order[hi] >> 32) == id) hi++;
+        if (id >= 0 && id < n && !e->nodes[id].dead) {
+            if (!Engine_stage_src(e, id, lo, hi)) {
+                Engine_fo_flush(e);
+                Engine_stage_src(e, id, lo, hi);
+            }
         }
+        lo = hi;
     }
     Engine_fo_flush(e);
     e->nchanges = 0;

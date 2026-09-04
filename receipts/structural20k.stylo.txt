@@ -1,5 +1,5 @@
 # runner=stylo fixture=/Users/airm5/Documents/code/stylo-cc/fixtures/structural.stylebench threads=6
-# TIME_MS=37.377 TIME_MUT_MS=132.197 elements=20002
+# TIME_MS=37.153 TIME_MUT_MS=136.490 elements=20002
 0	div	id=testroot	disp=block	pos=static	w=auto	h=auto	minw=auto	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=0,0,0,0
 1	elem9	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=246,197,111,255
 2	elem2	id=-	disp=inline-block	pos=static	w=auto	h=10px	minw=10px	fs=10px	lh=10px	fw=400	vis=visible	color=rgb(0, 0, 0)	bg=67,128,184,255

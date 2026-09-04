@@ -11,7 +11,8 @@ stylo/              git submodule — servo/stylo 0.20.0 (oracle crate + unit te
 harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
 scripts/            bench-suite.sh — the 20 k sibling / structural / nth / ba races, the 5 k media race
                     gen-longhands.shcc — CC script: Stylo's longhand list → engine/longhands.cch
-browser-bench/      StyleBench itself in Chrome / WebKit via Playwright (vendored copy gitignored)
+browser-bench/      StyleBench itself in Chrome / WebKit via Playwright, and in Ladybird (vendored copy gitignored)
+ladybird/           git submodule — LadybirdBrowser/ladybird, built to Build/distribution by `scripts/browser-bench.sh ladybird-build`
 receipts/           last cmp-clean receipts, both runners: full dumps for tiny / local, header + body digest for 20 k (full/ is gitignored)
 ```
 
@@ -40,16 +41,18 @@ Style only. No layout. No paint. No browser. Stylo submodule tracks `origin/main
 
 CC is 2.7–7.6× faster on the first restyle and 1.5–30× faster on the edit rounds, with identical output; the smallest margin is the default suite's edit rounds (1.5×), the largest is media resizes (30×), where Stylo restyles every element on each resize and CC restyles only those a flipped rule touches. Widening the dump from 11 properties to all 189 cost CC about half a millisecond per column; Stylo already computed all of them.
 
-**The browsers, for scale.** The same StyleBench, unmodified, run in Chrome and in WebKit on this machine (`scripts/browser-bench.sh`, receipts in `receipts/browser-*.txt`; WebKit is Playwright's build, not Safari's shipped one). StyleBench times each edit step's JS + style recalc + **layout** in an 800×600 iframe and never times the initial resolution, so the only comparable column is the edit rounds, and the browser rows carry layout, UA-sheet matching, box construction and full-grammar CSS that ours do not. Order-of-magnitude only:
+**The browsers, for scale.** The same StyleBench, unmodified, run in Chrome, in WebKit and in Ladybird on this machine (`scripts/browser-bench.sh`, receipts in `receipts/browser-*.txt`; WebKit is Playwright's build, not Safari's shipped one; Ladybird is a Distribution build of the `ladybird/` submodule). StyleBench times each edit step's JS + style recalc + **layout** in an 800×600 iframe and never times the initial resolution, so the only comparable column is the edit rounds, and the browser rows carry layout, UA-sheet matching, box construction and full-grammar CSS that ours do not. Order-of-magnitude only:
 
-| suite | Chrome edits | WebKit edits | Stylo edits | CC edits |
-|---|---|---|---|---|
-| default | 118 | 99 | 23.4 | 15.6 |
-| sibling | 693 | 421 | 144.6 | 72.9 |
-| structural | 282 | 411 | 135.4 | 16.5 |
-| nth | 351 | 460 | 166.1 | 38.1 |
-| before / after | 200 | 163 | 57.5 | 18.7 |
-| media (55 resizes) | 446 | 270 | 425.3 | 14.3 |
+| suite | Chrome edits | WebKit edits | Ladybird edits | Stylo edits | CC edits |
+|---|---|---|---|---|---|
+| default | 118 | 99 | 211 *(118)* | 23.4 | 15.6 |
+| sibling | 693 | 421 | 298 *(187)* | 144.6 | 72.9 |
+| structural | 282 | 411 | 246 *(152)* | 135.4 | 16.5 |
+| nth | 351 | 460 | 408 *(294)* | 166.1 | 38.1 |
+| before / after | 200 | 163 | 339 *(350)* | 57.5 | 18.7 |
+| media (55 resizes) | 446 | 270 | 207 *(202)* | 425.3 | 14.3 |
+
+Ladybird's column is the **Conservative** runner; stock StyleBench is in parentheses. Stock StyleBench flushes each step with `getBoundingClientRect()` alone, and Ladybird's engine skips the style flush when it can prove the pending edits cannot move geometry — on stock, its class and attribute steps cost ~4 ms in every suite except before / after (where a class flip changes `content`), which is the restyle not being done, not being done fast. Ladybird's own perf harness closes that hole with a `_runTest` that also reads `getComputedStyle(body).backgroundColor` before and after each step; `--conservative` on either driver injects that exact override (`browser-bench/conservative.mjs`). Under it Chrome and WebKit are unchanged within noise (`receipts/browser-{chrome,webkit}-conservative.txt`), so their stock numbers stand. Stylo and CC have no lazy path: every StyleBench step runs the full restyle on the clock, so they are already at Conservative strictness or stricter.
 
 A style-only probe on the same page (`--split`: force a full style flush, then `getBoundingClientRect` for layout) puts Chrome's default edit rounds at ~88 ms style / ~15 ms layout and the initial resolution StyleBench leaves untimed at ~37 ms, against Stylo's 26.7 and our 9.8 on the same tree. The probe is stable on the default suite and noisy elsewhere (WebKit's clock is 1 ms-granular), so only that row is quoted; full output is in `receipts/browser-chrome.txt` / `receipts/browser-webkit.txt`.
 
@@ -251,6 +254,8 @@ make bench-ba         # before/after 20k/5k, same shape
 make bench-media      # media queries 5k elements, 55 resizes, same shape
 make longhands        # regenerate engine/longhands.cch from Stylo (--longhands dump + longhands.toml)
 scripts/browser-bench.sh all 5   # StyleBench in Chrome + Playwright WebKit (+ Safari if remote automation is on)
+scripts/browser-bench.sh ladybird-build          # build the ladybird/ submodule (Distribution; 30+ min first time)
+scripts/browser-bench.sh ladybird 5 --conservative   # StyleBench in Ladybird; drop --conservative for the stock runner
 ```
 
 `CC_STYLE_WORKERS=n` caps the CC worker pool (default: all cores).

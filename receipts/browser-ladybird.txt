@@ -1,0 +1,53 @@
+# StyleBench (WebKit main 67bf126de007) run locally via scripts/browser-bench.sh, 2026-09-04
+# Apple M5, macOS 26.5.2
+# label: Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual)
+# sync = step JS + style recalc + layout (800x600 iframe); async = constant 1 ms/step; initial resolution untimed by StyleBench
+# Ladybird a1db2e3a 2026-09-04, Distribution preset, built from the ladybird/ submodule; --headless=manual, 1024x768 window. STOCK runner: getBoundingClientRect() flush only -- Ladybird skips the style flush when pending changes cannot affect geometry (class/attr steps ~4 ms in every suite but before/after), so see browser-ladybird-conservative.txt for the forced-flush figure.
+== Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual) (from browser-bench/results/ladybird.json): StyleBench, 5 iteration(s), ms (sync = style + layout flush; async = constant 1/step) ==
+suite                                iter steps   sync ms  async ms  total ms
+Descendant and child combinators        1    25     117.9      25.0     142.9
+Sibling combinators                     1    25     190.3      25.0     215.3
+Structural pseudo classes               1    25     152.1      25.0     177.1
+Nth pseudo classes                      1    25     294.2      25.0     319.2
+Before and after pseudo elements        1    25     355.7      25.0     380.7
+Dynamic media queries                   1    55     211.8      55.0     266.8
+Descendant and child combinators        2    25     136.7      25.0     161.7
+Sibling combinators                     2    25     186.8      25.0     211.8
+Structural pseudo classes               2    25     158.7      25.0     183.7
+Nth pseudo classes                      2    25     305.4      25.0     330.4
+Before and after pseudo elements        2    25     355.4      25.0     380.4
+Dynamic media queries                   2    55     226.5      55.0     281.5
+Descendant and child combinators        3    25     148.2      25.0     173.2
+Sibling combinators                     3    25     290.1      25.0     315.1
+Structural pseudo classes               3    25     164.3      25.0     189.3
+Nth pseudo classes                      3    25     311.2      25.0     336.2
+Before and after pseudo elements        3    25     365.6      25.0     390.6
+Dynamic media queries                   3    55     210.1      55.0     265.1
+Descendant and child combinators        4    25     138.3      25.0     163.3
+Sibling combinators                     4    25     192.6      25.0     217.6
+Structural pseudo classes               4    25     164.5      25.0     189.5
+Nth pseudo classes                      4    25     345.9      25.0     370.9
+Before and after pseudo elements        4    25     349.7      25.0     374.7
+Dynamic media queries                   4    55     202.4      55.0     257.4
+Descendant and child combinators        5    25     127.9      25.0     152.9
+Sibling combinators                     5    25     226.0      25.0     251.0
+Structural pseudo classes               5    25     170.1      25.0     195.1
+Nth pseudo classes                      5    25     310.9      25.0     335.9
+Before and after pseudo elements        5    25     372.3      25.0     397.3
+Dynamic media queries                   5    55     204.9      55.0     259.9
+suite (over iterations)              steps  sync mean  sync min  total mean
+Descendant and child combinators        25      133.8     117.9       158.8
+Sibling combinators                     25      217.2     186.8       242.2
+Structural pseudo classes               25      161.9     152.1       186.9
+Nth pseudo classes                      25      313.5     294.2       338.5
+Before and after pseudo elements        25      359.7     349.7       384.7
+Dynamic media queries                   55      211.1     202.4       266.1
+per step kind, sync ms summed over the suite's steps of that kind, mean over iterations:
+  Descendant and child combinators  Adding classes=4.1  Removing classes=6.8  Mutating attributes=3.7  Adding leaf elements=68.4  Removing leaf elements=50.9
+  Sibling combinators               Adding classes=4.1  Removing classes=6.7  Mutating attributes=3.9  Adding leaf elements=118.1  Removing leaf elements=84.3
+  Structural pseudo classes         Adding classes=4.0  Removing classes=6.8  Mutating attributes=3.3  Adding leaf elements=92.4  Removing leaf elements=55.4
+  Nth pseudo classes                Adding classes=4.1  Removing classes=6.3  Mutating attributes=3.5  Adding leaf elements=174.5  Removing leaf elements=125.1
+  Before and after pseudo elements  Adding classes=82.4  Removing classes=67.0  Mutating attributes=27.1  Adding leaf elements=103.1  Removing leaf elements=80.2
+  Dynamic media queries             resizes=211.1
+StyleBench score (runs/min = 60000 / geomean(suite totals) / 1.5): mean 160.01  [168.9, 162.5, 150.0, 160.4, 158.4]
+geomean of suite totals, ms: mean 250.4  [236.9, 246.2, 266.7, 249.4, 252.6]

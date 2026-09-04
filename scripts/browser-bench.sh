@@ -5,6 +5,8 @@
 #   scripts/browser-bench.sh chrome [N]      # installed Google Chrome, headless=new, N iterations
 #   scripts/browser-bench.sh webkit [N]      # Playwright's WebKit build (stand-in; not Safari's WebCore)
 #   scripts/browser-bench.sh safari          # safaridriver if "Allow Remote Automation" is on, else manual instructions
+#   scripts/browser-bench.sh ladybird [N]    # Ladybird from the ladybird/ submodule (see `ladybird-build`), headless=manual
+#   scripts/browser-bench.sh ladybird-build  # build the submodule's Distribution preset (30+ min first time; needs brew tools)
 #   scripts/browser-bench.sh serve           # just serve StyleBench for a manual run
 #   scripts/browser-bench.sh fetch           # (re)fetch StyleBench from WebKit main (sparse clone)
 #   scripts/browser-bench.sh report FILE     # format a pasted benchmarkClient._measuredValuesList JSON
@@ -76,8 +78,29 @@ safari() {
   fi
 }
 
+LB_BIN="$ROOT/ladybird/Build/distribution/bin/Ladybird.app/Contents/MacOS/Ladybird"
+
+ladybird_build() {
+  # Upstream macOS instructions: xcode CLT + brew autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config.
+  # Do NOT put Homebrew libtool's gnubin on PATH: skia's build needs Apple's `libtool -static`.
+  [ -f "$ROOT/ladybird/Meta/ladybird.py" ] || git -C "$ROOT" submodule update --init --depth 1 ladybird
+  for t in cmake ninja nasm autoconf automake glibtool pkg-config; do
+    command -v "$t" >/dev/null || { echo "missing $t: brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config"; exit 1; }
+  done
+  (cd "$ROOT/ladybird" && BUILD_PRESET=Distribution ./Meta/ladybird.py build ladybird)
+  echo "built $LB_BIN"
+}
+
+ladybird() {
+  [ -x "$LB_BIN" ] || { echo "no Ladybird binary at $LB_BIN; run: $0 ladybird-build"; exit 1; }
+  echo "ladybird: $(git -C "$ROOT/ladybird" log -1 --format='%h %cs') (Distribution)"
+  node ladybird.mjs --iterations "${1:-5}" "${@:2}"
+}
+
 cmd="${1:-all}"; shift || true
 case "$cmd" in
+  ladybird-build) ladybird_build ;;
+  ladybird) deps; [ -d StyleBench ] || fetch; machine; ladybird "$@" ;;
   fetch) fetch ;;
   serve) deps; [ -d StyleBench ] || fetch; node run.mjs --serve "$@" ;;
   report) deps; f="$1"; [[ "$f" = /* ]] || f="$ROOT/$f"; node run.mjs --from-json "$f" "${@:2}" ;;
@@ -90,6 +113,12 @@ case "$cmd" in
     mkdir -p results
     node run.mjs --browser chrome --iterations "${1:-5}" --split --json results/chrome.json "${@:2}"
     node run.mjs --browser webkit --iterations "${1:-5}" --split --json results/webkit.json "${@:2}"
+    if [ -x "$LB_BIN" ]; then
+      ladybird "${1:-5}" --json results/ladybird.json "${@:2}"
+      ladybird "${1:-5}" --conservative --json results/ladybird-conservative.json "${@:2}"
+    else
+      echo "(no Ladybird build; run: $0 ladybird-build)"
+    fi
     safari "${1:-5}" "${@:2}" || true
     ;;
   *) echo "usage: $0 [all|chrome|chromium|webkit|safari|serve|fetch|report] [iterations] [-- run.mjs args]"; exit 2 ;;

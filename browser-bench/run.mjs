@@ -3,6 +3,7 @@
 //
 //   node run.mjs --browser chrome|chromium|webkit [--iterations N] [--suite NAME]
 //                [--headed] [--port P] [--json OUT] [--split]   (--first-restyle is an alias of --split)
+//                [--conservative]   # StyleBenchConservative's _runTest: +getComputedStyle flush (see conservative.mjs)
 //   node run.mjs --serve [--port P]          # just serve, for a manual Safari run
 //   node run.mjs --from-json FILE            # format a pasted benchmarkClient._measuredValuesList
 //
@@ -42,8 +43,13 @@ const jsonOut = opt('json', null);
 const serveOnly = !!opt('serve', false);
 const fromJson = opt('from-json', null);
 const firstRestyle = !!opt('first-restyle', false) || !!opt('split', false);
+const conservative = !!opt('conservative', false);
+
+import { CONSERVATIVE_RUNTEST } from './conservative.mjs';
 
 // ---------- static server ----------
+// With --conservative, the stock resources/benchmark-report.js is served with the Conservative
+// _runTest appended (it loads right after benchmark-runner.js). The vendored files are not modified.
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.json': 'application/json' };
 function startServer(port) {
   return new Promise((resolve, reject) => {
@@ -55,6 +61,7 @@ function startServer(port) {
       fs.readFile(file, (err, data) => {
         if (err) { res.writeHead(404); return res.end('not found'); }
         res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+        if (conservative && urlPath === '/StyleBench/resources/benchmark-report.js') return res.end(data + '\n' + CONSERVATIVE_RUNTEST);
         res.end(data);
       });
     });
@@ -168,6 +175,7 @@ if (browserName === 'chrome') {
   console.error(`unknown --browser ${browserName}`);
   process.exit(2);
 }
+if (conservative) label += ' [CONSERVATIVE runner: +getComputedStyle flush]';
 
 try {
   const context = await browser.newContext({ viewport: { width: 1024, height: 768 } });

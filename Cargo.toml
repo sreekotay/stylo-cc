@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["harness"]
-exclude = ["stylo", "stylo-runner"]
+exclude = ["stylo", "stylo-runner", "ladybird"]
 
 [workspace.package]
 edition = "2021"

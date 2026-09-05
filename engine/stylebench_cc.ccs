@@ -155,7 +155,9 @@ typedef enum {
     MUT_ADD_LEAF,
     MUT_REMOVE_LEAF,
     MUT_RESIZE,
-    MUT_RESTYLE
+    MUT_RESTYLE,
+    MUT_HOVER_ON,
+    MUT_HOVER_OFF
 } MutKind;
 
 typedef struct {
@@ -214,8 +216,13 @@ typedef struct {
  *                      seen; inherit / copy / apply no-op while NULL.
  *   has_lists        — set when a compound takes :is / :not / :where;
  *                      match_from is Node_match_compound plus one
- *                      predicted-false branch.
- * calc() is parse-time only (U_CALC never taken on StyleBench lengths).
+ *                      predicted-false branch. The lists themselves live
+ *                      in Engine.clists; Compound.list_id is 0 unless
+ *                      this compound has one.
+ *   :hover           — the interned atom ":hover" on classes[]; no Node
+ *                      field, no extra test on the match hop.
+ *   calcs            — mixed-calc 4-tuples; CssLen.calc is 0 unless the
+ *                      sheet wrote `calc()` with more than one basis.
  * Do not put optional state back on Node or on the unguarded match hop. */
 typedef struct {
     CCSlice var_n[CSS_MAX_VARS];
@@ -276,9 +283,13 @@ typedef struct Compound {
     int* attr_eq;
     Bloom need;
     int open;
+    uint16_t list_id; /* 0 = none; else 1-based into Engine.clists */
+} Compound;
+
+typedef struct {
     IsList* lists;
     int nlist;
-} Compound;
+} CList;
 
 typedef struct {
     int star, nclass, nattr;
@@ -455,6 +466,14 @@ typedef struct {
     /* Sheet-global: stay 0 / NULL on StyleBench. See NodeVars. */
     int has_vars;
     int has_lists;
+    CssLenCalc* calcs;
+    int ncalcs, cap_calcs;
+    CList* clists;
+    int nclists, cap_clists;
+    CCSlice hover_atom;
+    /* Pointer target for +hover: the bit is written on this node and
+     * its ancestors. -1 when nothing is hovered. */
+    int hover_src;
     NodeVars* vtab;
     unsigned pseudo_used;
     int inv_stamp;
@@ -487,6 +506,12 @@ typedef struct {
     double sum_fanout, sum_blooms;
     long cnt_src, cnt_cand, cnt_rules;
     double t0_levels, t0_share, t0_match, t0_inherit;
+    /* Host ABI (stylecc): when set, style_one keeps Hit lists for take_matches. */
+    int record_matches;
+    int* match_rule;
+    uint8_t* match_pelem;
+    int* match_node;
+    int nmatch_rec, cap_match_rec;
 } Engine;
 
 /* Redis Encode shape: restyle cannot mutate the tree; mut under hold
@@ -506,11 +531,11 @@ typedef struct {
 
 @typeview Mutate on Engine {
     r: intern, fill_node, insert_child, dirty_following, ensure_class_cap,
-       ensure_attr_cap, apply_mut, log_change, log_pos, repos_family,
+       ensure_attr_cap, apply_mut, hover_write, log_change, log_pos, repos_family,
        note_leaf_op, push_bucket, set_inline_rule, store, cap_nodes, cap_changes,
        has_sib_comb, pseudo_used;
     rw: nodes, nnodes, nchanges, changes, levels_stale, leaf_ops, leaf_op_parent,
-        nleaf_ops, cap_leaf_ops;
+        nleaf_ops, cap_leaf_ops, hover_src;
 };
 
 typedef @typeview(Match) Engine* EngineMatch;
@@ -531,6 +556,8 @@ static void Engine_dirty_following(Engine* e, int src);
 static void Engine_reset_pseudo(Engine* e, int i);
 static void Engine_inherit_pseudo(Engine* e, int i, int p);
 static void Engine_set_inline_rule(Engine* e, Node* n);
+static void Engine_hover_write(Engine* e, int id, int on);
+static void Engine_apply_mut(Engine* e, MutOp* m);
 static CCSlice Engine_intern(Engine* e, CCSlice src);
 static int fill_rule(Engine* e, CssNode* nd, Rule* r);
 static void !>(CCError) Engine_alloc_pools(Engine* e);
@@ -591,6 +618,50 @@ static void Engine_note_vars(Engine* e) {
 
 static NodeVars* nv_at(Engine* e, int slot) {
     return e->vtab ? &e->vtab[slot] : 0;
+}
+
+/* Match typeview is full (48). These bind the pools so inherit / match
+ * lists do not add fields there. StyleBench never interned a row. */
+static CList* g_clists;
+
+static uint16_t Engine_intern_calc(Engine* e, const CssLenCalc* c) {
+    for (int i = 0; i < e->ncalcs; i++) {
+        CssLenCalc* t = &e->calcs[i];
+        if (t->c_px == c->c_px && t->c_em == c->c_em &&
+            t->c_rem == c->c_rem && t->c_pct == c->c_pct)
+            return (uint16_t)(i + 1);
+    }
+    if (e->ncalcs >= e->cap_calcs) {
+        int ncap = e->cap_calcs ? e->cap_calcs * 2 : 16;
+        CssLenCalc* n = e->store.allocT::[CssLenCalc](ncap);
+        if (!n) return 0;
+        if (e->calcs && e->ncalcs)
+            memcpy(n, e->calcs, sizeof(CssLenCalc) * (size_t)e->ncalcs);
+        e->calcs = n;
+        e->cap_calcs = ncap;
+    }
+    e->calcs[e->ncalcs] = *c;
+    e->ncalcs++;
+    cssval_bind_calcs(e->calcs);
+    return (uint16_t)e->ncalcs;
+}
+
+static uint16_t Engine_intern_clist(Engine* e, IsList* lists, int nlist) {
+    if (!nlist) return 0;
+    if (e->nclists >= e->cap_clists) {
+        int ncap = e->cap_clists ? e->cap_clists * 2 : 16;
+        CList* n = e->store.allocT::[CList](ncap);
+        if (!n) return 0;
+        if (e->clists && e->nclists)
+            memcpy(n, e->clists, sizeof(CList) * (size_t)e->nclists);
+        e->clists = n;
+        e->cap_clists = ncap;
+    }
+    e->clists[e->nclists].lists = lists;
+    e->clists[e->nclists].nlist = nlist;
+    e->nclists++;
+    g_clists = e->clists;
+    return (uint16_t)e->nclists;
 }
 
 static CCSlice !>(CCError) CCSlice_read_path(CCSlice* path, CCArena arena) {
@@ -700,6 +771,9 @@ static CCSlice ingest_take_line(CCSlice text, size_t* pos) {
 
 static int cssval_len_cs(CCSlice s, CssLen* out) {
     return cssval_parse_len_slice(s.ptr, s.len, out);
+}
+static int cssval_len_cs_mix(CCSlice s, CssLen* out, CssLenCalc* mixed) {
+    return cssval_parse_len_slice_mix(s.ptr, s.len, out, mixed);
 }
 static int cssval_color_cs(CCSlice s, CssColor* out) {
     return cssval_parse_color_slice(s.ptr, s.len, out);
@@ -897,6 +971,14 @@ static int fill_pseudo(Engine* e, CssNode* nd, CompoundScratch* c) {
     CCSlice name_s = name->span();
     CCSlice arg_s = cc_slice_empty();
     if (arg) arg_s = arg->span();
+    if (name_s.eq_cstr("hover")) {
+        if (arg_s.len) return 0;
+        if (c->nclass >= MAX_CLASS) return 0;
+        if (!e->hover_atom.len) e->hover_atom = e->intern(@slice(":hover"));
+        c->classes[c->nclass++] = e->hover_atom;
+        c->sb++;
+        return 1;
+    }
     int kind = -1;
     if (name_s.eq_cstr("is")) kind = LIST_IS;
     else if (name_s.eq_cstr("not")) kind = LIST_NOT;
@@ -969,7 +1051,8 @@ static int fill_compound(Engine* e, CssNode* nd, CompoundScratch* c) {
         }
         ch = ch->next(nd);
     }
-    return c->star || c->type.len || c->id.len || c->nclass || c->nattr || c->pseudo || c->pelem || c->nlist;
+    return c->star || c->type.len || c->id.len || c->nclass || c->nattr ||
+           c->pseudo || c->pelem || c->nlist;
 }
 
 /* Hash the bytes, not the interned pointer: arena addresses change per
@@ -1023,7 +1106,8 @@ static void compound_paint_need(Compound* c) {
     c->open = bloom_empty(&n);
 }
 
-static int pack_compound(CCArena store, CompoundScratch* s, Compound* d) {
+static int pack_compound(Engine* e, CompoundScratch* s, Compound* d) {
+    CCArena store = e->store;
     d->star = s->star;
     d->nclass = s->nclass;
     d->nattr = s->nattr;
@@ -1038,12 +1122,13 @@ static int pack_compound(CCArena store, CompoundScratch* s, Compound* d) {
     d->attr_n = 0;
     d->attr_v = 0;
     d->attr_eq = 0;
-    d->nlist = s->nlist;
-    d->lists = 0;
+    d->list_id = 0;
     if (s->nlist) {
-        d->lists = store.allocT::[IsList](s->nlist);
-        if (!d->lists) return 0;
-        memcpy(d->lists, s->lists, sizeof(IsList) * (size_t)s->nlist);
+        IsList* lists = store.allocT::[IsList](s->nlist);
+        if (!lists) return 0;
+        memcpy(lists, s->lists, sizeof(IsList) * (size_t)s->nlist);
+        d->list_id = Engine_intern_clist(e, lists, s->nlist);
+        if (!d->list_id) return 0;
     }
     if (s->nclass) {
         d->classes = store.allocT::[CCSlice](s->nclass);
@@ -1101,7 +1186,7 @@ static int fill_selector(Engine* e, CssNode* nd, Rule* r) {
         memcpy(r->comb, tmpcomb, sizeof(Comb) * (size_t)(r->n - 1));
     }
     for (int i = 0; i < r->n; i++)
-        if (!pack_compound(e->store, &tmpc[i], &r->c[i])) return 0;
+        if (!pack_compound(e, &tmpc[i], &r->c[i])) return 0;
     for (int i = 0; i + 1 < r->n; i++)
         if (r->c[i].pelem) return 0; /* a pseudo-element is always last */
     r->pelem = r->c[r->n - 1].pelem;
@@ -1156,7 +1241,15 @@ static int Engine_fill_cell(Engine* e, int prop, CCSlice val, CssDecl* d) {
     if (PROP_KIND[prop] == LH_LEN) {
         if (prop == P_font_weight && val.eq_cstr("normal")) val = @slice("400");
         else if (prop == P_font_weight && val.eq_cstr("bold")) val = @slice("700");
-        return cssval_len_cs(val, &d->v.len);
+        CssLenCalc mix;
+        memset(&mix, 0, sizeof mix);
+        if (!cssval_len_cs_mix(val, &d->v.len, &mix)) return 0;
+        if (d->v.len.unit == U_CALC) {
+            uint16_t id = Engine_intern_calc(e, &mix);
+            if (!id) return 0;
+            d->v.len.calc = id;
+        }
+        return 1;
     }
     if (PROP_KIND[prop] == LH_COLOR)
         return cssval_color_cs(val, &d->v.color);
@@ -1742,22 +1835,28 @@ static void Engine_note_left(Engine* e, const Compound* c, int k, int ci) {
     for (int p = 0; p < e->npred; p++)
         if (c->pseudo & (1u << p))
             e->push_left_rule(e->preds[p].atom, k, ci);
-    for (int i = 0; i < c->nlist; i++) {
-        IsList* L = &c->lists[i];
-        for (int a = 0; a < L->n; a++)
-            for (int j = 0; j < L->alts[a].n; j++)
-                e->note_left(&L->alts[a].c[j], k, ci);
+    if (c->list_id) {
+        CList* cl = &e->clists[c->list_id - 1];
+        for (int i = 0; i < cl->nlist; i++) {
+            IsList* L = &cl->lists[i];
+            for (int a = 0; a < L->n; a++)
+                for (int j = 0; j < L->alts[a].n; j++)
+                    e->note_left(&L->alts[a].c[j], k, ci);
+        }
     }
 }
 
 /* Structural rows inside :is / :not still need Node.pos bits. */
 static void Engine_note_pseudos(Engine* e, const Compound* c) {
     e->pseudo_used |= c->pseudo;
-    for (int i = 0; i < c->nlist; i++) {
-        IsList* L = &c->lists[i];
-        for (int a = 0; a < L->n; a++)
-            for (int j = 0; j < L->alts[a].n; j++)
-                e->note_pseudos(&L->alts[a].c[j]);
+    if (c->list_id) {
+        CList* cl = &e->clists[c->list_id - 1];
+        for (int i = 0; i < cl->nlist; i++) {
+            IsList* L = &cl->lists[i];
+            for (int a = 0; a < L->n; a++)
+                for (int j = 0; j < L->alts[a].n; j++)
+                    e->note_pseudos(&L->alts[a].c[j]);
+        }
     }
 }
 
@@ -2166,6 +2265,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->atoms = e->store.allocT::[CCSlice](e->cap_atoms);
     e->natoms = 0;
     e->viewport_w = 800;
+    e->hover_src = -1;
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
         !e->child_pairs || !e->desc_pairs ||
@@ -2273,7 +2373,7 @@ static int Node_has_attr(Node* n, const CCSlice* name, const CCSlice* val, int e
 static int hop_compound(Engine* e, int idx, const Compound* c) {
     if (idx < 0) return 0;
     if (!e->nodes[idx].match_compound(c)) return 0;
-    if (!e->has_lists || !c->nlist) return 1;
+    if (!e->has_lists) return 1;
     return Engine_match_lists(e, idx, c);
 }
 
@@ -2333,8 +2433,10 @@ static int Engine_match_inner_from(Engine* e, int idx, const InnerSel* s, int ci
 }
 
 static int Engine_match_lists(Engine* e, int idx, const Compound* c) {
-    for (int i = 0; i < c->nlist; i++) {
-        IsList* L = &c->lists[i];
+    if (!c->list_id) return 1;
+    CList* cl = &g_clists[c->list_id - 1];
+    for (int i = 0; i < cl->nlist; i++) {
+        IsList* L = &cl->lists[i];
         int hit = 0;
         for (int a = 0; a < L->n; a++) {
             InnerSel* s = &L->alts[a];
@@ -2358,7 +2460,7 @@ static int Engine_match_from(Engine* e, int idx, const Rule* r, int ci) {
     /* has_lists is 0 unless the sheet parsed :is / :not / :where. */
     if (!n->match_compound(&r->c[ci]))
         return 0;
-    if (e->has_lists && r->c[ci].nlist && !Engine_match_lists(e, idx, &r->c[ci]))
+    if (e->has_lists && !Engine_match_lists(e, idx, &r->c[ci]))
         return 0;
     if (ci == 0)
         return 1;
@@ -2412,7 +2514,7 @@ static int Engine_match_from_join(Engine* e, int idx, const Rule* r, int ci) {
     Node* n = &e->nodes[idx];
     if (!n->match_compound(&r->c[ci]))
         return 0;
-    if (e->has_lists && r->c[ci].nlist && !Engine_match_lists(e, idx, &r->c[ci]))
+    if (e->has_lists && !Engine_match_lists(e, idx, &r->c[ci]))
         return 0;
     if (ci == 0)
         return 1;
@@ -2731,6 +2833,32 @@ static void Engine_style_one(Engine* e, int i, Hits* hs) {
             e->apply_rule(i, n, hs, rule_idx);
     }
     Engine_apply_sib(e, i, n, hs);
+    if (e->record_matches) {
+        for (int t = 0; t < 3; t++) {
+            for (int k = 0; k < hs->n[t]; k++) {
+                if (e->nmatch_rec >= e->cap_match_rec) {
+                    int nc = e->cap_match_rec ? e->cap_match_rec * 2 : 256;
+                    int* nr = (int*)realloc(e->match_rule, sizeof(int) * (size_t)nc);
+                    uint8_t* np = (uint8_t*)realloc(e->match_pelem, (size_t)nc);
+                    int* nn = (int*)realloc(e->match_node, sizeof(int) * (size_t)nc);
+                    if (!nr || !np || !nn) {
+                        free(nr);
+                        free(np);
+                        free(nn);
+                        break;
+                    }
+                    e->match_rule = nr;
+                    e->match_pelem = np;
+                    e->match_node = nn;
+                    e->cap_match_rec = nc;
+                }
+                e->match_node[e->nmatch_rec] = i;
+                e->match_rule[e->nmatch_rec] = hs->h[t][k].rule;
+                e->match_pelem[e->nmatch_rec] = (uint8_t)t;
+                e->nmatch_rec++;
+            }
+        }
+    }
     e->cascade(n, i, hs->h[0], hs->n[0], n->inline_rule);
     for (int p = 0; p < 2; p++)
         e->cascade(&e->pnodes[2 * i + p], e->cap_nodes + 2 * i + p, hs->h[1 + p], hs->n[1 + p], 0);
@@ -3619,6 +3747,7 @@ static void Engine_style_arm(Engine* e, int n, int arm, int dirty_only) {
 
 static void !>(CCError) Engine_style_all(Engine* eng) {
     EngineMatch m = eng;
+    eng->nmatch_rec = 0;
     double t0 = now_ms();
     m->paint_levels();
     int nn = eng->nnodes;
@@ -3640,9 +3769,15 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
     t0 = now_ms();
     na = arm_count(nc);
     if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
-    @parallel for (a in 0..na) {
-        Engine_style_arm(eng, nc, a, 0);
-    } !>.wait()!>;
+    /* record_matches appends to shared buffers — must not run style_arm in parallel. */
+    if (eng->record_matches || na <= 1) {
+        for (int a = 0; a < na; a++)
+            Engine_style_arm(eng, nc, a, 0);
+    } else {
+        @parallel for (a in 0..na) {
+            Engine_style_arm(eng, nc, a, 0);
+        } !>.wait()!>;
+    }
     for (int i = 0; i < eng->nnodes; i++) {
         if (eng->share_of[i] != i)
             m->copy_specified(i, eng->share_of[i]);
@@ -3659,6 +3794,7 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
 
 static void !>(CCError) Engine_style_dirty(Engine* eng) {
     EngineMatch m = eng;
+    eng->nmatch_rec = 0;
     double t0 = now_ms();
     if (eng->levels_stale) {
         m->paint_levels();
@@ -3688,9 +3824,14 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
     t0 = now_ms();
     na = arm_count(nc);
     if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
-    @parallel for (a in 0..na) {
-        Engine_style_arm(eng, nc, a, 1);
-    } !>.wait()!>;
+    if (eng->record_matches || na <= 1) {
+        for (int a = 0; a < na; a++)
+            Engine_style_arm(eng, nc, a, 1);
+    } else {
+        @parallel for (a in 0..na) {
+            Engine_style_arm(eng, nc, a, 1);
+        } !>.wait()!>;
+    }
     eng->sum_match += now_ms() - t0;
     t1 = now_ms();
     for (int i = 0; i < eng->nnodes; i++) {
@@ -3780,6 +3921,12 @@ static void !>(CCError) Engine_ingest_muts(Engine* e, char[:] text) {
         } else if (slice_eq_lit(cols[0], "resize") && nc >= 2) {
             m->kind = MUT_RESIZE;
             m->id = parse_int_slice(cols[1]);
+        } else if (slice_eq_lit(cols[0], "+hover") && nc >= 2) {
+            m->kind = MUT_HOVER_ON;
+            m->id = parse_int_slice(cols[1]);
+        } else if (slice_eq_lit(cols[0], "-hover") && nc >= 2) {
+            m->kind = MUT_HOVER_OFF;
+            m->id = parse_int_slice(cols[1]);
         } else {
             return cc_err(CC_ERR_PARSE, "mut line");
         }
@@ -3811,6 +3958,31 @@ static int Engine_ensure_attr_cap(Engine* e, Node* n, int need) {
     n->attrs = p;
     n->cap_attr = cap;
     return 1;
+}
+
+/* :hover is the interned atom on classes[] — same write as +class / -class. */
+static void Engine_hover_write(Engine* e, int id, int on) {
+    if (id < 0 || id >= e->nnodes) return;
+    Node* n = &e->nodes[id];
+    if (n->dead) return;
+    CCSlice atom = e->intern(@slice(":hover"));
+    if (on) {
+        if (n->has_class(&atom)) return;
+        if (!e->ensure_class_cap(n, n->nclass + 1)) return;
+        n->classes[n->nclass++] = atom;
+        n->dirty = 1;
+        e->log_change(id, CH_ADD_CLASS, atom, cc_slice_empty(), cc_slice_empty());
+        if (e->nchanges) e->changes[e->nchanges - 1].idx = n->nclass - 1;
+    } else {
+        int idx = -1;
+        for (int i = 0; i < n->nclass; i++)
+            if (slices_eq(&n->classes[i], &atom)) { idx = i; break; }
+        if (idx < 0) return;
+        Engine_tmp_del_one_class(n, atom, idx);
+        n->dirty = 1;
+        e->log_change(id, CH_DEL_CLASS, atom, cc_slice_empty(), cc_slice_empty());
+        if (e->nchanges) e->changes[e->nchanges - 1].idx = idx;
+    }
 }
 
 static void Engine_apply_mut(Engine* e, MutOp* m) {
@@ -3875,6 +4047,28 @@ static void Engine_apply_mut(Engine* e, MutOp* m) {
         n->nclass--;
         n->dirty = 1;
         e->log_change(m->id, CH_DEL_CLASS, gone, cc_slice_empty(), cc_slice_empty());
+    } else if (m->kind == MUT_HOVER_ON) {
+        /* Pointer over N: the bit goes on N and every ancestor. */
+        int path[64];
+        int np = 0;
+        for (int i = m->id; i >= 0 && np < 64; i = e->nodes[i].parent)
+            path[np++] = i;
+        if (e->hover_src >= 0 && e->hover_src != m->id) {
+            for (int i = e->hover_src; i >= 0; i = e->nodes[i].parent) {
+                int keep = 0;
+                for (int k = 0; k < np; k++)
+                    if (path[k] == i) { keep = 1; break; }
+                if (!keep) e->hover_write(i, 0);
+            }
+        }
+        for (int k = 0; k < np; k++)
+            e->hover_write(path[k], 1);
+        e->hover_src = m->id;
+    } else if (m->kind == MUT_HOVER_OFF) {
+        int src = e->hover_src >= 0 ? e->hover_src : m->id;
+        for (int i = src; i >= 0; i = e->nodes[i].parent)
+            e->hover_write(i, 0);
+        e->hover_src = -1;
     } else if (m->kind == MUT_SET_ATTR) {
         CCSlice name = e->intern(m->a);
         CCSlice val = e->intern(m->b);
@@ -3991,7 +4185,7 @@ static void !>(CCError) Engine_run_mutations(Engine* e, CCShardDomain* domain, d
     return cc_ok();
 }
 
-int main(int argc, char** argv) {
+int stylebench_cc_main(int argc, char** argv) {
     @errhandler(CCError e) { cc_error_log(e); return 1; }
 
     CCArena store = cc_arena_heap(megabytes(128)) @destroy;
@@ -4056,6 +4250,594 @@ int main(int argc, char** argv) {
             css_out_str(&o, "\n");
             io.write_all(cc_slice_from_buffer(linebuf, o.n)) !>;
         }
+    }
+    return 0;
+}
+
+/* ——— stylecc C ABI (Ladybird host seam) ——— */
+#include "stylecc.h"
+
+#define STYLECC_HOST_NODES 65536
+#define STYLECC_HOST_RULES 32768
+
+struct StyleCC {
+    Engine eng;
+    int* eng_of_host;
+    uint32_t cap_host;
+    uint32_t* host_of_eng;
+    uint32_t* rule_host;
+    uint32_t* atom_of; /* stylecc atom id -> we use Engine atoms; map host atom */
+    CCSlice* atom_text;
+    uint32_t natom_host, cap_atom_host;
+    uint64_t drops;
+    int indexed;
+    int pools_ready;
+};
+
+static CCSlice stylecc_atom_slice(StyleCC* sc, uint32_t a) {
+    if (!a || a >= sc->natom_host) return cc_slice_empty();
+    return sc->atom_text[a];
+}
+
+static int Engine_init_host(Engine* e, int cap_nodes, int cap_rules) {
+    e->cap_nodes = cap_nodes;
+    e->cap_rules = cap_rules;
+    e->nodes = e->store.allocT::[Node](e->cap_nodes);
+    e->rules = e->store.allocT::[Rule](e->cap_rules);
+    e->pool = map_new::[CCSlice, CCSlice](e->store);
+    e->by_id = map_new::[CCSlice, Vec::[int]](e->store);
+    e->by_class = map_new::[CCSlice, Vec::[int]](e->store);
+    e->by_type = map_new::[CCSlice, Vec::[int]](e->store);
+    e->by_parent_id = map_new::[CCSlice, Vec::[int]](e->store);
+    e->by_parent_class = map_new::[CCSlice, Vec::[int]](e->store);
+    e->by_parent_type = map_new::[CCSlice, Vec::[int]](e->store);
+    e->child_pairs = map_new::[AtomPair, Vec::[int]](e->store);
+    e->desc_pairs = map_new::[AtomPair, Vec::[int]](e->store);
+    e->left_rules = map_new::[CCSlice, Vec::[int]](e->store);
+    e->universal = vec_new::[int](e->store);
+    e->sib_by_id = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_by_class = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_by_type = map_new::[CCSlice, Vec::[int]](e->store);
+    e->sib_universal = vec_new::[int](e->store);
+    e->cap_muts = 8;
+    e->muts = e->store.allocT::[MutOp](e->cap_muts);
+    e->cap_changes = e->cap_nodes * 4 + 64;
+    e->changes = e->store.allocT::[Change](e->cap_changes);
+    e->chg_order = e->store.allocT::[uint64_t](e->cap_changes);
+    e->nchanges = 0;
+    e->inv_ids = e->store.allocT::[int](e->cap_nodes);
+    e->inv_off = e->store.allocT::[int](e->cap_nodes);
+    e->inv_sig = e->store.allocT::[uint64_t](e->cap_nodes);
+    e->rule_gen = e->store.allocT::[int](e->cap_rules);
+    e->rule_slot = e->store.allocT::[int](e->cap_rules);
+    e->inv_rules = e->store.allocT::[InvRule](e->cap_rules);
+    if (e->rule_gen) memset(e->rule_gen, 0, sizeof(int) * (size_t)e->cap_rules);
+    e->inv_stamp = 1;
+    e->bloom_stamp = 1;
+    e->fo_cap = 4 * e->cap_nodes;
+    e->fo_ids = e->store.allocT::[int](e->fo_cap);
+    e->fo_off = e->store.allocT::[int](e->fo_cap);
+    e->fo_job = e->store.allocT::[int](e->fo_cap);
+    e->fo_sig = e->store.allocT::[uint64_t](e->fo_cap);
+    e->fo_rcap = 8 * e->cap_rules;
+    e->fo_rules = e->store.allocT::[InvRule](e->fo_rcap);
+    e->fo_jcap = e->cap_changes + 8;
+    e->fo_jobs = e->store.allocT::[SrcJob](e->fo_jcap);
+    e->cap_leaf_ops = e->cap_nodes;
+    e->leaf_ops = e->store.allocT::[int](e->cap_leaf_ops);
+    e->leaf_op_parent = e->store.allocT::[int](e->cap_leaf_ops);
+    e->level_ids = e->store.allocT::[int](e->cap_nodes);
+    e->level_off = e->store.allocT::[int](64);
+    e->share_of = e->store.allocT::[int](e->cap_nodes);
+    e->share_ents = e->store.allocT::[ShareEnt](e->cap_nodes);
+    e->pnodes = e->store.allocT::[Node](2 * e->cap_nodes);
+    e->snaps = e->store.allocT::[StySnap](e->cap_nodes);
+    e->snap_of = e->store.allocT::[int](e->cap_nodes);
+    e->max_arms = 0;
+    e->hit_scratch = 0;
+    e->atom_id = map_new::[CCSlice, int](e->store);
+    e->cap_atoms = N_STATIC_ATOMS + 4 * e->cap_rules + 4096;
+    e->atoms = e->store.allocT::[CCSlice](e->cap_atoms);
+    e->natoms = 0;
+    e->viewport_w = 800;
+    e->hover_src = -1;
+    e->record_matches = 1;
+    if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
+        !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
+        !e->child_pairs || !e->desc_pairs || !e->left_rules || !e->muts || !e->changes ||
+        !e->inv_ids || !e->inv_off || !e->inv_sig || !e->rule_gen || !e->rule_slot ||
+        !e->inv_rules || !e->leaf_ops || !e->leaf_op_parent || !e->fo_ids || !e->fo_off ||
+        !e->fo_job || !e->fo_sig || !e->fo_rules || !e->fo_jobs || !e->level_ids ||
+        !e->level_off || !e->share_of || !e->share_ents || !e->pnodes || !e->snaps ||
+        !e->snap_of || !e->atom_id || !e->atoms)
+        return 0;
+    Sty_init_values();
+    for (int k = 0; k < N_STATIC_ATOMS; k++) {
+        CCSlice t = cc_slice_from_buffer((void*)ATOM_TEXT[k], strlen(ATOM_TEXT[k]));
+        if (e->atom(t) != k) return 0;
+    }
+    e->ident_div = e->intern(@slice("div"));
+    e->box_block = Sty_box_INIT;
+    e->box_block.display = A_block;
+    e->npred = 0;
+    e->root = 0;
+    e->nnodes = 0;
+    e->nrules = 0;
+    return 1;
+}
+
+StyleCC* stylecc_create(void) {
+    StyleCC* sc = (StyleCC*)calloc(1, sizeof(StyleCC));
+    if (!sc) return 0;
+    sc->eng.store = cc_arena_heap(megabytes(256));
+    if (!Engine_init_host(&sc->eng, STYLECC_HOST_NODES, STYLECC_HOST_RULES)) {
+        stylecc_destroy(sc);
+        return 0;
+    }
+    sc->cap_host = STYLECC_HOST_NODES;
+    sc->eng_of_host = (int*)calloc(sc->cap_host, sizeof(int));
+    sc->host_of_eng = (uint32_t*)calloc((size_t)STYLECC_HOST_NODES, sizeof(uint32_t));
+    sc->rule_host = (uint32_t*)calloc((size_t)STYLECC_HOST_RULES, sizeof(uint32_t));
+    sc->cap_atom_host = 4096;
+    sc->atom_text = (CCSlice*)calloc(sc->cap_atom_host, sizeof(CCSlice));
+    sc->natom_host = 1; /* 0 reserved */
+    if (!sc->eng_of_host || !sc->host_of_eng || !sc->rule_host || !sc->atom_text) {
+        stylecc_destroy(sc);
+        return 0;
+    }
+    for (uint32_t i = 0; i < sc->cap_host; i++)
+        sc->eng_of_host[i] = -1;
+    return sc;
+}
+
+void stylecc_destroy(StyleCC* sc) {
+    if (!sc) return;
+    free(sc->eng.match_rule);
+    free(sc->eng.match_pelem);
+    free(sc->eng.match_node);
+    free(sc->eng_of_host);
+    free(sc->host_of_eng);
+    free(sc->rule_host);
+    free(sc->atom_text);
+    /* Arena is not separately destroyed: process teardown. */
+    free(sc);
+}
+
+uint32_t stylecc_intern(StyleCC* sc, char const* s, size_t len) {
+    if (!sc || !s || !len) return 0;
+    CCSlice raw = cc_slice_from_buffer((void*)s, len);
+    CCSlice owned = sc->eng.intern(raw);
+    if (!owned.len) return 0;
+    /* Reuse existing host atom with same interned pointer. */
+    for (uint32_t i = 1; i < sc->natom_host; i++)
+        if (sc->atom_text[i].ptr == owned.ptr && sc->atom_text[i].len == owned.len)
+            return i;
+    if (sc->natom_host >= sc->cap_atom_host) {
+        uint32_t nc = sc->cap_atom_host * 2;
+        CCSlice* na = (CCSlice*)realloc(sc->atom_text, sizeof(CCSlice) * nc);
+        if (!na) return 0;
+        memset(na + sc->cap_atom_host, 0, sizeof(CCSlice) * (nc - sc->cap_atom_host));
+        sc->atom_text = na;
+        sc->cap_atom_host = nc;
+    }
+    uint32_t id = sc->natom_host++;
+    sc->atom_text[id] = owned;
+    return id;
+}
+
+static int stylecc_map_host(StyleCC* sc, uint32_t host_id) {
+    if (!host_id) return -1;
+    if (host_id >= sc->cap_host) {
+        uint32_t nc = host_id + 1024;
+        int* n = (int*)realloc(sc->eng_of_host, sizeof(int) * nc);
+        if (!n) return -1;
+        for (uint32_t i = sc->cap_host; i < nc; i++) n[i] = -1;
+        sc->eng_of_host = n;
+        sc->cap_host = nc;
+    }
+    return sc->eng_of_host[host_id];
+}
+
+int stylecc_ensure_node(StyleCC* sc, uint32_t host_id) {
+    if (!sc || !host_id) return -1;
+    int ei = stylecc_map_host(sc, host_id);
+    if (ei >= 0) return ei;
+    if (sc->eng.nnodes >= sc->eng.cap_nodes) return -1;
+    ei = sc->eng.nnodes++;
+    Node* nd = &sc->eng.nodes[ei];
+    memset(nd, 0, sizeof(*nd));
+    nd->parent = -1;
+    nd->first_child = nd->last_child = nd->next_sib = nd->prev_sib = -1;
+    nd->dead = 1;
+    Node_reset_style(nd);
+    sc->eng_of_host[host_id] = ei;
+    sc->host_of_eng[ei] = host_id;
+    sc->eng.reset_pseudo(ei);
+    return ei;
+}
+
+int stylecc_upsert_node(StyleCC* sc, uint32_t host_id, uint32_t parent_host,
+                        uint32_t type_atom, uint32_t id_atom,
+                        uint32_t const* class_atoms, size_t nclass,
+                        uint32_t const* attr_name_atoms, uint32_t const* attr_value_atoms,
+                        size_t nattr) {
+    if (!sc) return -1;
+    int ei = stylecc_ensure_node(sc, host_id);
+    if (ei < 0) return -1;
+    Node* nd = &sc->eng.nodes[ei];
+    int parent = -1;
+    if (parent_host != UINT32_MAX && parent_host != 0) {
+        parent = stylecc_ensure_node(sc, parent_host);
+        if (parent < 0) return -1;
+    }
+    if (!nd->dead && nd->parent >= 0) {
+        /* Detach from old parent sibling list. */
+        Node* p = &sc->eng.nodes[nd->parent];
+        if (nd->prev_sib >= 0) sc->eng.nodes[nd->prev_sib].next_sib = nd->next_sib;
+        else p->first_child = nd->next_sib;
+        if (nd->next_sib >= 0) sc->eng.nodes[nd->next_sib].prev_sib = nd->prev_sib;
+        else p->last_child = nd->prev_sib;
+    }
+    nd->dead = 0;
+    nd->parent = parent;
+    nd->tag = stylecc_atom_slice(sc, type_atom);
+    nd->dom_id = stylecc_atom_slice(sc, id_atom);
+    if (!Engine_ensure_class_cap(&sc->eng, nd, (int)nclass > MAX_CLASS ? (int)nclass : MAX_CLASS))
+        return -1;
+    nd->nclass = 0;
+    for (size_t i = 0; i < nclass && i < (size_t)nd->cap_class; i++)
+        nd->classes[nd->nclass++] = stylecc_atom_slice(sc, class_atoms[i]);
+    if (!Engine_ensure_attr_cap(&sc->eng, nd, (int)nattr > MAX_ATTR ? (int)nattr : MAX_ATTR))
+        return -1;
+    nd->nattr = 0;
+    for (size_t i = 0; i < nattr && i < (size_t)nd->cap_attr; i++) {
+        nd->attrs[nd->nattr].name = stylecc_atom_slice(sc, attr_name_atoms[i]);
+        nd->attrs[nd->nattr].value = attr_value_atoms
+            ? stylecc_atom_slice(sc, attr_value_atoms[i])
+            : cc_slice_empty();
+        nd->attrs[nd->nattr].equals = 1;
+        nd->nattr++;
+    }
+    nd->first_child = nd->last_child = nd->next_sib = nd->prev_sib = -1;
+    if (parent >= 0)
+        sc->eng.insert_child(parent, -1, ei);
+    nd->dirty = 1;
+    sc->eng.levels_stale = 1;
+    sc->eng.set_inline_rule(nd);
+    return ei;
+}
+
+int stylecc_set_connected(StyleCC* sc, uint32_t host_id, int connected,
+                          uint32_t parent_host, int sibling_index) {
+    if (!sc) return -1;
+    int ei = stylecc_ensure_node(sc, host_id);
+    if (ei < 0) return -1;
+    Node* nd = &sc->eng.nodes[ei];
+    if (!connected) {
+        if (!nd->dead && nd->parent >= 0) {
+            Node* p = &sc->eng.nodes[nd->parent];
+            if (nd->prev_sib >= 0) sc->eng.nodes[nd->prev_sib].next_sib = nd->next_sib;
+            else p->first_child = nd->next_sib;
+            if (nd->next_sib >= 0) sc->eng.nodes[nd->next_sib].prev_sib = nd->prev_sib;
+            else p->last_child = nd->prev_sib;
+        }
+        nd->dead = 1;
+        nd->parent = -1;
+        nd->dirty = 1;
+        sc->eng.levels_stale = 1;
+        return 0;
+    }
+    int parent = -1;
+    if (parent_host != UINT32_MAX && parent_host)
+        parent = stylecc_ensure_node(sc, parent_host);
+    if (!nd->dead && nd->parent >= 0) {
+        Node* p = &sc->eng.nodes[nd->parent];
+        if (nd->prev_sib >= 0) sc->eng.nodes[nd->prev_sib].next_sib = nd->next_sib;
+        else p->first_child = nd->next_sib;
+        if (nd->next_sib >= 0) sc->eng.nodes[nd->next_sib].prev_sib = nd->prev_sib;
+        else p->last_child = nd->prev_sib;
+    }
+    nd->dead = 0;
+    nd->parent = parent;
+    nd->next_sib = nd->prev_sib = -1;
+    if (parent >= 0)
+        sc->eng.insert_child(parent, sibling_index, ei);
+    nd->dirty = 1;
+    sc->eng.levels_stale = 1;
+    return 0;
+}
+
+int stylecc_apply_feature(StyleCC* sc, uint32_t host_id, int feature_kind,
+                          uint32_t name_atom, uint32_t value_atom, int present) {
+    if (!sc) return -1;
+    int ei = stylecc_ensure_node(sc, host_id);
+    if (ei < 0) return -1;
+    Node* nd = &sc->eng.nodes[ei];
+    CCSlice name = stylecc_atom_slice(sc, name_atom);
+    CCSlice value = stylecc_atom_slice(sc, value_atom);
+    if (feature_kind == STYLECC_FEAT_TAG) {
+        nd->tag = present ? value : cc_slice_empty();
+    } else if (feature_kind == STYLECC_FEAT_ID) {
+        nd->dom_id = present ? value : cc_slice_empty();
+    } else if (feature_kind == STYLECC_FEAT_CLASS) {
+        if (present) {
+            if (!Engine_ensure_class_cap(&sc->eng, nd, nd->nclass + 1)) return -1;
+            int found = 0;
+            for (int i = 0; i < nd->nclass; i++)
+                if (nd->classes[i].ptr == name.ptr) { found = 1; break; }
+            if (!found) {
+                nd->classes[nd->nclass++] = name;
+                sc->eng.log_change(ei, CH_ADD_CLASS, name, cc_slice_empty(), cc_slice_empty());
+            }
+        } else {
+            for (int i = 0; i < nd->nclass; i++) {
+                if (nd->classes[i].ptr == name.ptr) {
+                    CCSlice gone = nd->classes[i];
+                    nd->classes[i] = nd->classes[--nd->nclass];
+                    sc->eng.log_change(ei, CH_DEL_CLASS, gone, cc_slice_empty(), cc_slice_empty());
+                    break;
+                }
+            }
+        }
+    } else if (feature_kind == STYLECC_FEAT_ATTR) {
+        if (present) {
+            if (!Engine_ensure_attr_cap(&sc->eng, nd, nd->nattr + 1)) return -1;
+            int found = -1;
+            for (int i = 0; i < nd->nattr; i++)
+                if (nd->attrs[i].name.ptr == name.ptr) { found = i; break; }
+            CCSlice old = cc_slice_empty();
+            if (found < 0) {
+                found = nd->nattr++;
+                nd->attrs[found].name = name;
+            } else {
+                old = nd->attrs[found].value;
+            }
+            nd->attrs[found].value = value;
+            nd->attrs[found].equals = 1;
+            sc->eng.log_change(ei, CH_SET_ATTR, name, old, value);
+        } else {
+            for (int i = 0; i < nd->nattr; i++) {
+                if (nd->attrs[i].name.ptr == name.ptr) {
+                    CCSlice old = nd->attrs[i].value;
+                    nd->attrs[i] = nd->attrs[--nd->nattr];
+                    sc->eng.log_change(ei, CH_DEL_ATTR, name, old, cc_slice_empty());
+                    break;
+                }
+            }
+        }
+    }
+    nd->dirty = 1;
+    return 0;
+}
+
+void stylecc_set_viewport_width(StyleCC* sc, int width_px) {
+    if (!sc) return;
+    if (sc->eng.viewport_w != width_px) {
+        sc->eng.viewport_w = width_px;
+        sc->eng.resized = 1;
+    }
+}
+
+int stylecc_add_pos_pred(StyleCC* sc, int kind, int a, int b) {
+    if (!sc || sc->eng.npred >= MAX_POS) return -1;
+    char buf[64];
+    snprintf(buf, sizeof buf, "pos%d_%d_%d_%d", kind, a, b, sc->eng.npred);
+    CCSlice atom = sc->eng.intern(cc_slice_cstr(buf));
+    sc->eng.preds[sc->eng.npred].kind = kind;
+    sc->eng.preds[sc->eng.npred].a = a;
+    sc->eng.preds[sc->eng.npred].b = b;
+    sc->eng.preds[sc->eng.npred].atom = atom;
+    return sc->eng.npred++;
+}
+
+int stylecc_add_rule(StyleCC* sc, StyleCCCompound const* compounds, size_t ncomp,
+                     uint8_t const* combs, int origin, int mq_row, uint8_t pelem) {
+    if (!sc || !compounds || ncomp == 0 || ncomp > MAX_SELCOMP) return -1;
+    if (sc->eng.nrules >= sc->eng.cap_rules) return -1;
+    Engine* e = &sc->eng;
+    Rule* r = &e->rules[e->nrules];
+    memset(r, 0, sizeof(*r));
+    r->mq = mq_row;
+    r->off = !e->mq_on(mq_row);
+    r->origin = origin;
+    r->order = e->nrules;
+    r->pelem = pelem;
+    r->c = e->store.allocT::[Compound]((int)ncomp);
+    r->comb = ncomp > 1 ? e->store.allocT::[Comb]((int)ncomp - 1) : 0;
+    if (!r->c || (ncomp > 1 && !r->comb)) return -1;
+    r->n = (int)ncomp;
+    for (size_t i = 0; i < ncomp; i++) {
+        StyleCCCompound const* src = &compounds[i];
+        CompoundScratch s;
+        memset(&s, 0, sizeof s);
+        s.type = stylecc_atom_slice(sc, src->type_atom);
+        s.star = !src->type_atom;
+        s.id = stylecc_atom_slice(sc, src->id_atom);
+        if (s.id.len) s.sa++;
+        if (s.type.len && !s.star) s.sc++;
+        for (size_t c = 0; c < src->nclass && c < MAX_CLASS; c++) {
+            s.classes[s.nclass++] = stylecc_atom_slice(sc, src->class_atoms[c]);
+            s.sa++;
+        }
+        for (size_t a = 0; a < src->nattr && a < MAX_ATTR; a++) {
+            s.attr_n[s.nattr] = stylecc_atom_slice(sc, src->attr_name_atoms[a]);
+            s.attr_v[s.nattr] = src->attr_value_atoms
+                ? stylecc_atom_slice(sc, src->attr_value_atoms[a])
+                : cc_slice_empty();
+            s.attr_eq[s.nattr] = src->attr_equals ? src->attr_equals[a] : 1;
+            s.nattr++;
+            s.sb++;
+        }
+        s.pseudo = src->pos_mask;
+        s.pelem = src->pelem;
+        if (!pack_compound(e, &s, &r->c[i])) return -1;
+        r->sa += s.sa;
+        r->sb += s.sb;
+        r->sc += s.sc;
+        if (i + 1 < ncomp && combs) {
+            uint8_t cb = combs[i];
+            r->comb[i] = cb == STYLECC_COMB_CHILD ? COMB_CHILD
+                : cb == STYLECC_COMB_NEXT ? COMB_NEXT
+                : cb == STYLECC_COMB_SUBSEQ ? COMB_SUBSEQ
+                : COMB_DESC;
+        }
+    }
+    if (pelem) r->pelem = pelem;
+    else if (r->n) r->pelem = r->c[r->n - 1].pelem;
+    sc->indexed = 0;
+    return e->nrules++;
+}
+
+int stylecc_set_rule_decls(StyleCC* sc, int rule_id, StyleCCDecl const* decls, size_t ndecl) {
+    if (!sc || rule_id < 0 || rule_id >= sc->eng.nrules) return -1;
+    Rule* r = &sc->eng.rules[rule_id];
+    DeclScratch ds;
+    ds.n = 0;
+    for (size_t i = 0; i < ndecl && ds.n < DECL_SCRATCH; i++) {
+        CCSlice name = cc_slice_from_buffer((void*)decls[i].prop, decls[i].prop_len);
+        CCSlice val = cc_slice_from_buffer((void*)decls[i].value, decls[i].value_len);
+        Engine_take_decl(&sc->eng, &ds, name, val, decls[i].important);
+    }
+    if (!ds.n) {
+        r->decls = 0;
+        r->ndecl = 0;
+        r->has_imp = 0;
+        return 0;
+    }
+    r->decls = sc->eng.store.allocT::[CssDecl](ds.n);
+    if (!r->decls) return -1;
+    memcpy(r->decls, ds.d, sizeof(CssDecl) * (size_t)ds.n);
+    r->ndecl = ds.n;
+    r->has_imp = 0;
+    for (int k = 0; k < ds.n; k++)
+        if (ds.d[k].imp) r->has_imp = 1;
+    sc->pools_ready = 0;
+    return 0;
+}
+
+void stylecc_set_rule_host_id(StyleCC* sc, int rule_id, uint32_t host_rule_id) {
+    if (!sc || rule_id < 0 || rule_id >= STYLECC_HOST_RULES) return;
+    sc->rule_host[rule_id] = host_rule_id;
+}
+
+uint32_t stylecc_rule_host_id(StyleCC* sc, int rule_id) {
+    if (!sc || rule_id < 0 || rule_id >= STYLECC_HOST_RULES) return 0;
+    return sc->rule_host[rule_id];
+}
+
+int stylecc_index_rules(StyleCC* sc) {
+    if (!sc) return -1;
+    @errhandler(CCError e) { (void)e; return -1; }
+    /* Clear index maps by rebuilding empty ones. */
+    sc->eng.by_id = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.by_class = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.by_type = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.by_parent_id = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.by_parent_class = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.by_parent_type = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.child_pairs = map_new::[AtomPair, Vec::[int]](sc->eng.store);
+    sc->eng.desc_pairs = map_new::[AtomPair, Vec::[int]](sc->eng.store);
+    sc->eng.left_rules = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.universal = vec_new::[int](sc->eng.store);
+    sc->eng.sib_by_id = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.sib_by_class = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.sib_by_type = map_new::[CCSlice, Vec::[int]](sc->eng.store);
+    sc->eng.sib_universal = vec_new::[int](sc->eng.store);
+    sc->eng.index_rules() !>;
+    if (!sc->pools_ready) {
+        sc->eng.alloc_pools() !>;
+        sc->pools_ready = 1;
+    }
+    sc->indexed = 1;
+    return 0;
+}
+
+int stylecc_style_all(StyleCC* sc) {
+    if (!sc) return -1;
+    @errhandler(CCError e) { (void)e; return -1; }
+    if (!sc->indexed && stylecc_index_rules(sc) != 0) return -1;
+    sc->eng.paint_blooms();
+    sc->eng.style_all() !>;
+    return 0;
+}
+
+int stylecc_style_dirty(StyleCC* sc) {
+    if (!sc) return -1;
+    @errhandler(CCError e) { (void)e; return -1; }
+    if (!sc->indexed && stylecc_index_rules(sc) != 0) return -1;
+    sc->eng.paint_blooms_dirty();
+    sc->eng.fanout_dirty();
+    if (sc->eng.resized) sc->eng.media_dirty();
+    sc->eng.reset_dirty();
+    /* Snapshot dirty hosts before clear — take_dirty reads this stamp via last_dirty list. */
+    sc->eng.style_dirty() !>;
+    sc->eng.clear_dirty();
+    sc->eng.resized = 0;
+    sc->eng.nchanges = 0;
+    return 0;
+}
+
+void stylecc_mark_dirty(StyleCC* sc, uint32_t host_id) {
+    if (!sc) return;
+    int ei = stylecc_map_host(sc, host_id);
+    if (ei >= 0) sc->eng.nodes[ei].dirty = 1;
+}
+
+size_t stylecc_match_count(StyleCC* sc) {
+    return sc ? (size_t)sc->eng.nmatch_rec : 0;
+}
+
+size_t stylecc_take_matches(StyleCC* sc, StyleCCMatch* out, size_t cap) {
+    if (!sc || !out || !cap) return stylecc_match_count(sc);
+    size_t n = (size_t)sc->eng.nmatch_rec;
+    if (n > cap) n = cap;
+    for (size_t i = 0; i < n; i++) {
+        int ei = sc->eng.match_node[i];
+        out[i].host_node = ei >= 0 && ei < STYLECC_HOST_NODES ? sc->host_of_eng[ei] : 0;
+        out[i].rule_id = sc->eng.match_rule[i];
+        out[i].pelem = sc->eng.match_pelem[i];
+    }
+    return (size_t)sc->eng.nmatch_rec;
+}
+
+size_t stylecc_dirty_count(StyleCC* sc) {
+    return sc ? (size_t)sc->eng.last_dirty : 0;
+}
+
+size_t stylecc_take_dirty(StyleCC* sc, uint32_t* out, size_t cap) {
+    if (!sc) return 0;
+    size_t total = (size_t)sc->eng.last_dirty;
+    size_t n = 0;
+    for (size_t i = 0; i < total; i++) {
+        int ei = sc->eng.inv_ids[i];
+        if (out && n < cap) out[n++] = sc->host_of_eng[ei];
+    }
+    return total;
+}
+
+void stylecc_note_drop(StyleCC* sc, char const* reason) {
+    (void)reason;
+    if (sc) sc->drops++;
+}
+
+uint64_t stylecc_drop_count(StyleCC* sc) {
+    return sc ? sc->drops : 0;
+}
+
+int stylecc_load_fixture(StyleCC* sc, char const* text, size_t len) {
+    if (!sc || !text) return -1;
+    @errhandler(CCError e) { (void)e; return -1; }
+    /* Host engines already allocated; fixture path is for ABI tests only.
+     * Re-init from scratch. */
+    memset(&sc->eng, 0, sizeof(sc->eng));
+    sc->eng.store = cc_arena_heap(megabytes(128));
+    sc->eng.load_fixture(cc_slice_from_buffer((void*)text, len)) !>;
+    sc->eng.record_matches = 1;
+    sc->indexed = 1;
+    sc->pools_ready = 1;
+    for (int i = 0; i < sc->eng.nnodes && (uint32_t)i < sc->cap_host; i++) {
+        sc->eng_of_host[i + 1] = i; /* synthetic host ids 1..n */
+        sc->host_of_eng[i] = (uint32_t)(i + 1);
     }
     return 0;
 }

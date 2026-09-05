@@ -134,11 +134,15 @@ struct Slot {
     has_snapshot: Cell<bool>,
     handled_snapshot: Cell<bool>,
     dead: Cell<bool>,
+    hover: bool,
 }
 
 pub struct HostDoc {
     slots: Vec<Slot>,
     lock: SharedRwLock,
+    /// Fixture id the pointer is over; hover bits sit on that node and
+    /// its ancestors. `None` when nothing is hovered.
+    hover_src: Option<i32>,
 }
 
 impl HostDoc {
@@ -168,6 +172,7 @@ impl HostDoc {
             has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
+            hover: false,
         });
         for n in &fix.nodes {
             let parent = if n.parent < 0 {
@@ -203,6 +208,7 @@ impl HostDoc {
                 has_snapshot: Cell::new(false),
                 handled_snapshot: Cell::new(true),
                 dead: Cell::new(false),
+                hover: false,
             });
         }
         for i in 1..slots.len() {
@@ -218,7 +224,11 @@ impl HostDoc {
         for s in &mut slots {
             s.style_attr = parse_inline_style(&s.attrs, &lock);
         }
-        let mut boxed = Box::new(HostDoc { slots, lock });
+        let mut boxed = Box::new(HostDoc {
+            slots,
+            lock,
+            hover_src: None,
+        });
         let doc_ptr = &*boxed as *const HostDoc;
         for s in &mut boxed.slots {
             s.doc = doc_ptr;
@@ -308,6 +318,25 @@ impl HostDoc {
         let class_name = LocalName::from("class");
         if !snap.changed_attrs.iter().any(|n| n == &class_name) {
             snap.changed_attrs.push(class_name);
+        }
+        self.note_dirty_path(fixture_id);
+    }
+
+    fn snapshot_hover(&self, snapshots: &mut SnapshotMap, fixture_id: i32) {
+        let Some(slot_id) = (fixture_id as u32).checked_add(1) else {
+            return;
+        };
+        if slot_id as usize >= self.slots.len() || self.slots[slot_id as usize].dead.get() {
+            return;
+        }
+        let old = if self.slots[slot_id as usize].hover {
+            stylo_dom::ElementState::HOVER
+        } else {
+            stylo_dom::ElementState::empty()
+        };
+        let snap = self.ensure_snapshot(snapshots, slot_id);
+        if snap.state.is_none() {
+            snap.state = Some(old);
         }
         self.note_dirty_path(fixture_id);
     }
@@ -498,6 +527,66 @@ impl HostDoc {
         }
     }
 
+    /// Fixture ids from `id` up to `#testroot` (document slot 0 is not an element).
+    fn hover_chain(&self, id: i32) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut cur = Some(id);
+        while let Some(fid) = cur {
+            let Some(sid) = (fid as u32).checked_add(1) else {
+                break;
+            };
+            if sid as usize >= self.slots.len() || self.slots[sid as usize].dead.get() {
+                break;
+            }
+            out.push(fid);
+            cur = self.slots[sid as usize]
+                .parent
+                .and_then(|p| if p == 0 { None } else { Some(p as i32 - 1) });
+        }
+        out
+    }
+
+    fn write_hover(&mut self, snapshots: &mut SnapshotMap, id: i32, on: bool) {
+        let Some(s) = self.fixture_slot(id) else {
+            return;
+        };
+        if s.dead.get() || s.hover == on {
+            return;
+        }
+        self.snapshot_hover(snapshots, id);
+        if let Some(s) = self.fixture_slot(id) {
+            s.hover = on;
+        }
+    }
+
+    fn set_hover_chain(&mut self, snapshots: &mut SnapshotMap, id: i32) {
+        let next = self.hover_chain(id);
+        if next.is_empty() {
+            return;
+        }
+        if let Some(src) = self.hover_src {
+            if src != id {
+                for old in self.hover_chain(src) {
+                    if !next.contains(&old) {
+                        self.write_hover(snapshots, old, false);
+                    }
+                }
+            }
+        }
+        for fid in &next {
+            self.write_hover(snapshots, *fid, true);
+        }
+        self.hover_src = Some(id);
+    }
+
+    fn clear_hover_chain(&mut self, snapshots: &mut SnapshotMap, id: i32) {
+        let src = self.hover_src.unwrap_or(id);
+        for fid in self.hover_chain(src) {
+            self.write_hover(snapshots, fid, false);
+        }
+        self.hover_src = None;
+    }
+
     pub fn apply_mut(&mut self, m: &Mut, snapshots: &mut SnapshotMap) {
         match m {
             Mut::AddClass { id, class } => {
@@ -577,6 +666,8 @@ impl HostDoc {
                 }
                 self.remove_leaf(*id);
             }
+            Mut::SetHover { id } => self.set_hover_chain(snapshots, *id),
+            Mut::ClearHover { id } => self.clear_hover_chain(snapshots, *id),
             Mut::Resize { .. } | Mut::Restyle => {}
         }
     }
@@ -629,6 +720,7 @@ impl HostDoc {
             has_snapshot: Cell::new(false),
             handled_snapshot: Cell::new(true),
             dead: Cell::new(false),
+            hover: false,
         });
         let doc_ptr = &*self as *const HostDoc;
         self.slots[new_id as usize].doc = doc_ptr;
@@ -941,9 +1033,12 @@ impl SelectorsElement for Elem {
     }
     fn match_non_ts_pseudo_class(
         &self,
-        _: &<Self::Impl as SelectorImpl>::NonTSPseudoClass,
+        pc: &<Self::Impl as SelectorImpl>::NonTSPseudoClass,
         _: &mut MatchingContext<Self::Impl>,
     ) -> bool {
+        if pc.state_flag().intersects(stylo_dom::ElementState::HOVER) {
+            return self.slot().hover;
+        }
         false
     }
     fn match_pseudo_element(
@@ -1071,7 +1166,11 @@ impl TElement for Elem {
         None
     }
     fn state(&self) -> stylo_dom::ElementState {
-        stylo_dom::ElementState::empty()
+        if self.slot().hover {
+            stylo_dom::ElementState::HOVER
+        } else {
+            stylo_dom::ElementState::empty()
+        }
     }
     fn has_part_attr(&self) -> bool {
         false

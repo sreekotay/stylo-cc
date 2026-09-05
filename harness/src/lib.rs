@@ -312,6 +312,8 @@ pub enum Mut {
     /// Viewport width in CSS px (StyleBench `resizeViewToWidth`).
     Resize { width: i32 },
     Restyle,
+    SetHover { id: i32 },
+    ClearHover { id: i32 },
 }
 
 #[derive(Clone, Debug)]
@@ -988,6 +990,8 @@ impl Fixture {
                 Mut::RemoveLeaf { id } => writeln!(out, "-leaf\t{id}")?,
                 Mut::Resize { width } => writeln!(out, "resize\t{width}")?,
                 Mut::Restyle => writeln!(out, "restyle")?,
+                Mut::SetHover { id } => writeln!(out, "+hover\t{id}")?,
+                Mut::ClearHover { id } => writeln!(out, "-hover\t{id}")?,
             }
         }
         Ok(())
@@ -1169,6 +1173,12 @@ fn parse_mut_line(line: &str) -> Result<Mut, String> {
         }),
         "resize" if cols.len() >= 2 => Ok(Mut::Resize {
             width: cols[1].parse().map_err(|_| "width")?,
+        }),
+        "+hover" if cols.len() >= 2 => Ok(Mut::SetHover {
+            id: cols[1].parse().map_err(|_| "id")?,
+        }),
+        "-hover" if cols.len() >= 2 => Ok(Mut::ClearHover {
+            id: cols[1].parse().map_err(|_| "id")?,
         }),
         _ => Err(format!("bad mut line: {line}")),
     }

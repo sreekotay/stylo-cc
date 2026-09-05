@@ -1,0 +1,10 @@
+machine: Apple M5, 10 cores, macOS 26.5.2
+chrome:  Google Chrome 152.0.7977.76 
+safari:  26.5.2
+node:    v24.14.0, playwright Version 1.62.1
+ladybird: a1db2e3a 2026-09-04 (Distribution)
+Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters)
+/Users/airm5/Documents/code/stylo-cc/ladybird/Build/distribution/bin/Ladybird.app/Contents/MacOS/Ladybird
+running http://127.0.0.1:8766/StyleBench/index.html?unit=ms&iterationCount=1
+Ladybird exited early (code null, signal SIGTERM)
+no iterations completed

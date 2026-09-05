@@ -49,9 +49,9 @@ echo "== stylo release =="
     "$FIX" > "$FULL/$OUT.stylo.txt"
 
 echo "== cc -O (warm) =="
-"$CCC" build run -O "$ROOT/engine/stylebench_cc.ccs" -- "$FIX" > /dev/null
+CC_OPT=-O "$ROOT/scripts/cc-run.sh" "$FIX" > /dev/null
 echo "== cc -O =="
-"$CCC" build run -O "$ROOT/engine/stylebench_cc.ccs" -- "$FIX" \
+CC_OPT=-O "$ROOT/scripts/cc-run.sh" "$FIX" \
     > "$FULL/$OUT.cc.txt"
 
 tmp="$(mktemp -d)"

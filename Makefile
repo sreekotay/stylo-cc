@@ -6,7 +6,7 @@ RECEIPTS ?= receipts
 FIXTURES ?= fixtures
 CCC ?= ccc
 
-.PHONY: longhands setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media test build release bench help
+.PHONY: longhands setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media libstylecc test-abi test build release bench help
 
 help:
 	@echo "fixture         tiny suite (81 / 40) for the compile loop"
@@ -24,11 +24,19 @@ help:
 	@echo "bench-nth       nth 20k/5k, same shape as bench-sibling"
 	@echo "bench-ba        before/after 20k/5k, same shape as bench-sibling"
 	@echo "bench-media     media queries 5k/5k, 55 resizes, same shape as bench-sibling"
+	@echo "libstylecc      build lib/libstylecc.a (C ABI for Ladybird seam)"
+	@echo "test-abi        libstylecc smoke: rule match + class remove + fixture load"
 	@echo "longhands       regenerate engine/longhands.cch from Stylo's --longhands dump + longhands.toml"
 	@echo "test            upstream cargo test --workspace"
 
 setup:
 	git submodule update --init --depth 1
+
+libstylecc:
+	./scripts/build-libstylecc.sh
+
+test-abi: libstylecc
+	./scripts/test-stylecc-abi.sh
 
 # Stylo's content-longhand list -> the table the engine's @comptime block walks.
 longhands: $(STYLO)/Cargo.toml
@@ -45,7 +53,7 @@ stylo-run: fixture
 
 cc-run: fixture
 	mkdir -p $(RECEIPTS)
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny.stylebench > $(RECEIPTS)/tiny.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny.stylebench > $(RECEIPTS)/tiny.cc.txt
 
 fixture-default: $(STYLO)/Cargo.toml
 	mkdir -p $(FIXTURES)
@@ -74,7 +82,7 @@ fixture-media-tiny: $(STYLO)/Cargo.toml
 compare-sibling: fixture-sibling-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_sibling.stylebench > $(RECEIPTS)/tiny_sibling.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_sibling.stylebench > $(RECEIPTS)/tiny_sibling.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny_sibling.stylebench > $(RECEIPTS)/tiny_sibling.cc.txt
 	@grep -v '^#' $(RECEIPTS)/tiny_sibling.stylo.txt > /tmp/stylo.sib
 	@grep -v '^#' $(RECEIPTS)/tiny_sibling.cc.txt > /tmp/cc.sib
 	cmp /tmp/stylo.sib /tmp/cc.sib
@@ -84,7 +92,7 @@ compare-sibling: fixture-sibling-tiny
 compare-structural: fixture-structural-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_structural.stylebench > $(RECEIPTS)/tiny_structural.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_structural.stylebench > $(RECEIPTS)/tiny_structural.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny_structural.stylebench > $(RECEIPTS)/tiny_structural.cc.txt
 	@grep -v '^#' $(RECEIPTS)/tiny_structural.stylo.txt > /tmp/stylo.str
 	@grep -v '^#' $(RECEIPTS)/tiny_structural.cc.txt > /tmp/cc.str
 	cmp /tmp/stylo.str /tmp/cc.str
@@ -94,7 +102,7 @@ compare-structural: fixture-structural-tiny
 compare-nth: fixture-nth-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_nth.stylebench > $(RECEIPTS)/tiny_nth.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_nth.stylebench > $(RECEIPTS)/tiny_nth.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny_nth.stylebench > $(RECEIPTS)/tiny_nth.cc.txt
 	@grep -v '^#' $(RECEIPTS)/tiny_nth.stylo.txt > /tmp/stylo.nth
 	@grep -v '^#' $(RECEIPTS)/tiny_nth.cc.txt > /tmp/cc.nth
 	cmp /tmp/stylo.nth /tmp/cc.nth
@@ -104,7 +112,7 @@ compare-nth: fixture-nth-tiny
 compare-ba: fixture-ba-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_ba.stylebench > $(RECEIPTS)/tiny_ba.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_ba.stylebench > $(RECEIPTS)/tiny_ba.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny_ba.stylebench > $(RECEIPTS)/tiny_ba.cc.txt
 	@grep -v '^#' $(RECEIPTS)/tiny_ba.stylo.txt > /tmp/stylo.ba
 	@grep -v '^#' $(RECEIPTS)/tiny_ba.cc.txt > /tmp/cc.ba
 	cmp /tmp/stylo.ba /tmp/cc.ba
@@ -114,7 +122,7 @@ compare-ba: fixture-ba-tiny
 compare-media: fixture-media-tiny
 	mkdir -p $(RECEIPTS)
 	$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $(FIXTURES)/tiny_media.stylebench > $(RECEIPTS)/tiny_media.stylo.txt
-	$(CCC) run engine/stylebench_cc.ccs -- $(FIXTURES)/tiny_media.stylebench > $(RECEIPTS)/tiny_media.cc.txt
+	./scripts/cc-run.sh $(FIXTURES)/tiny_media.stylebench > $(RECEIPTS)/tiny_media.cc.txt
 	@grep -v '^#' $(RECEIPTS)/tiny_media.stylo.txt > /tmp/stylo.media
 	@grep -v '^#' $(RECEIPTS)/tiny_media.cc.txt > /tmp/cc.media
 	cmp /tmp/stylo.media /tmp/cc.media
@@ -137,7 +145,7 @@ compare-local:
 		name=$$(basename $$f .stylebench); \
 		echo "== $$name =="; \
 		$(CARGO) run -q --manifest-path stylo-runner/Cargo.toml -- $$f > $(RECEIPTS)/$$name.stylo.txt; \
-		$(CCC) run engine/stylebench_cc.ccs -- $$f > $(RECEIPTS)/$$name.cc.txt; \
+		./scripts/cc-run.sh $$f > $(RECEIPTS)/$$name.cc.txt; \
 		grep -v '^#' $(RECEIPTS)/$$name.stylo.txt > /tmp/stylo.local; \
 		grep -v '^#' $(RECEIPTS)/$$name.cc.txt > /tmp/cc.local; \
 		cmp /tmp/stylo.local /tmp/cc.local; \
@@ -151,7 +159,7 @@ bench-style: fixture-default
 	mkdir -p $(RECEIPTS)/full
 	$(CARGO) run -q --release --manifest-path stylo-runner/Cargo.toml -- \
 		$(FIXTURES)/default.stylebench > $(RECEIPTS)/full/default.stylo.txt
-	$(CCC) build run -O engine/stylebench_cc.ccs -- \
+	CC_OPT=-O ./scripts/cc-run.sh \
 		$(FIXTURES)/default.stylebench > $(RECEIPTS)/full/default.cc.txt
 	@grep -v '^#' $(RECEIPTS)/full/default.stylo.txt > /tmp/stylo.styles
 	@grep -v '^#' $(RECEIPTS)/full/default.cc.txt > /tmp/cc.styles

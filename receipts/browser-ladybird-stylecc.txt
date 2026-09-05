@@ -1,0 +1,172 @@
+machine: Apple M5, 10 cores, macOS 26.5.2
+chrome:  Google Chrome 152.0.7977.76 
+safari:  26.5.2
+node:    v24.14.0, playwright Version 1.62.1
+ladybird: a1db2e3a 2026-09-04 (Distribution)
+Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters)
+/Users/airm5/Documents/code/stylo-cc/ladybird/Build/distribution/bin/Ladybird.app/Contents/MacOS/Ladybird
+running http://127.0.0.1:8766/StyleBench/index.html?unit=ms&iterationCount=5
+  [2s] Descendant and child combinators / Adding classes - 0
+  [2s] Descendant and child combinators / Removing classes - 0
+  [2s] Descendant and child combinators / Mutating attributes - 0
+  [2s] Descendant and child combinators / Adding leaf elements - 0
+  [2s] Descendant and child combinators / Removing leaf elements - 0
+  [2s] Descendant and child combinators / Adding classes - 1
+  [2s] Descendant and child combinators / Removing classes - 1
+  [2s] Descendant and child combinators / Mutating attributes - 1
+  [2s] Descendant and child combinators / Adding leaf elements - 1
+  [2s] Descendant and child combinators / Removing leaf elements - 1
+  [2s] Descendant and child combinators / Adding classes - 2
+  [2s] Descendant and child combinators / Removing classes - 2
+  [2s] Descendant and child combinators / Mutating attributes - 2
+  [2s] Descendant and child combinators / Adding leaf elements - 2
+  [2s] Descendant and child combinators / Removing leaf elements - 2
+  [2s] Descendant and child combinators / Adding classes - 3
+  [2s] Descendant and child combinators / Removing classes - 3
+  [2s] Descendant and child combinators / Mutating attributes - 3
+  [2s] Descendant and child combinators / Adding leaf elements - 3
+  [2s] Descendant and child combinators / Removing leaf elements - 3
+  [2s] Descendant and child combinators / Adding classes - 4
+  [2s] Descendant and child combinators / Removing classes - 4
+  [2s] Descendant and child combinators / Mutating attributes - 4
+  [2s] Descendant and child combinators / Adding leaf elements - 4
+  [2s] Descendant and child combinators / Removing leaf elements - 4
+  [2s] iteration 1/5 done
+  [3s] Descendant and child combinators / Adding classes - 0
+  [3s] Descendant and child combinators / Removing classes - 0
+  [3s] Descendant and child combinators / Mutating attributes - 0
+  [3s] Descendant and child combinators / Adding leaf elements - 0
+  [3s] Descendant and child combinators / Removing leaf elements - 0
+  [3s] Descendant and child combinators / Adding classes - 1
+  [3s] Descendant and child combinators / Removing classes - 1
+  [3s] Descendant and child combinators / Mutating attributes - 1
+  [3s] Descendant and child combinators / Adding leaf elements - 1
+  [3s] Descendant and child combinators / Removing leaf elements - 1
+  [3s] Descendant and child combinators / Adding classes - 2
+  [3s] Descendant and child combinators / Removing classes - 2
+  [3s] Descendant and child combinators / Mutating attributes - 2
+  [3s] Descendant and child combinators / Adding leaf elements - 2
+  [3s] Descendant and child combinators / Removing leaf elements - 2
+  [3s] Descendant and child combinators / Adding classes - 3
+  [3s] Descendant and child combinators / Removing classes - 3
+  [3s] Descendant and child combinators / Mutating attributes - 3
+  [3s] Descendant and child combinators / Adding leaf elements - 3
+  [3s] Descendant and child combinators / Removing leaf elements - 3
+  [3s] Descendant and child combinators / Adding classes - 4
+  [3s] Descendant and child combinators / Removing classes - 4
+  [3s] Descendant and child combinators / Mutating attributes - 4
+  [3s] Descendant and child combinators / Adding leaf elements - 4
+  [3s] Descendant and child combinators / Removing leaf elements - 4
+  [3s] iteration 2/5 done
+  [3s] Descendant and child combinators / Adding classes - 0
+  [3s] Descendant and child combinators / Removing classes - 0
+  [3s] Descendant and child combinators / Mutating attributes - 0
+  [3s] Descendant and child combinators / Adding leaf elements - 0
+  [3s] Descendant and child combinators / Removing leaf elements - 0
+  [3s] Descendant and child combinators / Adding classes - 1
+  [3s] Descendant and child combinators / Removing classes - 1
+  [3s] Descendant and child combinators / Mutating attributes - 1
+  [3s] Descendant and child combinators / Adding leaf elements - 1
+  [3s] Descendant and child combinators / Removing leaf elements - 1
+  [3s] Descendant and child combinators / Adding classes - 2
+  [3s] Descendant and child combinators / Removing classes - 2
+  [3s] Descendant and child combinators / Mutating attributes - 2
+  [3s] Descendant and child combinators / Adding leaf elements - 2
+  [3s] Descendant and child combinators / Removing leaf elements - 2
+  [3s] Descendant and child combinators / Adding classes - 3
+  [3s] Descendant and child combinators / Removing classes - 3
+  [3s] Descendant and child combinators / Mutating attributes - 3
+  [3s] Descendant and child combinators / Adding leaf elements - 3
+  [3s] Descendant and child combinators / Removing leaf elements - 3
+  [3s] Descendant and child combinators / Adding classes - 4
+  [3s] Descendant and child combinators / Removing classes - 4
+  [3s] Descendant and child combinators / Mutating attributes - 4
+  [3s] Descendant and child combinators / Adding leaf elements - 4
+  [4s] Descendant and child combinators / Removing leaf elements - 4
+  [4s] iteration 3/5 done
+  [4s] Descendant and child combinators / Adding classes - 0
+  [4s] Descendant and child combinators / Removing classes - 0
+  [4s] Descendant and child combinators / Mutating attributes - 0
+  [4s] Descendant and child combinators / Adding leaf elements - 0
+  [4s] Descendant and child combinators / Removing leaf elements - 0
+  [4s] Descendant and child combinators / Adding classes - 1
+  [4s] Descendant and child combinators / Removing classes - 1
+  [4s] Descendant and child combinators / Mutating attributes - 1
+  [4s] Descendant and child combinators / Adding leaf elements - 1
+  [4s] Descendant and child combinators / Removing leaf elements - 1
+  [4s] Descendant and child combinators / Adding classes - 2
+  [4s] Descendant and child combinators / Removing classes - 2
+  [4s] Descendant and child combinators / Mutating attributes - 2
+  [4s] Descendant and child combinators / Adding leaf elements - 2
+  [4s] Descendant and child combinators / Removing leaf elements - 2
+  [4s] Descendant and child combinators / Adding classes - 3
+  [4s] Descendant and child combinators / Removing classes - 3
+  [4s] Descendant and child combinators / Mutating attributes - 3
+  [4s] Descendant and child combinators / Adding leaf elements - 3
+  [4s] Descendant and child combinators / Removing leaf elements - 3
+  [4s] Descendant and child combinators / Adding classes - 4
+  [4s] Descendant and child combinators / Removing classes - 4
+  [4s] Descendant and child combinators / Mutating attributes - 4
+  [4s] Descendant and child combinators / Adding leaf elements - 4
+  [4s] Descendant and child combinators / Removing leaf elements - 4
+  [4s] iteration 4/5 done
+  [4s] Descendant and child combinators / Adding classes - 0
+  [4s] Descendant and child combinators / Removing classes - 0
+  [4s] Descendant and child combinators / Mutating attributes - 0
+  [4s] Descendant and child combinators / Adding leaf elements - 0
+  [4s] Descendant and child combinators / Removing leaf elements - 0
+  [4s] Descendant and child combinators / Adding classes - 1
+  [4s] Descendant and child combinators / Removing classes - 1
+  [5s] Descendant and child combinators / Mutating attributes - 1
+  [5s] Descendant and child combinators / Adding leaf elements - 1
+  [5s] Descendant and child combinators / Removing leaf elements - 1
+  [5s] Descendant and child combinators / Adding classes - 2
+  [5s] Descendant and child combinators / Removing classes - 2
+  [5s] Descendant and child combinators / Mutating attributes - 2
+  [5s] Descendant and child combinators / Adding leaf elements - 2
+  [5s] Descendant and child combinators / Removing leaf elements - 2
+  [5s] Descendant and child combinators / Adding classes - 3
+  [5s] Descendant and child combinators / Removing classes - 3
+  [5s] Descendant and child combinators / Mutating attributes - 3
+  [5s] Descendant and child combinators / Adding leaf elements - 3
+  [5s] Descendant and child combinators / Removing leaf elements - 3
+  [5s] Descendant and child combinators / Adding classes - 4
+  [5s] Descendant and child combinators / Removing classes - 4
+  [5s] Descendant and child combinators / Mutating attributes - 4
+  [5s] Descendant and child combinators / Adding leaf elements - 4
+  [5s] Descendant and child combinators / Removing leaf elements - 4
+  [5s] iteration 5/5 done
+userAgent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Ladybird/1.0 Chrome/146.0.0.0 AppleWebKit/537.36 Safari/537.36
+
+== Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters): StyleBench, 5 iteration(s), ms (sync = style + layout flush; async = constant 1/step) ==
+
+suite                                iter steps   sync ms  async ms  total ms
+Descendant and child combinators        1    25     249.0      25.0     274.0
+Descendant and child combinators        2    25     205.4      25.0     230.4
+Descendant and child combinators        3    25     208.2      25.0     233.2
+Descendant and child combinators        4    25     206.3      25.0     231.3
+Descendant and child combinators        5    25     210.7      25.0     235.7
+
+suite (over iterations)              steps  sync mean  sync min  total mean
+Descendant and child combinators        25      215.9     205.4       240.9
+
+per step kind, sync ms summed over the suite's steps of that kind, mean over iterations:
+  Descendant and child combinators  Adding classes=44.5  Removing classes=39.9  Mutating attributes=16.0  Adding leaf elements=66.8  Removing leaf elements=48.8
+
+StyleBench score (runs/min = 60000 / geomean(suite totals) / 1.5): mean 166.75  [146.0, 173.6, 171.5, 172.9, 169.7]
+geomean of suite totals, ms: mean 240.9  [274.0, 230.4, 233.2, 231.3, 235.7]
+
+== Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters): Ladybird internals style clock, ms (Document::update_style; style only, no layout) ==
+suite                                iter steps     sync    style   engine recompute pre-flush init style init engine init wall   live
+Descendant and child combinators        1    25    249.0    110.1     94.3      14.1       4.4       99.1        64.7     147.8  20000
+Descendant and child combinators        2    25    205.4    107.0     92.9      12.5       4.9       97.1        63.4       145  20000
+Descendant and child combinators        3    25    208.2    109.3     94.6      13.0       4.6      100.5        64.9     148.6  20000
+Descendant and child combinators        4    25    206.3    107.3     92.5      13.3       4.2       97.4        63.5     144.3  20000
+Descendant and child combinators        5    25    210.7    108.8     94.2      13.0       4.7       97.5        63.4     144.3  20000
+
+suite (min over iterations)               steps     sync    style   engine recompute pre-flush init style init engine init wall   live
+Descendant and child combinators             25    205.4    107.0     92.5      12.5       4.2       97.1        63.4     144.3  20000
+
+sync = StyleBench step clock (JS + style + layout). style = styleUpdateMicroseconds over the suite's steps; engine = styleEngineTransactionSetup + styleEnginePlanning (Rust StyleEngine:
+matching / invalidation / cascade identities); recompute = styleRecomputeMicroseconds (C++ ComputedValues materialization). pre-flush = update_style spent in the pre-step flushes (work
+deferred out of a step lands here). init = the flush we force right after createBenchmark(): style / engine part / wall (incl. layout); live = elements under #testroot.

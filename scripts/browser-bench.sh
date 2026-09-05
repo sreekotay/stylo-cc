@@ -88,7 +88,17 @@ ladybird_build() {
   for t in cmake ninja nasm autoconf automake glibtool pkg-config; do
     command -v "$t" >/dev/null || { echo "missing $t: brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config"; exit 1; }
   done
+  # Optional: LIBWEB_STYLE_ENGINE=cc builds Ladybird with the Concurrent-C StyleEngine host.
+  local cmake_extra=()
+  if [ "${LIBWEB_STYLE_ENGINE:-}" = "cc" ]; then
+    "$ROOT/scripts/build-libstylecc.sh"
+    cmake_extra+=(-DLIBWEB_STYLE_ENGINE_CC=ON "-DSTYLECC_ROOT=$ROOT")
+  fi
   (cd "$ROOT/ladybird" && BUILD_PRESET=Distribution ./Meta/ladybird.py build ladybird)
+  if [ "${#cmake_extra[@]}" -gt 0 ] && [ -d "$ROOT/ladybird/Build/distribution" ]; then
+    cmake -S "$ROOT/ladybird" -B "$ROOT/ladybird/Build/distribution" "${cmake_extra[@]}"
+    cmake --build "$ROOT/ladybird/Build/distribution" --target ladybird -j"$(sysctl -n hw.ncpu)"
+  fi
   echo "built $LB_BIN"
 }
 

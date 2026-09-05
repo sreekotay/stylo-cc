@@ -1,0 +1,64 @@
+# stylebench-fixture 1
+# name=user-action-hover
+# :hover is a node bit. +hover N is the pointer over N, so the bit is
+# written on N and its ancestors. Subject, descendant, sibling, :not / :is,
+# leftover drop, child hover lights the parent.
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#self:hover { padding-left: 8px; }
+#box:hover .deep { background-color: rgb(10, 20, 30); }
+#a:hover + #b { padding-top: 4px; }
+#a:hover ~ #c { padding-bottom: 6px; }
+span:not(:hover) { padding-right: 2px; }
+:is(#iso:hover) { padding-left: 12px; }
+:where(:hover) { padding-top: 30px; }
+#iso { padding-top: 1px; }
+:hover() { padding-left: 99px; }
+span:hover { margin-top: 3px; }
+---tree---
+0	-1	div	testroot		
+1	0	span	self		
+2	0	span	box		
+3	2	span	deep		
+4	0	span	a		
+5	0	span	b		
+6	0	span	c		
+7	0	span	iso		
+8	0	span	other		
+9	0	span	-		
+10	0	span	-		
+---mut---
++hover	1
+restyle
+-hover	1
+restyle
++hover	2
+restyle
+-hover	2
+restyle
++hover	3
+restyle
+-hover	3
+restyle
++hover	4
+restyle
+-hover	4
+restyle
++hover	7
+restyle
+-hover	7
+restyle
++hover	9
+restyle
+-hover	9
+restyle

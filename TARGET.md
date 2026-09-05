@@ -28,6 +28,7 @@ A styling engine — tree, match, cascade, computed values, inherit, invalidatio
 - **One family of matches.** Descendant / child / sibling combinators, structural and `:nth-*` pseudo-classes, `::before` / `::after`, `@media` are all compound facts in the same buckets and the same `match_from`. No property, selector, or suite is special-cased; no option is tuned per suite (workers size themselves).
 - **Sequential first, parallel once the relations are nameable.** Match runs `@parallel for` over share canons in worker-sized arms; signature and invalidation passes run in parallel because they only read the tree; share, inherit, and the change-log staging are serial.
 - **Stylo's storage cut without Stylo's `Arc`s.** One pointer per style family; initial or parent until a declaration lands, then the node's own slot. Inherit is a parent hop, and an inherited change on a restyled node re-inherits its clean descendants.
+- **Mutation writes.** Redis-shaped `CCExclHold` tickets (`domain.hold*` + `@destroy`).
 
 ## Gate and receipts
 

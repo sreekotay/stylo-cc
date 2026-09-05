@@ -3958,7 +3958,7 @@ static void !>(CCError) Engine_run_mutations(Engine* e, CCShardDomain* domain, d
         if (end > start) {
             uint64_t names[MAX_SHARDS];
             size_t nnames = unique_node_shards(domain->mask, ids, nids, names, MAX_SHARDS);
-            CCShardHold hold = nnames
+            CCExclHold hold = nnames
                 ? domain->hold_sorted(names, nnames)
                 : domain->hold_all();
             @defer hold.release();

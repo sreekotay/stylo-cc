@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { U_NUM = 0, U_PX, U_EM, U_REM, U_PCT };
+enum { U_NUM = 0, U_PX, U_EM, U_REM, U_PCT, U_CALC };
 enum { LKW_NONE = 0, LKW_AUTO, LKW_NORMAL, LKW_NONE_KW, LKW_MAX_CONTENT,
        LKW_MIN_CONTENT, LKW_FIT_CONTENT, LKW_BOLDER, LKW_LIGHTER, N_LKW };
 static const char* const LKW_TEXT[N_LKW] = {
@@ -21,11 +21,14 @@ static const char* const LKW_TEXT[N_LKW] = {
     "bolder", "lighter"
 };
 
-/* v is the specified number; px is what it resolves to (em / rem / % on
- * font-size). Keeping v means a re-inherit re-resolves exactly. */
+/* Specified length is a linear combination of four bases (px / em / rem / %).
+ * A plain `2em` is c_em=2; `calc(2em + 4px)` is mixed (unit U_CALC).
+ * `v` is the single-basis specified number (same role as before); the c_*
+ * coeffs are the specified tuple used to re-resolve. `px` is computed. */
 typedef struct {
     float v;
     float px;
+    float c_px, c_em, c_rem, c_pct;
     uint8_t unit;
     uint8_t kw;
 } CssLen;
@@ -52,6 +55,187 @@ static int cssval_eq(const char* s, size_t n, const char* lit) {
     return 1;
 }
 
+typedef struct {
+    float px, em, rem, pct;
+    int is_len;
+    int saw_pct;
+} CssCalc;
+
+static int cssval_calc_skip(const char* s, size_t n, size_t* i) {
+    while (*i < n && (s[*i] == ' ' || s[*i] == '\t' || s[*i] == '\n' || s[*i] == '\r')) (*i)++;
+    return *i < n;
+}
+
+static int cssval_calc_num(const char* s, size_t n, size_t* i, double* out) {
+    size_t k = *i;
+    int neg = 0, digits = 0;
+    double v = 0;
+    if (k < n && (s[k] == '-' || s[k] == '+')) { neg = s[k] == '-'; k++; }
+    while (k < n && s[k] >= '0' && s[k] <= '9') { v = v * 10 + (s[k] - '0'); k++; digits++; }
+    if (k < n && s[k] == '.') {
+        k++;
+        double f = 0.1;
+        while (k < n && s[k] >= '0' && s[k] <= '9') { v += (s[k] - '0') * f; f *= 0.1; k++; digits++; }
+    }
+    if (!digits) return 0;
+    *out = neg ? -v : v;
+    *i = k;
+    return 1;
+}
+
+static int cssval_calc_expr(const char* s, size_t n, size_t* i, CssCalc* out);
+
+static int cssval_calc_leaf(const char* s, size_t n, size_t* i, CssCalc* out) {
+    memset(out, 0, sizeof *out);
+    if (!cssval_calc_skip(s, n, i)) return 0;
+    int neg = 0;
+    while (*i < n && (s[*i] == '+' || s[*i] == '-')) {
+        if (s[*i] == '-') neg = !neg;
+        (*i)++;
+        if (!cssval_calc_skip(s, n, i)) return 0;
+    }
+    if (*i < n && s[*i] == '(') {
+        (*i)++;
+        if (!cssval_calc_expr(s, n, i, out)) return 0;
+        if (!cssval_calc_skip(s, n, i) || s[*i] != ')') return 0;
+        (*i)++;
+        if (neg) { out->px = -out->px; out->em = -out->em; out->rem = -out->rem; out->pct = -out->pct; }
+        return 1;
+    }
+    if (*i + 4 <= n &&
+        (s[*i] == 'c' || s[*i] == 'C') && (s[*i + 1] == 'a' || s[*i + 1] == 'A') &&
+        (s[*i + 2] == 'l' || s[*i + 2] == 'L') && (s[*i + 3] == 'c' || s[*i + 3] == 'C')) {
+        *i += 4;
+        if (!cssval_calc_skip(s, n, i) || s[*i] != '(') return 0;
+        (*i)++;
+        if (!cssval_calc_expr(s, n, i, out)) return 0;
+        if (!cssval_calc_skip(s, n, i) || s[*i] != ')') return 0;
+        (*i)++;
+        if (neg) { out->px = -out->px; out->em = -out->em; out->rem = -out->rem; out->pct = -out->pct; }
+        return 1;
+    }
+    double v;
+    if (!cssval_calc_num(s, n, i, &v)) return 0;
+    if (neg) v = -v;
+    if (*i < n && s[*i] == '%') {
+        (*i)++;
+        out->pct = (float)v;
+        out->is_len = 1;
+        out->saw_pct = 1;
+        return 1;
+    }
+    if (*i + 3 <= n && (s[*i] == 'r' || s[*i] == 'R') &&
+        (s[*i + 1] == 'e' || s[*i + 1] == 'E') && (s[*i + 2] == 'm' || s[*i + 2] == 'M')) {
+        *i += 3;
+        out->rem = (float)v;
+        out->is_len = 1;
+        return 1;
+    }
+    if (*i + 2 <= n && (s[*i] == 'e' || s[*i] == 'E') &&
+        (s[*i + 1] == 'm' || s[*i + 1] == 'M')) {
+        *i += 2;
+        out->em = (float)v;
+        out->is_len = 1;
+        return 1;
+    }
+    if (*i + 2 <= n && (s[*i] == 'p' || s[*i] == 'P') &&
+        (s[*i + 1] == 'x' || s[*i + 1] == 'X')) {
+        *i += 2;
+        out->px = (float)v;
+        out->is_len = 1;
+        return 1;
+    }
+    out->px = (float)v;
+    return 1;
+}
+
+static int cssval_calc_term(const char* s, size_t n, size_t* i, CssCalc* out) {
+    if (!cssval_calc_leaf(s, n, i, out)) return 0;
+    for (;;) {
+        size_t save = *i;
+        if (!cssval_calc_skip(s, n, i)) { *i = save; return 1; }
+        char op = s[*i];
+        if (op != '*' && op != '/') { *i = save; return 1; }
+        (*i)++;
+        CssCalc rhs;
+        if (!cssval_calc_leaf(s, n, i, &rhs)) return 0;
+        if (op == '*') {
+            if (out->is_len && rhs.is_len) return 0;
+            if (!out->is_len && rhs.is_len) {
+                float k = out->px;
+                *out = rhs;
+                out->px *= k; out->em *= k; out->rem *= k; out->pct *= k;
+            } else {
+                if (rhs.is_len) return 0;
+                float k = rhs.px;
+                out->px *= k; out->em *= k; out->rem *= k; out->pct *= k;
+            }
+        } else {
+            if (rhs.is_len || rhs.px == 0.0f) return 0;
+            float k = 1.0f / rhs.px;
+            out->px *= k; out->em *= k; out->rem *= k; out->pct *= k;
+        }
+    }
+}
+
+static int cssval_calc_expr(const char* s, size_t n, size_t* i, CssCalc* out) {
+    if (!cssval_calc_term(s, n, i, out)) return 0;
+    for (;;) {
+        size_t save = *i;
+        if (!cssval_calc_skip(s, n, i)) { *i = save; return 1; }
+        char op = s[*i];
+        if (op != '+' && op != '-') { *i = save; return 1; }
+        (*i)++;
+        CssCalc rhs;
+        if (!cssval_calc_term(s, n, i, &rhs)) return 0;
+        if (out->is_len != rhs.is_len) return 0;
+        float sgn = op == '-' ? -1.0f : 1.0f;
+        out->px += sgn * rhs.px;
+        out->em += sgn * rhs.em;
+        out->rem += sgn * rhs.rem;
+        out->pct += sgn * rhs.pct;
+        if (rhs.saw_pct) out->saw_pct = 1;
+    }
+}
+
+static void cssval_len_from_calc(CssLen* o, const CssCalc* c) {
+    o->c_px = c->px;
+    o->c_em = c->em;
+    o->c_rem = c->rem;
+    o->c_pct = c->pct;
+    int n = 0;
+    if (c->px != 0.0f) n++;
+    if (c->em != 0.0f) n++;
+    if (c->rem != 0.0f) n++;
+    if (c->pct != 0.0f) n++;
+    if (!c->is_len) {
+        o->unit = U_NUM;
+        o->v = c->px;
+        o->px = c->px;
+        return;
+    }
+    if (n > 1) {
+        o->unit = U_CALC;
+        o->v = 0;
+        o->px = c->px;
+        return;
+    }
+    if (c->em != 0.0f) { o->unit = U_EM; o->v = c->em; }
+    else if (c->rem != 0.0f) { o->unit = U_REM; o->v = c->rem; }
+    else if (c->pct != 0.0f || (n == 0 && c->saw_pct)) { o->unit = U_PCT; o->v = c->pct; }
+    else { o->unit = U_PX; o->v = c->px; o->px = c->px; }
+}
+
+static int cssval_parse_calc(const char* s, size_t n, CssLen* out) {
+    size_t i = 0;
+    CssCalc c;
+    if (!cssval_calc_leaf(s, n, &i, &c)) return 0;
+    if (!cssval_calc_skip(s, n, &i)) i = n;
+    if (i != n) return 0;
+    cssval_len_from_calc(out, &c);
+    return 1;
+}
+
 static int cssval_parse_len(const char* s, size_t n, CssLen* out) {
     s = cssval_trim(s, &n);
     memset(out, 0, sizeof(*out));
@@ -62,6 +246,9 @@ static int cssval_parse_len(const char* s, size_t n, CssLen* out) {
         }
     }
     if (!n) return 0;
+    if (n >= 4 && (s[0] == 'c' || s[0] == 'C') && (s[1] == 'a' || s[1] == 'A') &&
+        (s[2] == 'l' || s[2] == 'L') && (s[3] == 'c' || s[3] == 'C'))
+        return cssval_parse_calc(s, n, out);
     size_t i = 0;
     int neg = 0;
     if (s[i] == '-' || s[i] == '+') { neg = s[i] == '-'; i++; }
@@ -84,18 +271,27 @@ static int cssval_parse_len(const char* s, size_t n, CssLen* out) {
     else if (un == 1 && u[0] == '%') out->unit = U_PCT;
     else return 0;
     out->v = (float)v;
-    out->px = out->unit == U_PX ? (float)v : 0.0f;
+    if (out->unit == U_PX) { out->c_px = (float)v; out->px = (float)v; }
+    else if (out->unit == U_EM) out->c_em = (float)v;
+    else if (out->unit == U_REM) out->c_rem = (float)v;
+    else if (out->unit == U_PCT) out->c_pct = (float)v;
+    else { out->c_px = (float)v; out->px = (float)v; }
     return 1;
 }
 
 /* em / rem resolve against a font size; % only on font-size (the caller
- * passes the parent's size as `fs` for that one field). */
+ * passes the parent's size as `fs` for that one field). Mixed calc folds
+ * em/rem into px; leftover % on a non-font-size length stays for dump. */
 static inline void cssval_resolve(CssLen* l, float fs, float root_fs, int pct_of_fs) {
     if (l->kw) return;
     switch (l->unit) {
-    case U_EM:  l->px = l->v * fs; break;
-    case U_REM: l->px = l->v * root_fs; break;
-    case U_PCT: if (pct_of_fs) l->px = l->v * fs / 100.0f; break;
+    case U_EM:  l->px = l->c_em * fs; break;
+    case U_REM: l->px = l->c_rem * root_fs; break;
+    case U_PCT: if (pct_of_fs) l->px = l->c_pct * fs / 100.0f; break;
+    case U_CALC:
+        l->px = l->c_px + l->c_em * fs + l->c_rem * root_fs;
+        if (pct_of_fs) l->px += l->c_pct * fs / 100.0f;
+        break;
     default: break;
     }
 }
@@ -199,18 +395,139 @@ static int cssval_parse_color(const char* s, size_t n, CssColor* out) {
     return 0;
 }
 
+enum { VAR_CELL = 0, VAR_REF = 1, VAR_CUSTOM = 2 };
+#define CSS_MAX_VARS 16
+
+static int cssval_has_var(const char* s, size_t n) {
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if ((s[i] == 'v' || s[i] == 'V') && (s[i + 1] == 'a' || s[i + 1] == 'A') &&
+            (s[i + 2] == 'r' || s[i + 2] == 'R') && s[i + 3] == '(')
+            return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    const char* nptr;
+    size_t nlen;
+    const char* vptr;
+    size_t vlen;
+} CssVarRef;
+
+static int cssval_var_eq(const char* a, size_t na, const char* b, size_t nb) {
+    if (na != nb) return 0;
+    return memcmp(a, b, na) == 0;
+}
+
+static int cssval_var_lookup(const CssVarRef* vars, int nvar, const char* n, size_t nl) {
+    for (int i = 0; i < nvar; i++)
+        if (cssval_var_eq(vars[i].nptr, vars[i].nlen, n, nl)) return i;
+    return -1;
+}
+
+/* Replace each var() with the custom property or its fallback. Cycle
+ * or a missing name with no fallback fails (invalid at computed time). */
+static int cssval_subst_into(const char* s, size_t n, const CssVarRef* vars, int nvar,
+                             const char** stack, size_t* slen, int nd,
+                             char* out, size_t cap, size_t* w);
+
+static int cssval_subst_var_call(const char* s, size_t n, size_t* i,
+                                 const CssVarRef* vars, int nvar,
+                                 const char** stack, size_t* slen, int nd,
+                                 char* out, size_t cap, size_t* w) {
+    *i += 4;
+    while (*i < n && (s[*i] == ' ' || s[*i] == '\t' || s[*i] == '\n' || s[*i] == '\r')) (*i)++;
+    size_t ns = *i;
+    while (*i < n && s[*i] != ',' && s[*i] != ')' &&
+           s[*i] != ' ' && s[*i] != '\t' && s[*i] != '\n' && s[*i] != '\r')
+        (*i)++;
+    size_t nl = *i - ns;
+    while (*i < n && (s[*i] == ' ' || s[*i] == '\t' || s[*i] == '\n' || s[*i] == '\r')) (*i)++;
+    const char* fb = 0;
+    size_t fbn = 0;
+    if (*i < n && s[*i] == ',') {
+        (*i)++;
+        size_t fs = *i, depth = 0, fe = *i;
+        while (*i < n) {
+            if (s[*i] == '(') depth++;
+            else if (s[*i] == ')') {
+                if (!depth) break;
+                depth--;
+            }
+            (*i)++;
+            fe = *i;
+        }
+        fb = s + fs;
+        fbn = fe - fs;
+        while (fbn && (fb[0] == ' ' || fb[0] == '\t' || fb[0] == '\n' || fb[0] == '\r')) { fb++; fbn--; }
+        while (fbn && (fb[fbn - 1] == ' ' || fb[fbn - 1] == '\t' || fb[fbn - 1] == '\n' || fb[fbn - 1] == '\r')) fbn--;
+    }
+    if (*i >= n || s[*i] != ')') return 0;
+    (*i)++;
+    if (nl < 2 || s[ns] != '-' || s[ns + 1] != '-') return 0;
+    for (int k = 0; k < nd; k++)
+        if (cssval_var_eq(stack[k], slen[k], s + ns, nl)) return 0;
+    int hit = cssval_var_lookup(vars, nvar, s + ns, nl);
+    if (hit >= 0) {
+        if (nd >= 8) return 0;
+        stack[nd] = s + ns;
+        slen[nd] = nl;
+        return cssval_subst_into(vars[hit].vptr, vars[hit].vlen, vars, nvar,
+                                 stack, slen, nd + 1, out, cap, w);
+    }
+    if (!fb) return 0;
+    return cssval_subst_into(fb, fbn, vars, nvar, stack, slen, nd, out, cap, w);
+}
+
+static int cssval_subst_into(const char* s, size_t n, const CssVarRef* vars, int nvar,
+                             const char** stack, size_t* slen, int nd,
+                             char* out, size_t cap, size_t* w) {
+    size_t i = 0;
+    while (i < n) {
+        if (i + 4 <= n &&
+            (s[i] == 'v' || s[i] == 'V') && (s[i + 1] == 'a' || s[i + 1] == 'A') &&
+            (s[i + 2] == 'r' || s[i + 2] == 'R') && s[i + 3] == '(') {
+            if (!cssval_subst_var_call(s, n, &i, vars, nvar, stack, slen, nd, out, cap, w))
+                return 0;
+            continue;
+        }
+        if (*w >= cap) return 0;
+        out[(*w)++] = s[i++];
+    }
+    return 1;
+}
+
+static int cssval_subst(const char* s, size_t n, const CssVarRef* vars, int nvar,
+                        char* out, size_t cap, size_t* outn) {
+    const char* stack[8];
+    size_t slen[8];
+    *outn = 0;
+    if (!cssval_subst_into(s, n, vars, nvar, stack, slen, 0, out, cap, outn)) return 0;
+    while (*outn && (out[0] == ' ' || out[0] == '\t' || out[0] == '\n' || out[0] == '\r')) {
+        memmove(out, out + 1, --(*outn));
+    }
+    while (*outn && (out[*outn - 1] == ' ' || out[*outn - 1] == '\t' ||
+                     out[*outn - 1] == '\n' || out[*outn - 1] == '\r'))
+        (*outn)--;
+    return 1;
+}
+
 /* One declaration in a rule: which longhand, its importance, and the
  * value in the cell for that longhand's kind. `wide` is a CSS-wide
- * keyword: 1 = initial (the cell is unused). */
+ * keyword: 1 = initial (the cell is unused). `varkind` is a custom
+ * property or a longhand whose specified text still has var(). */
 typedef struct {
     uint16_t prop;
     uint8_t imp;
     uint8_t wide;
+    uint8_t varkind;
     union {
         int atom;
         CssLen len;
         CssColor color;
     } v;
+    CCSlice vname;
+    CCSlice raw;
 } CssDecl;
 
 /* Output line builder: one computed-style row is a few KB. */
@@ -240,6 +557,19 @@ static void css_out_num(CssOut* o, double v) {
 
 static void css_out_len(CssOut* o, const CssLen* l) {
     if (l->kw) { css_out_str(o, LKW_TEXT[l->kw]); return; }
+    if (l->unit == U_CALC && l->c_pct != 0.0f) {
+        /* Leftover % + folded absolute. Stylo ToCss: calc(% ± px). */
+        css_out_str(o, "calc(");
+        css_out_num(o, l->c_pct);
+        css_out_str(o, "%");
+        if (l->px != 0.0f) {
+            css_out_str(o, l->px > 0.0f ? " + " : " - ");
+            css_out_num(o, l->px > 0.0f ? l->px : -l->px);
+            css_out_str(o, "px");
+        }
+        css_out_str(o, ")");
+        return;
+    }
     switch (l->unit) {
     case U_NUM: css_out_num(o, l->v); break;
     case U_PCT: css_out_num(o, l->v); css_out_str(o, "%"); break;
@@ -275,11 +605,24 @@ static void css_out_content(CssOut* o, const char* s, size_t n) {
 }
 
 static inline int cssval_len_eq(const CssLen* a, const CssLen* b) {
-    return a->kw == b->kw && a->unit == b->unit && a->v == b->v && a->px == b->px;
+    return a->kw == b->kw && a->unit == b->unit &&
+           a->c_px == b->c_px && a->c_em == b->c_em &&
+           a->c_rem == b->c_rem && a->c_pct == b->c_pct;
 }
 
 static inline int cssval_color_eq(const CssColor* a, const CssColor* b) {
     return a->kw == b->kw && a->r == b->r && a->g == b->g && a->b == b->b && a->a == b->a;
+}
+
+/* Slice-shaped entry points — same layout as CCSlice { const char*; size_t; }. */
+static int cssval_parse_len_slice(const char* ptr, size_t len, CssLen* out) {
+    return cssval_parse_len(ptr, len, out);
+}
+static int cssval_parse_color_slice(const char* ptr, size_t len, CssColor* out) {
+    return cssval_parse_color(ptr, len, out);
+}
+static int cssval_has_var_slice(const char* ptr, size_t len) {
+    return cssval_has_var(ptr, len);
 }
 
 #endif

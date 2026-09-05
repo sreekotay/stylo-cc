@@ -1,3 +1,3 @@
 # runner=stylo fixture=fixtures/default.stylebench threads=6
-# TIME_MS=26.743 TIME_MUT_MS=23.492 elements=20002
+# TIME_MS=28.157 TIME_MUT_MS=23.035 elements=20002
 # BODY_ROWS=20002 BODY_SHA256=ed9d16f666ece5f49610a551231a533911445b7f632ed2c3aa534fa60ed1d092

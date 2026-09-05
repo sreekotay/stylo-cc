@@ -1,0 +1,66 @@
+# stylebench-fixture 1
+# name=calc-lengths
+# calc() on length longhands: fold, em/rem, leftover %, inherit, style=,
+# mut re-resolve, invalid drop.
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#fold { height: calc(8px + 8px); }
+#times { min-width: calc(2 * 8px); }
+#times-rev { min-width: calc(8px * 2); }
+#nest { padding-left: calc(calc(4px) + 4px); }
+#em { font-size: calc(2em); }
+#mix { height: calc(2em + 4px); }
+#leftover { width: calc(50% + 8px); }
+#leftover-minus { width: calc(50% - 8px); }
+#fs-pct { font-size: calc(100% - 2px); }
+#rem { padding-top: calc(1rem); }
+#num { opacity: calc(1 - 0.25); }
+#div { height: calc(16px / 2); }
+#imp { height: 100px; }
+#imp { height: calc(8px) !important; }
+#kid { height: 1em; }
+#anckid { height: 1em; }
+.hot { font-size: calc(2em); }
+#bad-empty { height: calc(8px + ); }
+#bad-mul { height: calc(8px * 8px); }
+#bad-mix { height: calc(8px + 2); }
+---tree---
+0	-1	div	testroot		
+1	0	span	fold		
+2	0	span	times		
+3	0	span	nest		
+4	0	span	em		
+5	4	span	kid		
+6	0	span	mix		
+7	0	span	leftover		
+8	0	span	fs-pct		
+9	0	span	rem		
+10	0	span	num		
+11	0	span	bad-empty		
+12	0	span	bad-mul		
+13	0	span	bad-mix		
+14	0	span	times-rev		
+15	0	span	leftover-minus		
+16	0	span	div		
+17	0	span	imp		
+18	0	span	styled		style=height:calc(3 * 4px)
+19	0	span	anc		
+20	19	span	anckid		
+21	0	span	mutstyle		
+---mut---
++attr	19	class=hot
+restyle
+-attr	19	class
+restyle
++attr	21	style=padding-left:calc(1em + 2px)
+restyle

@@ -1,0 +1,47 @@
+# stylebench-fixture 1
+# name=custom-properties
+# var() / custom properties: substitute, fallback, inherit, calc(var()),
+# missing drop, cycle drop, style=, class mut re-resolve.
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#testroot { --gap: 8px; --c: #c00; --pad: 4px; }
+#direct { padding-left: var(--gap); }
+#fb { padding-left: var(--missing, 12px); }
+#miss { padding-left: var(--missing); }
+#calcvar { padding-top: calc(var(--gap) + 4px); }
+#col { color: var(--c); }
+#chain { --inner: var(--gap); padding-right: var(--inner); }
+#cyc { --a: var(--b); --b: var(--a); padding-left: var(--a); }
+#kid { padding-left: var(--gap); }
+#styled { padding-bottom: var(--gap); }
+.hot { --gap: 16px; }
+---tree---
+0	-1	div	testroot		
+1	0	span	direct		
+2	0	span	fb		
+3	0	span	miss		
+4	0	span	calcvar		
+5	0	span	col		
+6	0	span	chain		
+7	0	span	cyc		
+8	0	span	anc		
+9	8	span	kid		
+10	0	span	styled		style=--gap: 20px
+11	0	span	mutstyle		
+---mut---
++attr	8	class=hot
+restyle
+-attr	8	class
+restyle
++attr	11	style=padding-left:var(--gap)
+restyle

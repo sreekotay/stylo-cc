@@ -39,7 +39,7 @@ Same print format on both sides: `index tag id=… name=value ×189` in Stylo's 
 
 ## Status (2026-09-04)
 
-All six suites `cmp`-clean at 20 k with the 189-column dump. CC is 2.7–7.6× faster on the first restyle and 1.5–30× on the mutation rounds (README “In short”). Length `calc()` (`px` / `em` / `rem` / `%` / numbers) is gated by `fixtures/local/calc.stylebench`. Not done: the rest of CSS (`var()`, value lists, `:not` / `:is`, layout-time semantics) — none of it is exercised by StyleBench, so the output is identical there and would not be on arbitrary CSS.
+All six suites `cmp`-clean at 20 k with the 189-column dump. CC is 2.7–7.6× faster on the first restyle and 1.5–30× on the mutation rounds (README “In short”). Length `calc()` (`px` / `em` / `rem` / `%` / numbers) is gated by `fixtures/local/calc.stylebench`. `:is()` / `:not()` / `:where()` by `fixtures/local/is-not.stylebench`. `var()` / `--*` by `fixtures/local/var.stylebench`. Box shorthands (1–4 sides, overflow / gap, `border`) by `fixtures/local/box.stylebench`. Not done: the rest of CSS (value lists, user-action, layout-time semantics) — none of it is exercised by StyleBench, so the output is identical there and would not be on arbitrary CSS.
 
 ## Ladybird (reference, not a gate)
 

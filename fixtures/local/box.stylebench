@@ -1,0 +1,87 @@
+# stylebench-fixture 1
+# name=box-shorthands
+# 1–4 side tokens (margin / padding / border-* / inset), overflow / gap
+# pairs, combined border, calc / var components, leftover drop, style=, mut.
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+#testroot { --gap: 8px; --ov: hidden; --c: #c00; }
+#m1 { margin: 8px; }
+#m2 { margin: 8px 4px; }
+#m3 { margin: 8px 4px 2px; }
+#m4 { margin: 8px 4px 2px 1px; }
+#mauto { margin: auto; }
+#pad { padding: 1px 2px 3px 4px; }
+#bw { border-width: 1px 2px 3px 4px; }
+#bs { border-style: solid dashed; }
+#bc { border-color: #c00 #0c0 #00c #000; }
+#ov1 { overflow: hidden; }
+#ov2 { overflow: hidden scroll; }
+#gap1 { gap: 8px; }
+#gap2 { gap: 8px 4px; }
+#ins { inset: 1px 2px 3px 4px; }
+#bd { border: 1px solid #c00; }
+#bdnone { border: none; }
+#bdstyle { border: solid; }
+#bthin { border-width: thin; }
+#btop { border-top: 2px dashed #00f; }
+#calc { margin: calc(4px + 4px) 2px; }
+#vpad { padding: var(--gap); }
+#vpair { overflow: var(--ov); }
+#vcol { border: 1px solid var(--c); }
+#imp { margin: 0px; }
+#imp { margin: 8px !important; }
+#bad { margin: 1px 2px 3px 4px extra; }
+#order { margin-top: 99px; }
+#order { margin: 8px; }
+#after { margin: 8px; }
+#after { margin-top: 99px; }
+#styled { }
+.hot { padding: 16px; }
+---tree---
+0	-1	div	testroot		
+1	0	span	m1		
+2	0	span	m2		
+3	0	span	m3		
+4	0	span	m4		
+5	0	span	mauto		
+6	0	span	pad		
+7	0	span	bw		
+8	0	span	bs		
+9	0	span	bc		
+10	0	span	ov1		
+11	0	span	ov2		
+12	0	span	gap1		
+13	0	span	gap2		
+14	0	span	ins		
+15	0	span	bd		
+16	0	span	bdnone		
+17	0	span	bdstyle		
+18	0	span	bthin		
+19	0	span	btop		
+20	0	span	calc		
+21	0	span	vpad		
+22	0	span	vpair		
+23	0	span	vcol		
+24	0	span	imp		
+25	0	span	bad		
+26	0	span	order		
+27	0	span	after		
+28	0	span	styled		style=margin:10px
+29	0	span	mut		
+---mut---
++attr	29	class=hot
+restyle
+-attr	29	class
+restyle
++attr	29	style=padding:6px 3px
+restyle

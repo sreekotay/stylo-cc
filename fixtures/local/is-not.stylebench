@@ -1,0 +1,50 @@
+# stylebench-fixture 1
+# name=is-not-where
+# :is / :not / :where — OR list, nested :not, combinator inside :is,
+# specificity vs :where, descendant :not + class mut, empty list drop.
+# Do not fight #testroot * on height / min-width (same origin in Stylo).
+---base---
+#testroot {
+  font-size: 10px;
+  line-height: 10px;
+  color: #111;
+}
+#testroot * {
+  display: inline-block;
+  height:10px;
+  min-width:10px;
+}
+---css---
+:is(.a, .b) { padding-left: 8px; }
+:is(#xid, #yid) { padding-right: 20px; }
+span:not(.skip) { padding-top: 8px; }
+span:is(:not(.skip)) { margin-top: 2px; }
+:where(.w) { padding-bottom: 30px; }
+.w { padding-bottom: 4px; }
+span:is(.hot) { margin-left: 12px; }
+#box:not(.off) .deep { background-color: rgb(10, 20, 30); }
+:is(.foo .bar) { margin-right: 6px; }
+:is() { padding-left: 99px; }
+:not() { padding-left: 99px; }
+---tree---
+0	-1	div	testroot		
+1	0	span	-	a	
+2	0	span	-	b	
+3	0	span	xid		
+4	0	span	-	skip	
+5	0	span	-	w	
+6	0	span	-		
+7	0	div	box		
+8	7	span	-	deep	
+9	0	div	-	foo	
+10	9	span	-	bar	
+11	0	span	-		
+---mut---
++attr	11	class=hot
+restyle
+-attr	11	class
+restyle
++attr	7	class=off
+restyle
+-attr	7	class
+restyle

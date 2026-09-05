@@ -13,8 +13,6 @@
  * literals, and per-family inherit / resolve / dump code. Adding a
  * longhand is a row here and nothing else.
  */
-#include <string.h>
-
 @grammar(schema) LhRow {~~~~
     rules [
         cell:  keep [some complement charset [#'\t' #'\n']]
@@ -83,10 +81,10 @@ char[:0] toml_path = args.len >= 1
 CCSlice toml = cc_file_read_path(toml_path, ar) !>;
 
 /* The grammar wants every line newline-terminated. */
-char* tbuf = (char*)cc_arena_alloc(ar, toml.len + 1, 1);
-memcpy(tbuf, toml.ptr, toml.len);
-tbuf[toml.len] = '\n';
-TomlNode* root = Toml.parse(tbuf, toml.len + 1, ar);
+char[:] tbuf = ar.alloc_slice_bytes(toml.len + 1);
+toml.copy(tbuf.sub(0, toml.len)) !>;
+tbuf.set(toml.len, '\n') !>;
+TomlNode* root = Toml.parse(tbuf.ptr, toml.len + 1, ar);
 if (!root) {
     out.eprintln(@slice("longhands.toml: grammar miss"));
     return 2;

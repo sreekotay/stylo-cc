@@ -1,3 +1,3 @@
 # runner=stylo fixture=/Users/airm5/Documents/code/stylo-cc/fixtures/media.stylebench threads=6
-# TIME_MS=11.439 TIME_MUT_MS=425.379 elements=5001
+# TIME_MS=11.785 TIME_MUT_MS=425.052 elements=5001
 # BODY_ROWS=5001 BODY_SHA256=bb4e157741d09f17d5438f9ae898ee1f51fb23e416238f0322891771b55b26cd

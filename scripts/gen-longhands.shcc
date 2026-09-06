@@ -119,7 +119,7 @@ while (ch) {
     ch = ch->next(root);
 }
 
-char[:] rows = in;
+char[:] rows = stdin.read_all(ar) !>;
 LhRowReader rd = cc_reader(LhRow, rows.ptr, rows.len, ar);
 LhRow row;
 int n = 0;

@@ -271,7 +271,7 @@ index 1809085d..3106a6ab 100644
          self.with_inherited_values_and_flags_from(inherited_source, &self.important_bits, &self.inherited_bits)
      }
 diff --git a/Libraries/LibWeb/Rust/src/css/style/bridge.rs b/Libraries/LibWeb/Rust/src/css/style/bridge.rs
-index 115622be..4c3b2cb3 100644
+index 115622be..c0a8ff80 100644
 --- a/Libraries/LibWeb/Rust/src/css/style/bridge.rs
 +++ b/Libraries/LibWeb/Rust/src/css/style/bridge.rs
 @@ -107,6 +107,8 @@ pub struct FfiAnimationInvalidation {
@@ -342,29 +342,7 @@ index 115622be..4c3b2cb3 100644
      engine.record_boundary_call(EventKind::AddStyleRule, |payload| {
          payload.write_u32(sheet);
          payload.write_u32(before_rule);
-@@ -1788,6 +1812,10 @@ pub unsafe extern "C" fn style_engine_consume_published_match_answer(
-     let Some(node) = StyleNodeID::from_raw(node) else {
-         return usize::MAX;
-     };
-+    #[cfg(feature = "stylecc")]
-+    if let Some(n) = super::stylecc_host::consume_published(engine, node.raw(), out, capacity) {
-+        return n;
-+    }
-     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-     let result = engine
-         .consume_published_match_answer_with(
-@@ -1846,6 +1874,10 @@ pub unsafe extern "C" fn style_engine_match_element(
-     let Some(node) = StyleNodeID::from_raw(node) else {
-         return usize::MAX;
-     };
-+    #[cfg(feature = "stylecc")]
-+    if let Some(n) = super::stylecc_host::consume_published(engine, node.raw(), out, capacity) {
-+        return n;
-+    }
-     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-     let result = match compact_for_cascade {
-         true => engine.match_element_for_cascade(node),
-@@ -2679,13 +2711,19 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+@@ -2679,13 +2703,19 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
              let operators = unsafe { std::slice::from_raw_parts(operators, count) };
              let values = unsafe { std::slice::from_raw_parts(values, count) };
              let original_values = unsafe { std::slice::from_raw_parts(original_values, count) };
@@ -385,7 +363,7 @@ index 115622be..4c3b2cb3 100644
                      let value = unsafe { engine.intern_specified_value(value.cast()) };
                      unsafe { engine.alias_specified_value(original_value.cast(), value) };
                      DeclaredProperty {
-@@ -2695,7 +2733,20 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+@@ -2695,7 +2725,20 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
                          value,
                      }
                  })
@@ -407,7 +385,7 @@ index 115622be..4c3b2cb3 100644
          }
      };
      engine.set_rule_declared_properties_with_operators(RuleID(rule - 1), &declared, declarations_are_complete);
-@@ -2716,6 +2767,8 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+@@ -2716,6 +2759,8 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
  pub unsafe extern "C" fn style_engine_intern_atom(engine: *mut c_void, raw: usize) -> u32 {
      let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
      let result = engine.intern_atom(raw).0;
@@ -416,7 +394,7 @@ index 115622be..4c3b2cb3 100644
      let token = engine.recording_atom_pointer_token(raw);
      engine.record_boundary_call(EventKind::InternAtom, |payload| {
          payload.write_u64(token.expect("an enabled recorder must tokenize the pointer"));
-@@ -2738,19 +2791,53 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
+@@ -2738,19 +2783,53 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
      let Some(root) = StyleNodeID::from_raw(root) else {
          return FfiStyleTransactionView::default();
      };
@@ -515,10 +493,10 @@ index 5c0e93a1..38203076 100644
          &mut self,
          root: StyleNodeID,
 diff --git a/Libraries/LibWeb/Rust/src/css/style/matching.rs b/Libraries/LibWeb/Rust/src/css/style/matching.rs
-index 9c12f27f..fb69b1b7 100644
+index 9c12f27f..202253e8 100644
 --- a/Libraries/LibWeb/Rust/src/css/style/matching.rs
 +++ b/Libraries/LibWeb/Rust/src/css/style/matching.rs
-@@ -3121,6 +3121,418 @@ impl StyleEngine {
+@@ -3121,6 +3121,419 @@ impl StyleEngine {
          identity
      }
  
@@ -618,9 +596,10 @@ index 9c12f27f..fb69b1b7 100644
 +            }
 +        }
 +        let Some(pulled) = super::stylecc_host::pull_used_for(host, dirty) else {
++            super::stylecc_host::stop_serving(host);
 +            return super::stylecc_host::CcOwnedPublish::failed();
 +        };
-+        let (changed, _, _) = {
++        let changed = {
 +            let sets = &self.computed_group_sets;
 +            super::stylecc_host::split_used_stops(host, pulled, |raw| {
 +                StyleNodeID::from_raw(raw)
@@ -937,7 +916,7 @@ index 9c12f27f..fb69b1b7 100644
      pub fn match_element(&mut self, node: StyleNodeID) -> Result<Vec<RuleMatch>, Incomplete> {
          self.match_element_for_purpose(node, false)
      }
-@@ -3676,6 +4088,10 @@ impl StyleEngine {
+@@ -3676,6 +4089,10 @@ impl StyleEngine {
      /// A contextual answer has no identity and must still consume its complete payload. A shared
      /// identity lets a downstream cache answer before copying that payload across the bridge.
      pub fn published_match_answer_signature(&mut self, node: StyleNodeID) -> Option<u32> {
@@ -963,10 +942,10 @@ index 1b6c8c15..01794048 100644
  mod catalog;
 diff --git a/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs b/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs
 new file mode 100644
-index 00000000..ac0f4c00
+index 00000000..9e1f1456
 --- /dev/null
 +++ b/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1037 @@
 +/*
 + * Concurrent-C StyleEngine host for Ladybird (stylo-cc seam).
 + *
@@ -978,7 +957,7 @@ index 00000000..ac0f4c00
 + */
 +
 +use super::bridge::{
-+    FfiDocumentStyleComputationInputs, FfiFeatureKind, FfiFeatureValueKind, FfiRuleMatch, FfiStateFact,
++    FfiDocumentStyleComputationInputs, FfiFeatureKind, FfiFeatureValueKind, FfiStateFact,
 +    FfiStyleDelta, FfiStyleDeltaDamage, FfiStyleDeltaGap, FfiStyleInputTransaction,
 +};
 +use crate::css::css_enums::keyword;
@@ -1028,14 +1007,6 @@ index 00000000..ac0f4c00
 +    value: *const c_char,
 +    value_len: usize,
 +    important: u8,
-+}
-+
-+#[repr(C)]
-+#[derive(Clone, Copy)]
-+struct StyleCCMatch {
-+    host_node: u32,
-+    rule_id: i32,
-+    pelem: u8,
 +}
 +
 +#[repr(C)]
@@ -1107,12 +1078,6 @@ index 00000000..ac0f4c00
 +    fn stylecc_take_used(eng: *mut StyleCC, out: *mut u32, cap: usize) -> usize;
 +    fn stylecc_consume_node_used(eng: *mut StyleCC, host_id: u32, out: *mut StyleCCUsed) -> i32;
 +    fn stylecc_node_restyled(eng: *mut StyleCC, host_id: u32) -> i32;
-+    fn stylecc_consume_node_matches(
-+        eng: *mut StyleCC,
-+        host_id: u32,
-+        out: *mut StyleCCMatch,
-+        cap: usize,
-+    ) -> usize;
 +    fn stylecc_note_drop(eng: *mut StyleCC, reason: *const c_char);
 +    fn stylecc_drop_count(eng: *mut StyleCC) -> u64;
 +}
@@ -1133,10 +1098,7 @@ index 00000000..ac0f4c00
 +    host_to_cc_rules: HashMap<u32, Vec<i32>>,
 +    /// Decls that arrived before `add_style_rule` stored a CC mapping.
 +    pending_rule_decls: HashMap<u32, (Vec<u16>, Vec<bool>, Vec<String>)>,
-+    deltas: Vec<FfiStyleDelta>,
 +    hover_atom: u32,
-+    /// Last owning take is serving CC used/match consume; overlay reads CC buckets.
-+    serve_matches: bool,
 +    /// Per-node digest of last CC used style. Unchanged used values are a stop.
 +    last_used_digest: HashMap<u32, u64>,
 +}
@@ -1200,21 +1162,6 @@ index 00000000..ac0f4c00
 +    }
 +}
 +
-+fn write_ffi_matches(node: u32, tmp: &[StyleCCMatch], out: *mut FfiRuleMatch, n: usize) {
-+    for (i, m) in tmp.iter().take(n).enumerate() {
-+        unsafe {
-+            *out.add(i) = FfiRuleMatch {
-+                node,
-+                rule: m.rule_id as u32,
-+                semantic_declaration: 0,
-+                pseudo_element: if m.pelem == 0 { u32::MAX } else { u32::from(m.pelem) },
-+                scope_host: 0,
-+                scope_proximity: u32::MAX,
-+            };
-+        }
-+    }
-+}
-+
 +fn utf16_to_utf8(units: &[u16]) -> String {
 +    String::from_utf16_lossy(units)
 +}
@@ -1265,9 +1212,7 @@ index 00000000..ac0f4c00
 +            rules_dirty: false,
 +            host_to_cc_rules: HashMap::new(),
 +            pending_rule_decls: HashMap::new(),
-+            deltas: Vec::new(),
 +            hover_atom,
-+            serve_matches: false,
 +            last_used_digest: HashMap::new(),
 +        },
 +    );
@@ -1833,7 +1778,6 @@ index 00000000..ac0f4c00
 +    let mode = own_mode();
 +    let mut hosts = HOSTS.lock().unwrap();
 +    let state = hosts.get_mut(&key(engine))?;
-+    state.serve_matches = false;
 +    publish_serve(engine, state.cc, false);
 +    let cc = state.cc;
 +    unsafe {
@@ -1915,14 +1859,11 @@ index 00000000..ac0f4c00
 +    if mode == "dirty" {
 +        return None;
 +    }
-+    let mut hosts = HOSTS.lock().unwrap();
-+    let state = hosts.get_mut(&key(engine))?;
-+    state.serve_matches = true;
 +    publish_serve(engine, cc, true);
-+    Some(materialize_deltas(state, buf))
++    Some(materialize_deltas(buf))
 +}
 +
-+fn materialize_deltas(state: &mut HostState, nodes: Vec<u32>) -> Vec<FfiStyleDelta> {
++fn materialize_deltas(nodes: Vec<u32>) -> Vec<FfiStyleDelta> {
 +    let mut deltas = Vec::with_capacity(nodes.len());
 +    for node in nodes {
 +        if node == 0 {
@@ -1943,7 +1884,6 @@ index 00000000..ac0f4c00
 +            gap: FfiStyleDeltaGap::Materialize,
 +        });
 +    }
-+    state.deltas = deltas.clone();
 +    deltas
 +}
 +
@@ -1991,27 +1931,21 @@ index 00000000..ac0f4c00
 +    engine: *mut c_void,
 +    pulled: Vec<(u32, StyleCCUsed)>,
 +    has_published: impl Fn(u32) -> bool,
-+) -> (Vec<(u32, StyleCCUsed)>, usize, usize) {
++) -> Vec<(u32, StyleCCUsed)> {
 +    let mut hosts = HOSTS.lock().unwrap();
 +    let Some(state) = hosts.get_mut(&key(engine)) else {
-+        return (pulled, 0, 0);
++        return pulled;
 +    };
 +    let mut changed = Vec::with_capacity(pulled.len());
-+    let mut stopped = 0usize;
-+    let mut recycled = 0usize;
 +    for (node, used) in pulled {
 +        let digest_matches = state.last_used_digest.get(&node) == Some(&used.digest);
 +        if digest_matches && has_published(node) {
-+            stopped += 1;
 +            continue;
-+        }
-+        if digest_matches {
-+            recycled += 1;
 +        }
 +        state.last_used_digest.insert(node, used.digest);
 +        changed.push((node, used));
 +    }
-+    (changed, stopped, recycled)
++    changed
 +}
 +
 +pub fn stop_serving(engine: *mut c_void) {
@@ -2030,44 +1964,6 @@ index 00000000..ac0f4c00
 +            deltas: Vec::new(),
 +        }
 +    }
-+}
-+
-+pub fn consume_published(
-+    engine: *mut c_void,
-+    node: u32,
-+    out: *mut FfiRuleMatch,
-+    capacity: usize,
-+) -> Option<usize> {
-+    let cc = serve_cc(engine)?;
-+    if unsafe { stylecc_node_restyled(cc, node) == 0 } {
-+        return None;
-+    }
-+    const STACK: usize = 32;
-+    let mut stack = [StyleCCMatch {
-+        host_node: 0,
-+        rule_id: 0,
-+        pelem: 0,
-+    }; STACK];
-+    let fill_cap = capacity.min(STACK);
-+    let n = unsafe { stylecc_consume_node_matches(cc, node, stack.as_mut_ptr(), fill_cap) };
-+    if n > capacity {
-+        return Some(n);
-+    }
-+    if n <= STACK {
-+        write_ffi_matches(node, &stack, out, n);
-+        return Some(n);
-+    }
-+    let mut tmp = vec![
-+        StyleCCMatch {
-+            host_node: 0,
-+            rule_id: 0,
-+            pelem: 0,
-+        };
-+        n
-+    ];
-+    let _ = unsafe { stylecc_consume_node_matches(cc, node, tmp.as_mut_ptr(), tmp.len()) };
-+    write_ffi_matches(node, &tmp, out, n);
-+    Some(n)
 +}
 +
 +pub fn drop_count(engine: *mut c_void) -> u64 {

@@ -1,10 +1,107 @@
-machine: Apple M5, 10 cores, macOS 26.5.2
-chrome:  Google Chrome 152.0.7977.76 
-safari:  26.5.2
-node:    v24.14.0, playwright Version 1.62.1
-ladybird: a1db2e3a 2026-09-04 (Distribution)
+# StyleBench in Ladybird, CC matching (STYLECC_OWN_TAKE=1), 5 iterations --internals
+# Apple M5, 2026-09-10. Conservative flush. Same binary as receipts/browser-ladybird-stylecc-forward.txt
+#
 Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters)
 /Users/airm5/Documents/code/stylo-cc/ladybird/Build/distribution/bin/Ladybird.app/Contents/MacOS/Ladybird
-running http://127.0.0.1:8766/StyleBench/index.html?unit=ms&iterationCount=1
-Ladybird exited early (code null, signal SIGTERM)
-no iterations completed
+running http://127.0.0.1:8766/StyleBench/index.html?unit=ms&iterationCount=5
+userAgent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Ladybird/1.0 Chrome/146.0.0.0 AppleWebKit/537.36 Safari/537.36
+
+== Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters): StyleBench, 5 iteration(s), ms (sync = style + layout flush; async = constant 1/step) ==
+
+suite                                iter steps   sync ms  async ms  total ms
+Descendant and child combinators        1    25     168.5      25.0     193.5
+Sibling combinators                     1    25     276.2      25.0     301.2
+Structural pseudo classes               1    25     285.5      25.0     310.5
+Nth pseudo classes                      1    25     338.9      25.0     363.9
+Before and after pseudo elements        1    25     188.3      25.0     213.3
+Dynamic media queries                   1    55       2.8      55.0      57.8
+Descendant and child combinators        2    25     191.1      25.0     216.1
+Sibling combinators                     2    25     285.3      25.0     310.3
+Structural pseudo classes               2    25     299.0      25.0     324.0
+Nth pseudo classes                      2    25     329.2      25.0     354.2
+Before and after pseudo elements        2    25     174.7      25.0     199.7
+Dynamic media queries                   2    55       2.6      55.0      57.6
+Descendant and child combinators        3    25     172.9      25.0     197.9
+Sibling combinators                     3    25     281.9      25.0     306.9
+Structural pseudo classes               3    25     294.6      25.0     319.6
+Nth pseudo classes                      3    25     340.1      25.0     365.1
+Before and after pseudo elements        3    25     174.3      25.0     199.3
+Dynamic media queries                   3    55       2.5      55.0      57.5
+Descendant and child combinators        4    25     175.6      25.0     200.6
+Sibling combinators                     4    25     286.4      25.0     311.4
+Structural pseudo classes               4    25     297.8      25.0     322.8
+Nth pseudo classes                      4    25     334.5      25.0     359.5
+Before and after pseudo elements        4    25     173.3      25.0     198.3
+Dynamic media queries                   4    55       1.9      55.0      56.9
+Descendant and child combinators        5    25     174.3      25.0     199.3
+Sibling combinators                     5    25     332.5      25.0     357.5
+Structural pseudo classes               5    25     317.5      25.0     342.5
+Nth pseudo classes                      5    25     339.3      25.0     364.3
+Before and after pseudo elements        5    25     177.1      25.0     202.1
+Dynamic media queries                   5    55       2.4      55.0      57.4
+
+suite (over iterations)              steps  sync mean  sync min  total mean
+Descendant and child combinators        25      176.5     168.5       201.5
+Sibling combinators                     25      292.5     276.2       317.5
+Structural pseudo classes               25      298.9     285.5       323.9
+Nth pseudo classes                      25      336.4     329.2       361.4
+Before and after pseudo elements        25      177.5     173.3       202.5
+Dynamic media queries                   55        2.4       1.9        57.4
+
+per step kind, sync ms summed over the suite's steps of that kind, mean over iterations:
+  Descendant and child combinators  Adding classes=17.7  Removing classes=17.9  Mutating attributes=10.2  Adding leaf elements=78.7  Removing leaf elements=51.9
+  Sibling combinators               Adding classes=50.8  Removing classes=35.4  Mutating attributes=19.2  Adding leaf elements=88.3  Removing leaf elements=98.7
+  Structural pseudo classes         Adding classes=14.5  Removing classes=40.5  Mutating attributes=9.5  Adding leaf elements=77.4  Removing leaf elements=157.0
+  Nth pseudo classes                Adding classes=14.8  Removing classes=40.5  Mutating attributes=9.6  Adding leaf elements=77.6  Removing leaf elements=193.9
+  Before and after pseudo elements  Adding classes=17.6  Removing classes=17.4  Mutating attributes=10.1  Adding leaf elements=80.7  Removing leaf elements=51.7
+  Dynamic media queries             resizes=2.4
+
+StyleBench score (runs/min = 60000 / geomean(suite totals) / 1.5): mean 190.12  [192.2, 189.5, 192.2, 192.0, 184.7]
+geomean of suite totals, ms: mean 210.4  [208.1, 211.1, 208.1, 208.3, 216.6]
+
+== Ladybird a1db2e3a 2026-09-04 (Distribution build, headless=manual, CONSERVATIVE flush + internals style counters): Ladybird internals style clock, ms (Document::update_style; style only, no layout) ==
+suite                                iter steps     sync    style   engine recompute pre-flush init style init engine init wall   live
+Descendant and child combinators        1    25    168.5     48.8     44.0       0.3       3.0      149.9       133.7     196.8  20000
+Descendant and child combinators        2    25    191.1     56.4     51.6       0.3       3.1      145.1       130.4     192.5  20000
+Descendant and child combinators        3    25    172.9     50.3     46.0       0.3       2.6      149.8       134.4     198.1  20000
+Descendant and child combinators        4    25    175.6     49.8     45.4       0.3       2.2      153.0       137.0       205  20000
+Descendant and child combinators        5    25    174.3     50.0     45.6       0.3       2.3      147.9       131.9     201.8  20000
+Sibling combinators                     1    25    276.2    157.7    145.1       7.9       2.1      378.4       349.0     423.6  20000
+Sibling combinators                     2    25    285.3    159.3    145.9       8.5       2.3      380.7       351.3     428.5  20000
+Sibling combinators                     3    25    281.9    159.0    145.9       7.8       2.2      379.2       349.6       432  20000
+Sibling combinators                     4    25    286.4    160.7    148.3       7.6       2.3      378.9       349.4     427.9  20000
+Sibling combinators                     5    25    332.5    181.9    166.4      10.4       2.3      380.0       351.1     434.6  20000
+Structural pseudo classes               1    25    285.5    163.6    119.2      29.8       1.6      127.6       112.4     173.3  20000
+Structural pseudo classes               2    25    299.0    170.8    125.8      30.3       1.9      130.0       114.7     178.9  20000
+Structural pseudo classes               3    25    294.6    164.5    119.6      30.4       1.7      133.5       117.7     184.2  20000
+Structural pseudo classes               4    25    297.8    166.2    121.6      29.9       2.0      133.6       117.7     186.4  20000
+Structural pseudo classes               5    25    317.5    177.6    126.1      35.6       1.8      177.5       137.0     240.8  20000
+Nth pseudo classes                      1    25    338.9    206.7    150.1      40.1       1.7      134.1       117.3     183.4  20000
+Nth pseudo classes                      2    25    329.2    200.3    145.0      39.4       1.7      133.5       117.2     182.4  20000
+Nth pseudo classes                      3    25    340.1    207.7    151.8      39.6       1.8      136.3       120.6     187.7  20000
+Nth pseudo classes                      4    25    334.5    202.7    146.7      39.9       2.0      133.5       117.7     185.2  20000
+Nth pseudo classes                      5    25    339.3    206.7    150.4      40.0       2.0      133.1       116.9     185.3  20000
+Before and after pseudo elements        1    25    188.3     50.5     44.1       0.7       2.5      134.9       119.0     182.8  20000
+Before and after pseudo elements        2    25    174.7     51.0     44.3       0.6       2.9      138.3       122.9     186.1  20000
+Before and after pseudo elements        3    25    174.3     50.2     44.0       0.5       2.8      137.5       121.4       188  20000
+Before and after pseudo elements        4    25    173.3     50.5     44.2       0.6       2.8      137.0       121.2     186.1  20000
+Before and after pseudo elements        5    25    177.1     51.5     44.9       0.6       2.7      135.3       119.8     185.2  20000
+Dynamic media queries                   1    55      2.8      1.8        0         0       3.3       35.9        28.2      47.8   5000
+Dynamic media queries                   2    55      2.6      1.9        0         0       3.4       36.5        29.0      48.8   5000
+Dynamic media queries                   3    55      2.5      1.9        0         0       3.2       38.9        30.5      51.1   5000
+Dynamic media queries                   4    55      1.9      1.9        0         0       3.1       37.6        29.8      49.8   5000
+Dynamic media queries                   5    55      2.4      2.1        0         0       3.4       37.0        29.1      49.1   5000
+
+suite (min over iterations)               steps     sync    style   engine recompute pre-flush init style init engine init wall   live
+Descendant and child combinators             25    168.5     48.8     44.0       0.3       2.2      145.1       130.4     192.5  20000
+Sibling combinators                          25    276.2    157.7    145.1       7.6       2.1      378.4       349.0     423.6  20000
+Structural pseudo classes                    25    285.5    163.6    119.2      29.8       1.6      127.6       112.4     173.3  20000
+Nth pseudo classes                           25    329.2    200.3    145.0      39.4       1.7      133.1       116.9     182.4  20000
+Before and after pseudo elements             25    173.3     50.2     44.0       0.5       2.5      134.9       119.0     182.8  20000
+Dynamic media queries                        55      1.9      1.8        0         0       3.1       35.9        28.2      47.8   5000
+
+sync = StyleBench step clock (JS + style + layout). style = styleUpdateMicroseconds over the suite's steps; engine = styleEngineTransactionSetup + styleEnginePlanning (Rust StyleEngine:
+matching / invalidation / cascade identities); recompute = styleRecomputeMicroseconds (C++ ComputedValues materialization). pre-flush = update_style spent in the pre-step flushes (work
+deferred out of a step lands here). init = the flush we force right after createBenchmark(): style / engine part / wall (incl. layout); live = elements under #testroot.
+
+wrote /tmp/bench-own.json

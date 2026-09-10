@@ -12,7 +12,8 @@ harness/            stylebench-gen — frozen WebKit StyleBench LCG / seeds
 scripts/            bench-suite.sh — the 20 k sibling / structural / nth / ba races, the 5 k media race
                     gen-longhands.shcc — CC script: Stylo's longhand list → engine/longhands.cch
 browser-bench/      StyleBench itself in Chrome / WebKit via Playwright, and in Ladybird (vendored copy gitignored)
-ladybird/           git submodule — LadybirdBrowser/ladybird, built to Build/distribution by `scripts/browser-bench.sh ladybird-build`
+ladybird/           git submodule — LadybirdBrowser/ladybird, pinned; never commit inside it
+patches/ladybird/   local patch list on that SHA (`scripts/ladybird-patches.sh`); applied by `ladybird-build`
 receipts/           last cmp-clean receipts, both runners: full dumps for tiny / local, header + body digest for 20 k (full/ is gitignored)
 ```
 
@@ -68,6 +69,28 @@ A style-only probe on the same page (`--split`: force a full style flush, then `
 | media (5 k elements) | 148 | 11.4 | **1.5** | 55 | *16* | 425.3 | **14.3** |
 
 On the edit rounds Ladybird's style pass lands between 1.0× (structural) and 4.4× (default) of Stylo's time, and 8× faster than Stylo on media, where like CC it only restyles what a flipped rule touches. CC is 2.5–8× faster than Ladybird's style pass on the edits and 5.5–100× on the first restyle. The rest of Ladybird's StyleBench step — the gap between the `style` column and the sync column in the receipt — is JS and layout.
+
+**CC matching in Ladybird.** Same Concurrent-C engine as the tables above, matching inside Ladybird instead of on the fixture host. Same Distribution Ladybird, Conservative StyleBench, 5 iterations (`STYLECC_WORKERS=1`). Ladybird rematch is `STYLECC_FORWARD=1`; CC matching is `STYLECC_OWN_TAKE=1`. CC matches and cascades; matching stays inside CC. The host copies CC used style (display, height / min-width, font, background) onto interned Ladybird groups and publishes a style-record identity. Layout is Ladybird's. StyleBench's **sync** clock is JS + style + layout per edit step; **style** is `Document::update_style` only. First restyle is a flush after `createBenchmark()`. Min of 5 iterations, ms (`receipts/browser-ladybird-stylecc-forward.txt`, `receipts/browser-ladybird-stylecc-own.txt`). Media is omitted: CC does not restyle on viewport resize.
+
+| suite | Ladybird rematch first restyle | CC first restyle | Ladybird rematch edits (sync) | CC edits (sync) | Ladybird rematch style | CC style |
+|---|---:|---:|---:|---:|---:|---:|
+| default | 99 | 145 | 225 | **169** | 105 | **49** |
+| sibling | **111** | 378 | 313 | **276** | 193 | **158** |
+| structural | **106** | 128 | **263** | 286 | **144** | 164 |
+| nth | **116** | 133 | 420 | **329** | 299 | **200** |
+| before / after | **132** | 135 | 356 | **173** | 136 | **50** |
+
+Default suite, per step kind (sync, min of 5):
+
+| step | Ladybird rematch | CC |
+|---|---:|---:|
+| add classes | 43.1 | **16.8** |
+| remove classes | 38.4 | **17.2** |
+| mutate attributes | 15.4 | **9.7** |
+| add leaf | 80.8 | **76.3** |
+| remove leaf | **45.5** | 47.9 |
+
+CC is slower on structural and nth **remove-leaf** (150 / 188 vs 51 / 116). Add-leaf is layout of 100 unique-color inline-blocks.
 
 **What this is not.** A Firefox speedup. Stylo here runs on a small host (`stylo-runner/`) rather than in a browser, and our engine implements StyleBench's CSS, not CSS. The claim is narrower: on this workload, doing the same job to the same output, this shape is faster. The rest of this file is the detail — what each suite exercises, how each side matches and invalidates, what was corrected to make the race fair, and how to run it.
 
@@ -272,9 +295,12 @@ make bench-ba         # before/after 20k/5k, same shape
 make bench-media      # media queries 5k elements, 55 resizes, same shape
 make longhands        # regenerate engine/longhands.cch from Stylo (--longhands dump + longhands.toml)
 scripts/browser-bench.sh all 5   # StyleBench in Chrome + Playwright WebKit (+ Safari if remote automation is on)
-scripts/browser-bench.sh ladybird-build          # build the ladybird/ submodule (Distribution; 30+ min first time)
+scripts/browser-bench.sh ladybird-build          # apply patches/ladybird, then Distribution build (30+ min first time)
+scripts/ladybird-patches.sh apply              # apply the local Ladybird patch list (no-op if already on the tree)
 scripts/browser-bench.sh ladybird 5 --conservative   # StyleBench in Ladybird; drop --conservative for the stock runner
 scripts/browser-bench.sh ladybird 5 --internals      # + Ladybird's own update_style clock per step and for the initial resolution
+STYLECC_FORWARD=1 scripts/browser-bench.sh ladybird 5 --internals   # Ladybird rematch
+STYLECC_OWN_TAKE=1 STYLECC_WORKERS=1 scripts/browser-bench.sh ladybird 5 --internals  # CC matching in Ladybird
 ```
 
 `CC_STYLE_WORKERS=n` caps the CC worker pool (default: all cores).

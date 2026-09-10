@@ -85,6 +85,7 @@ ladybird_build() {
   # Upstream macOS instructions: xcode CLT + brew autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config.
   # Do NOT put Homebrew libtool's gnubin on PATH: skia's build needs Apple's `libtool -static`.
   [ -f "$ROOT/ladybird/Meta/ladybird.py" ] || git -C "$ROOT" submodule update --init --depth 1 ladybird
+  "$ROOT/scripts/ladybird-patches.sh" apply
   for t in cmake ninja nasm autoconf automake glibtool pkg-config; do
     command -v "$t" >/dev/null || { echo "missing $t: brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config"; exit 1; }
   done

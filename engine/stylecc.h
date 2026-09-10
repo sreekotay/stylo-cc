@@ -3,8 +3,8 @@
  *
  * Structured ingest only — no CSS text on the hot path. Rules are compounds +
  * combinators + longhand decls; the tree is upserted by host style-node id.
- * Matching fills stylecc_take_matches; cascade/StyRefs still run inside the
- * engine but Ladybird's C++ StyleComputer is the layout-facing cascade.
+ * Matching stays internal. After style_*, take_used / consume_node_used is
+ * the layout-facing cascade (resolved StyRefs). Hits remain a debug view.
  */
 #ifndef STYLECC_H
 #define STYLECC_H
@@ -85,6 +85,23 @@ typedef struct StyleCCMatch {
     uint8_t pelem;      /* STYLECC_PE_* */
 } StyleCCMatch;
 
+/* Resolved used style for one host node (consume view, not a Ladybird type).
+ * Display ids match engine static atoms: inline=0, block=1, inline-block=2, none=3. */
+typedef struct StyleCCUsed {
+    uint32_t host_node;
+    uint8_t r, g, b, a;
+    uint32_t bgra;   /* Ladybird Color::from_bgra packing */
+    uint8_t display;
+    uint8_t height_auto;
+    uint8_t min_width_auto;
+    uint8_t line_height_normal;
+    float height_px;
+    float min_width_px;
+    float font_size_px;
+    float line_height_px;
+    uint64_t digest; /* used-style identity for O(1) stop */
+} StyleCCUsed;
+
 StyleCC* stylecc_create(void);
 void stylecc_destroy(StyleCC* eng);
 
@@ -125,7 +142,7 @@ int stylecc_add_rule(StyleCC* eng, StyleCCCompound const* compounds, size_t ncom
 /* Replace declaration block (longhand name+value text). */
 int stylecc_set_rule_decls(StyleCC* eng, int rule_id, StyleCCDecl const* decls, size_t ndecl);
 
-/* Host rule id map: Ladybird numbers rules 1-based; we store the host id. */
+/* Host rule id map (embedder numbering; mapped at consume, not in match). */
 void stylecc_set_rule_host_id(StyleCC* eng, int rule_id, uint32_t host_rule_id);
 uint32_t stylecc_rule_host_id(StyleCC* eng, int rule_id);
 
@@ -140,13 +157,25 @@ int stylecc_style_dirty(StyleCC* eng);
 /* Mark host node dirty (bypass fanout). */
 void stylecc_mark_dirty(StyleCC* eng, uint32_t host_id);
 
-/* Matches from the last style_all / style_dirty (per live element + pelem). */
+/* Matches from the last style_all / style_dirty (per live element + pelem).
+ * take_matches uses CC rule ids. consume_node_matches maps to host rule ids. */
 size_t stylecc_match_count(StyleCC* eng);
 size_t stylecc_take_matches(StyleCC* eng, StyleCCMatch* out, size_t cap);
+
+/* Last restyle's per-node view. Restyled-but-empty is a real answer.
+ * Host rule mapping happens here, not in match. */
+int stylecc_node_restyled(StyleCC* eng, uint32_t host_id);
+size_t stylecc_node_match_count(StyleCC* eng, uint32_t host_id);
+size_t stylecc_consume_node_matches(StyleCC* eng, uint32_t host_id, StyleCCMatch* out, size_t cap);
 
 /* Dirty host nodes from the last style_dirty (or all after style_all). */
 size_t stylecc_dirty_count(StyleCC* eng);
 size_t stylecc_take_dirty(StyleCC* eng, uint32_t* out, size_t cap);
+
+/* Hosts whose used style changed this restyle (rematch dirty ∪ inherit-only). */
+size_t stylecc_used_count(StyleCC* eng);
+size_t stylecc_take_used(StyleCC* eng, uint32_t* out, size_t cap);
+int stylecc_consume_node_used(StyleCC* eng, uint32_t host_id, StyleCCUsed* out);
 
 /* Drop counts for the host adapter (unsupported selectors, etc.). */
 void stylecc_note_drop(StyleCC* eng, char const* reason);

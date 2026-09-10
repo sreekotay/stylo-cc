@@ -347,6 +347,14 @@ struct Rule {
     int off;
 };
 
+/* Packed restyle log: engine node + CC rule + pelem. Host ids are a
+ * consume-time view, not written here. Vec backing is store. */
+typedef struct {
+    int node;
+    int rule;
+    uint8_t pelem;
+} MatchHit;
+
 /* One matched rule on its way into the cascade: origin, specificity and
  * order packed so a sort puts the declarations in cascade order. */
 typedef struct {
@@ -402,7 +410,7 @@ typedef struct {
 } Change;
 
 typedef struct {
-    CCArena store;
+    CCArena store;   /* engine lifetime: tree, rules, indexes, host maps, match_log backing */
     Node* nodes;
     int nnodes, cap_nodes;
     Rule* rules;
@@ -502,16 +510,22 @@ typedef struct {
     long cnt_hits_dropped;
     double t_levels, t_share, t_match, t_inherit;
     int last_dirty, sum_dirty;
+    int* used_ids;
+    int last_used;
     double sum_sig, sum_canon, sum_match, sum_copy, sum_inherit;
     double sum_fanout, sum_blooms;
     long cnt_src, cnt_cand, cnt_rules;
     double t0_levels, t0_share, t0_match, t0_inherit;
-    /* Host ABI (stylecc): when set, style_one keeps Hit lists for take_matches. */
+    /* Host ABI: packed engine hits. Backing on store (same grower as
+     * inverted indexes). Extent is restyle-scoped via clear(). */
     int record_matches;
-    int* match_rule;
-    uint8_t* match_pelem;
-    int* match_node;
-    int nmatch_rec, cap_match_rec;
+    Vec::[MatchHit] match_log;
+    int* match_off;
+    int* match_n;
+    int* restyle_gen;
+    int restyle_stamp;
+    /* Embedded hosts (Ladybird): skip @parallel — wait can hang at 0% CPU. */
+    int no_parallel;
 } Engine;
 
 /* Redis Encode shape: restyle cannot mutate the tree; mut under hold
@@ -561,6 +575,8 @@ static void Engine_apply_mut(Engine* e, MutOp* m);
 static CCSlice Engine_intern(Engine* e, CCSlice src);
 static int fill_rule(Engine* e, CssNode* nd, Rule* r);
 static void !>(CCError) Engine_alloc_pools(Engine* e);
+static void Engine_record_matches(Engine* e, int i, Hits* hs);
+static void Engine_begin_match_rec(Engine* e);
 
 /* Relocate {ptr,len} headers on grow. POD — use memcpy, not char[:].copy
  * (that path is non-deterministic under parallel fan-out). */
@@ -569,13 +585,16 @@ static int copy_ccslice_arr(CCSlice* dst, const CCSlice* src, int n) {
     return 1;
 }
 
-/* Value texts interned to small ids; the first N_STATIC_ATOMS are fixed. */
+/* Value texts interned to small ids; the first N_STATIC_ATOMS are fixed.
+ * Intern first, then look up: atom_id is keyed by interned slices, and a
+ * raw take_decl slice would otherwise miss A_* and mint a late id. */
 static int Engine_atom(Engine* e, CCSlice text) {
     text = text.trim();
     if (!text.len) text = @slice("normal");
-    int* hit = e->atom_id->get_ptr(text);
-    if (hit) return *hit;
     CCSlice owned = e->intern(text);
+    if (!owned.len) return A_normal;
+    int* hit = e->atom_id->get_ptr(owned);
+    if (hit) return *hit;
     if (e->natoms >= e->cap_atoms) {
         int cap = e->cap_atoms ? e->cap_atoms * 2 : 1024;
         CCSlice* p = e->store.allocT::[CCSlice](cap);
@@ -2226,6 +2245,8 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     e->chg_order = e->store.allocT::[uint64_t](e->cap_changes);
     e->nchanges = 0;
     e->inv_ids = e->store.allocT::[int](e->cap_nodes);
+    e->used_ids = e->store.allocT::[int](e->cap_nodes);
+    e->last_used = 0;
     e->inv_off = e->store.allocT::[int](e->cap_nodes);
     e->inv_sig = e->store.allocT::[uint64_t](e->cap_nodes);
     e->rule_gen = e->store.allocT::[int](e->cap_rules);
@@ -2269,7 +2290,7 @@ static void !>(CCError) Engine_load_fixture(Engine* e, char[:] text) {
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
         !e->child_pairs || !e->desc_pairs ||
-        !e->left_rules || !e->muts || !e->changes || !e->inv_ids || !e->inv_off ||
+        !e->left_rules || !e->muts || !e->changes || !e->inv_ids || !e->used_ids || !e->inv_off ||
         !e->inv_sig || !e->rule_gen || !e->rule_slot || !e->inv_rules ||
         !e->leaf_ops || !e->leaf_op_parent || !e->fo_ids || !e->fo_off ||
         !e->fo_job || !e->fo_sig || !e->fo_rules || !e->fo_jobs ||
@@ -2340,11 +2361,10 @@ static void !>(CCError) Engine_alloc_pools(Engine* e) {
             for (int d = 0; d < tmp.inline_rule->ndecl; d++)
                 used |= 1u << PROP_FAM[tmp.inline_rule->decls[d].prop];
     }
-    e->fam_used = used;
+    e->fam_used |= used;
     size_t slots = 3u * (size_t)e->cap_nodes;
     for (int f = 0; f < N_FAM; f++) {
-        e->fpool[f] = 0;
-        if (!(used & (1u << f))) continue;
+        if (!(used & (1u << f)) || e->fpool[f]) continue;
         e->fpool[f] = cc_arena_alloc(e->store, FAM_SIZEOF[f] * slots, 16);
         if (!e->fpool[f]) return cc_err(CC_ERR_OUT_OF_MEMORY, "family pool");
     }
@@ -2834,34 +2854,48 @@ static void Engine_style_one(Engine* e, int i, Hits* hs) {
     }
     Engine_apply_sib(e, i, n, hs);
     if (e->record_matches) {
-        for (int t = 0; t < 3; t++) {
-            for (int k = 0; k < hs->n[t]; k++) {
-                if (e->nmatch_rec >= e->cap_match_rec) {
-                    int nc = e->cap_match_rec ? e->cap_match_rec * 2 : 256;
-                    int* nr = (int*)realloc(e->match_rule, sizeof(int) * (size_t)nc);
-                    uint8_t* np = (uint8_t*)realloc(e->match_pelem, (size_t)nc);
-                    int* nn = (int*)realloc(e->match_node, sizeof(int) * (size_t)nc);
-                    if (!nr || !np || !nn) {
-                        free(nr);
-                        free(np);
-                        free(nn);
-                        break;
-                    }
-                    e->match_rule = nr;
-                    e->match_pelem = np;
-                    e->match_node = nn;
-                    e->cap_match_rec = nc;
-                }
-                e->match_node[e->nmatch_rec] = i;
-                e->match_rule[e->nmatch_rec] = hs->h[t][k].rule;
-                e->match_pelem[e->nmatch_rec] = (uint8_t)t;
-                e->nmatch_rec++;
-            }
-        }
+        for (int t = 0; t < 3; t++)
+            hits_sort(hs->h[t], hs->n[t]);
+        Engine_record_matches(e, i, hs);
     }
     e->cascade(n, i, hs->h[0], hs->n[0], n->inline_rule);
     for (int p = 0; p < 2; p++)
         e->cascade(&e->pnodes[2 * i + p], e->cap_nodes + 2 * i + p, hs->h[1 + p], hs->n[1 + p], 0);
+}
+
+static void Engine_begin_match_rec(Engine* e) {
+    /* Keep restyle capacity: Vec owner_regrow, not arena reset. */
+    e->match_log.clear();
+    e->restyle_stamp++;
+    if (e->restyle_stamp == 0) {
+        if (e->restyle_gen)
+            memset(e->restyle_gen, 0, sizeof(int) * (size_t)e->cap_nodes);
+        e->restyle_stamp = 1;
+    }
+}
+
+/* Packed in cascade order (hits already sorted). Engine rule ids — the
+ * host maps at the consume view, not here. */
+static void Engine_record_matches(Engine* e, int i, Hits* hs) {
+    if (e->restyle_gen)
+        e->restyle_gen[i] = e->restyle_stamp;
+    int n0 = (int)e->match_log.len;
+    if (e->match_off)
+        e->match_off[i] = n0;
+    for (int t = 0; t < 3; t++) {
+        for (int k = 0; k < hs->n[t]; k++) {
+            MatchHit h;
+            h.node = i;
+            h.rule = hs->h[t][k].rule;
+            h.pelem = (uint8_t)t;
+            if (e->match_log.push(h) != 0) {
+                if (e->match_n) e->match_n[i] = (int)e->match_log.len - n0;
+                return;
+            }
+        }
+    }
+    if (e->match_n)
+        e->match_n[i] = (int)e->match_log.len - n0;
 }
 
 
@@ -3504,16 +3538,18 @@ static void Engine_fo_flush(Engine* eng) {
     if (nc) {
         int na = arm_count(nc);
         int sz = arm_size(nc);
-        if (na <= 1) {
-            Engine_fo_arm(eng, nc, 0, sz, 0);
+        if (eng->no_parallel || na <= 1) {
+            for (int a = 0; a < na; a++)
+                Engine_fo_arm(eng, nc, a, sz, 0);
         } else {
             @parallel for (a in 0..na) {
                 Engine_fo_arm(eng, nc, a, sz, 0);
             } !>.wait()!>;
         }
         eng->undo_all();
-        if (na <= 1) {
-            Engine_fo_arm(eng, nc, 0, sz, 1);
+        if (eng->no_parallel || na <= 1) {
+            for (int a = 0; a < na; a++)
+                Engine_fo_arm(eng, nc, a, sz, 1);
         } else {
             @parallel for (a in 0..na) {
                 Engine_fo_arm(eng, nc, a, sz, 1);
@@ -3598,8 +3634,9 @@ static void Engine_media_dirty(Engine* eng) {
     int nn = eng->nnodes;
     int na = arm_count(nn);
     int sz = arm_size(nn);
-    if (na <= 1) {
-        Engine_mq_arm(eng, nn, 0, sz, nt, nopen);
+    if (eng->no_parallel || na <= 1) {
+        for (int a = 0; a < na; a++)
+            Engine_mq_arm(eng, nn, a, sz, nt, nopen);
     } else {
         @parallel for (a in 0..na) {
             Engine_mq_arm(eng, nn, a, sz, nt, nopen);
@@ -3617,6 +3654,26 @@ static void Engine_clear_dirty(Engine* e) {
         e->nodes[i].dirty = 0;
         e->nodes[i].inh_dirty = 0;
     }
+}
+
+static void Engine_stamp_used(Engine* e) {
+    int n = 0;
+    for (int i = 0; i < e->nnodes; i++) {
+        Node* nd = &e->nodes[i];
+        if (nd->dead) continue;
+        if (!nd->dirty && !nd->inh_dirty) continue;
+        if (e->used_ids) e->used_ids[n++] = i;
+    }
+    e->last_used = n;
+}
+
+static void Engine_stamp_used_all(Engine* e) {
+    int n = 0;
+    for (int i = 0; i < e->nnodes; i++) {
+        if (e->nodes[i].dead) continue;
+        if (e->used_ids) e->used_ids[n++] = i;
+    }
+    e->last_used = n;
 }
 
 /* Dirty nodes start over. Their inherited structs are snapshotted first:
@@ -3747,30 +3804,40 @@ static void Engine_style_arm(Engine* e, int n, int arm, int dirty_only) {
 
 static void !>(CCError) Engine_style_all(Engine* eng) {
     EngineMatch m = eng;
-    eng->nmatch_rec = 0;
+    Engine_begin_match_rec(eng);
     double t0 = now_ms();
     m->paint_levels();
     int nn = eng->nnodes;
     int na = arm_count(nn);
     if (eng->pseudo_used) {
         int sz = arm_size(nn);
-        @parallel for (a in 0..na) {
-            Engine_pos_arm(eng, nn, a, sz);
-        } !>.wait()!>;
+        if (eng->no_parallel || na <= 1) {
+            for (int a = 0; a < na; a++)
+                Engine_pos_arm(eng, nn, a, sz);
+        } else {
+            @parallel for (a in 0..na) {
+                Engine_pos_arm(eng, nn, a, sz);
+            } !>.wait()!>;
+        }
     }
     eng->t_levels = now_ms() - t0;
     t0 = now_ms();
-    @parallel for (a in 0..na) {
-        Engine_sig_arm(eng, 0, nn, a);
-    } !>.wait()!>;
+    if (eng->no_parallel || na <= 1) {
+        for (int a = 0; a < na; a++)
+            Engine_sig_arm(eng, 0, nn, a);
+    } else {
+        @parallel for (a in 0..na) {
+            Engine_sig_arm(eng, 0, nn, a);
+        } !>.wait()!>;
+    }
     eng->build_share();
     eng->t_share = now_ms() - t0;
     int nc = eng->ncanon;
     t0 = now_ms();
     na = arm_count(nc);
     if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
-    /* record_matches appends to shared buffers — must not run style_arm in parallel. */
-    if (eng->record_matches || na <= 1) {
+    /* record_matches / host: shared match buffers — serial style_arm. */
+    if (eng->no_parallel || eng->record_matches || na <= 1) {
         for (int a = 0; a < na; a++)
             Engine_style_arm(eng, nc, a, 0);
     } else {
@@ -3794,7 +3861,7 @@ static void !>(CCError) Engine_style_all(Engine* eng) {
 
 static void !>(CCError) Engine_style_dirty(Engine* eng) {
     EngineMatch m = eng;
-    eng->nmatch_rec = 0;
+    Engine_begin_match_rec(eng);
     double t0 = now_ms();
     if (eng->levels_stale) {
         m->paint_levels();
@@ -3807,8 +3874,9 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
         if (eng->nodes[i].dirty && !eng->nodes[i].dead)
             eng->inv_ids[nd++] = i;
     int na = arm_count(nd);
-    if (na <= 1) {
-        Engine_sig_arm(eng, eng->inv_ids, nd, 0);
+    if (eng->no_parallel || na <= 1) {
+        for (int a = 0; a < na; a++)
+            Engine_sig_arm(eng, eng->inv_ids, nd, a);
     } else {
         @parallel for (a in 0..na) {
             Engine_sig_arm(eng, eng->inv_ids, nd, a);
@@ -3824,7 +3892,7 @@ static void !>(CCError) Engine_style_dirty(Engine* eng) {
     t0 = now_ms();
     na = arm_count(nc);
     if (!Engine_ensure_hits(eng, na)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hit scratch");
-    if (eng->record_matches || na <= 1) {
+    if (eng->no_parallel || eng->record_matches || na <= 1) {
         for (int a = 0; a < na; a++)
             Engine_style_arm(eng, nc, a, 1);
     } else {
@@ -4272,6 +4340,7 @@ struct StyleCC {
     uint64_t drops;
     int indexed;
     int pools_ready;
+    int need_full_bloom;
 };
 
 static CCSlice stylecc_atom_slice(StyleCC* sc, uint32_t a) {
@@ -4306,6 +4375,8 @@ static int Engine_init_host(Engine* e, int cap_nodes, int cap_rules) {
     e->chg_order = e->store.allocT::[uint64_t](e->cap_changes);
     e->nchanges = 0;
     e->inv_ids = e->store.allocT::[int](e->cap_nodes);
+    e->used_ids = e->store.allocT::[int](e->cap_nodes);
+    e->last_used = 0;
     e->inv_off = e->store.allocT::[int](e->cap_nodes);
     e->inv_sig = e->store.allocT::[uint64_t](e->cap_nodes);
     e->rule_gen = e->store.allocT::[int](e->cap_rules);
@@ -4342,14 +4413,24 @@ static int Engine_init_host(Engine* e, int cap_nodes, int cap_rules) {
     e->viewport_w = 800;
     e->hover_src = -1;
     e->record_matches = 1;
+    e->no_parallel = 1;
+    e->match_off = e->store.allocT::[int](e->cap_nodes);
+    e->match_n = e->store.allocT::[int](e->cap_nodes);
+    e->restyle_gen = e->store.allocT::[int](e->cap_nodes);
+    e->restyle_stamp = 1;
+    e->match_log = vec_new::[MatchHit](e->store);
+    if (e->match_off) memset(e->match_off, 0, sizeof(int) * (size_t)e->cap_nodes);
+    if (e->match_n) memset(e->match_n, 0, sizeof(int) * (size_t)e->cap_nodes);
+    if (e->restyle_gen) memset(e->restyle_gen, 0, sizeof(int) * (size_t)e->cap_nodes);
     if (!e->nodes || !e->rules || !e->pool || !e->by_id || !e->by_class || !e->by_type ||
         !e->by_parent_id || !e->by_parent_class || !e->by_parent_type ||
         !e->child_pairs || !e->desc_pairs || !e->left_rules || !e->muts || !e->changes ||
-        !e->inv_ids || !e->inv_off || !e->inv_sig || !e->rule_gen || !e->rule_slot ||
+        !e->inv_ids || !e->used_ids || !e->inv_off || !e->inv_sig || !e->rule_gen || !e->rule_slot ||
         !e->inv_rules || !e->leaf_ops || !e->leaf_op_parent || !e->fo_ids || !e->fo_off ||
         !e->fo_job || !e->fo_sig || !e->fo_rules || !e->fo_jobs || !e->level_ids ||
         !e->level_off || !e->share_of || !e->share_ents || !e->pnodes || !e->snaps ||
-        !e->snap_of || !e->atom_id || !e->atoms)
+        !e->snap_of || !e->atom_id || !e->atoms || !e->match_off || !e->match_n ||
+        !e->restyle_gen || !e->match_log.data)
         return 0;
     Sty_init_values();
     for (int k = 0; k < N_STATIC_ATOMS; k++) {
@@ -4366,40 +4447,49 @@ static int Engine_init_host(Engine* e, int cap_nodes, int cap_rules) {
     return 1;
 }
 
+static int stylecc_bind_maps(StyleCC* sc) {
+    CCArena a = sc->eng.store;
+    sc->cap_host = STYLECC_HOST_NODES;
+    sc->eng_of_host = a.allocT::[int](sc->cap_host);
+    sc->host_of_eng = a.allocT::[uint32_t](STYLECC_HOST_NODES);
+    sc->rule_host = a.allocT::[uint32_t](STYLECC_HOST_RULES);
+    sc->cap_atom_host = 4096;
+    sc->atom_text = a.allocT::[CCSlice](sc->cap_atom_host);
+    sc->natom_host = 1;
+    if (!sc->eng_of_host || !sc->host_of_eng || !sc->rule_host || !sc->atom_text)
+        return 0;
+    memset(sc->host_of_eng, 0, sizeof(uint32_t) * (size_t)STYLECC_HOST_NODES);
+    memset(sc->rule_host, 0, sizeof(uint32_t) * (size_t)STYLECC_HOST_RULES);
+    memset(sc->atom_text, 0, sizeof(CCSlice) * sc->cap_atom_host);
+    for (uint32_t i = 0; i < sc->cap_host; i++)
+        sc->eng_of_host[i] = -1;
+    return 1;
+}
+
 StyleCC* stylecc_create(void) {
     StyleCC* sc = (StyleCC*)calloc(1, sizeof(StyleCC));
     if (!sc) return 0;
+    /* Ladybird/WebContent: CC @parallel can deadlock against the browser's
+     * thread model. Default to one worker; override with STYLECC_WORKERS. */
+    {
+        const char* wenv = getenv("STYLECC_WORKERS");
+        size_t n = 1;
+        if (wenv && atoi(wenv) > 0) n = (size_t)atoi(wenv);
+        cc_sched_set_num_workers(n);
+    }
     sc->eng.store = cc_arena_heap(megabytes(256));
-    if (!Engine_init_host(&sc->eng, STYLECC_HOST_NODES, STYLECC_HOST_RULES)) {
+    if (!cc_arena_valid(sc->eng.store) ||
+        !Engine_init_host(&sc->eng, STYLECC_HOST_NODES, STYLECC_HOST_RULES) ||
+        !stylecc_bind_maps(sc)) {
         stylecc_destroy(sc);
         return 0;
     }
-    sc->cap_host = STYLECC_HOST_NODES;
-    sc->eng_of_host = (int*)calloc(sc->cap_host, sizeof(int));
-    sc->host_of_eng = (uint32_t*)calloc((size_t)STYLECC_HOST_NODES, sizeof(uint32_t));
-    sc->rule_host = (uint32_t*)calloc((size_t)STYLECC_HOST_RULES, sizeof(uint32_t));
-    sc->cap_atom_host = 4096;
-    sc->atom_text = (CCSlice*)calloc(sc->cap_atom_host, sizeof(CCSlice));
-    sc->natom_host = 1; /* 0 reserved */
-    if (!sc->eng_of_host || !sc->host_of_eng || !sc->rule_host || !sc->atom_text) {
-        stylecc_destroy(sc);
-        return 0;
-    }
-    for (uint32_t i = 0; i < sc->cap_host; i++)
-        sc->eng_of_host[i] = -1;
     return sc;
 }
 
 void stylecc_destroy(StyleCC* sc) {
     if (!sc) return;
-    free(sc->eng.match_rule);
-    free(sc->eng.match_pelem);
-    free(sc->eng.match_node);
-    free(sc->eng_of_host);
-    free(sc->host_of_eng);
-    free(sc->rule_host);
-    free(sc->atom_text);
-    /* Arena is not separately destroyed: process teardown. */
+    cc_arena_destroy(&sc->eng.store);
     free(sc);
 }
 
@@ -4414,8 +4504,9 @@ uint32_t stylecc_intern(StyleCC* sc, char const* s, size_t len) {
             return i;
     if (sc->natom_host >= sc->cap_atom_host) {
         uint32_t nc = sc->cap_atom_host * 2;
-        CCSlice* na = (CCSlice*)realloc(sc->atom_text, sizeof(CCSlice) * nc);
+        CCSlice* na = (CCSlice*)cc_arena_alloc(sc->eng.store, sizeof(CCSlice) * nc, 8);
         if (!na) return 0;
+        memcpy(na, sc->atom_text, sizeof(CCSlice) * sc->cap_atom_host);
         memset(na + sc->cap_atom_host, 0, sizeof(CCSlice) * (nc - sc->cap_atom_host));
         sc->atom_text = na;
         sc->cap_atom_host = nc;
@@ -4429,8 +4520,9 @@ static int stylecc_map_host(StyleCC* sc, uint32_t host_id) {
     if (!host_id) return -1;
     if (host_id >= sc->cap_host) {
         uint32_t nc = host_id + 1024;
-        int* n = (int*)realloc(sc->eng_of_host, sizeof(int) * nc);
+        int* n = (int*)cc_arena_alloc(sc->eng.store, sizeof(int) * nc, 8);
         if (!n) return -1;
+        memcpy(n, sc->eng_of_host, sizeof(int) * sc->cap_host);
         for (uint32_t i = sc->cap_host; i < nc; i++) n[i] = -1;
         sc->eng_of_host = n;
         sc->cap_host = nc;
@@ -4504,6 +4596,7 @@ int stylecc_upsert_node(StyleCC* sc, uint32_t host_id, uint32_t parent_host,
     nd->dirty = 1;
     sc->eng.levels_stale = 1;
     sc->eng.set_inline_rule(nd);
+    sc->eng.note_leaf_op(ei, parent);
     return ei;
 }
 
@@ -4544,6 +4637,8 @@ int stylecc_set_connected(StyleCC* sc, uint32_t host_id, int connected,
         sc->eng.insert_child(parent, sibling_index, ei);
     nd->dirty = 1;
     sc->eng.levels_stale = 1;
+    if (connected)
+        sc->eng.note_leaf_op(ei, parent);
     return 0;
 }
 
@@ -4744,11 +4839,16 @@ int stylecc_index_rules(StyleCC* sc) {
     sc->eng.sib_by_type = map_new::[CCSlice, Vec::[int]](sc->eng.store);
     sc->eng.sib_universal = vec_new::[int](sc->eng.store);
     sc->eng.index_rules() !>;
-    if (!sc->pools_ready) {
-        sc->eng.alloc_pools() !>;
-        sc->pools_ready = 1;
-    }
+    sc->eng.alloc_pools() !>;
+    sc->pools_ready = 1;
     sc->indexed = 1;
+    sc->need_full_bloom = 1;
+    /* Sheet change: restyle everyone. inherit_one reads parent.sty; if the
+     * parent was never cascaded against this index it is still INIT (16px). */
+    for (int i = 0; i < sc->eng.nnodes; i++) {
+        if (!sc->eng.nodes[i].dead)
+            sc->eng.nodes[i].dirty = 1;
+    }
     return 0;
 }
 
@@ -4757,7 +4857,10 @@ int stylecc_style_all(StyleCC* sc) {
     @errhandler(CCError e) { (void)e; return -1; }
     if (!sc->indexed && stylecc_index_rules(sc) != 0) return -1;
     sc->eng.paint_blooms();
+    sc->need_full_bloom = 0;
+    sc->eng.nleaf_ops = 0;
     sc->eng.style_all() !>;
+    sc->eng.stamp_used_all();
     return 0;
 }
 
@@ -4765,12 +4868,19 @@ int stylecc_style_dirty(StyleCC* sc) {
     if (!sc) return -1;
     @errhandler(CCError e) { (void)e; return -1; }
     if (!sc->indexed && stylecc_index_rules(sc) != 0) return -1;
-    sc->eng.paint_blooms_dirty();
+    if (sc->need_full_bloom) {
+        sc->eng.paint_blooms();
+        sc->need_full_bloom = 0;
+        sc->eng.nleaf_ops = 0;
+    } else {
+        sc->eng.paint_blooms_dirty();
+    }
     sc->eng.fanout_dirty();
     if (sc->eng.resized) sc->eng.media_dirty();
     sc->eng.reset_dirty();
     /* Snapshot dirty hosts before clear — take_dirty reads this stamp via last_dirty list. */
     sc->eng.style_dirty() !>;
+    sc->eng.stamp_used();
     sc->eng.clear_dirty();
     sc->eng.resized = 0;
     sc->eng.nchanges = 0;
@@ -4784,20 +4894,74 @@ void stylecc_mark_dirty(StyleCC* sc, uint32_t host_id) {
 }
 
 size_t stylecc_match_count(StyleCC* sc) {
-    return sc ? (size_t)sc->eng.nmatch_rec : 0;
+    return sc ? sc->eng.match_log.len : 0;
 }
 
 size_t stylecc_take_matches(StyleCC* sc, StyleCCMatch* out, size_t cap) {
     if (!sc || !out || !cap) return stylecc_match_count(sc);
-    size_t n = (size_t)sc->eng.nmatch_rec;
+    size_t n = sc->eng.match_log.len;
     if (n > cap) n = cap;
+    MatchHit* hits = sc->eng.match_log.data;
     for (size_t i = 0; i < n; i++) {
-        int ei = sc->eng.match_node[i];
+        int ei = hits[i].node;
         out[i].host_node = ei >= 0 && ei < STYLECC_HOST_NODES ? sc->host_of_eng[ei] : 0;
-        out[i].rule_id = sc->eng.match_rule[i];
-        out[i].pelem = sc->eng.match_pelem[i];
+        out[i].rule_id = hits[i].rule;
+        out[i].pelem = hits[i].pelem;
     }
-    return (size_t)sc->eng.nmatch_rec;
+    return sc->eng.match_log.len;
+}
+
+static int stylecc_peek_eng(StyleCC* sc, uint32_t host_id) {
+    if (!sc || !host_id || host_id >= sc->cap_host) return -1;
+    return sc->eng_of_host[host_id];
+}
+
+int stylecc_node_restyled(StyleCC* sc, uint32_t host_id) {
+    int ei = stylecc_peek_eng(sc, host_id);
+    if (ei < 0 || !sc->eng.restyle_gen) return 0;
+    return sc->eng.restyle_gen[ei] == sc->eng.restyle_stamp;
+}
+
+size_t stylecc_node_match_count(StyleCC* sc, uint32_t host_id) {
+    if (!stylecc_node_restyled(sc, host_id) || !sc->eng.match_log.data) return 0;
+    int ei = stylecc_peek_eng(sc, host_id);
+    int off = sc->eng.match_off[ei];
+    int n = sc->eng.match_n[ei];
+    MatchHit* hits = sc->eng.match_log.data;
+    size_t nlog = sc->eng.match_log.len;
+    size_t c = 0;
+    for (int k = 0; k < n; k++) {
+        int idx = off + k;
+        if (idx < 0 || (size_t)idx >= nlog) continue;
+        int r = hits[idx].rule;
+        if (r >= 0 && r < STYLECC_HOST_RULES && sc->rule_host[r])
+            c++;
+    }
+    return c;
+}
+
+size_t stylecc_consume_node_matches(StyleCC* sc, uint32_t host_id, StyleCCMatch* out, size_t cap) {
+    size_t total = stylecc_node_match_count(sc, host_id);
+    if (!sc || !out || !cap) return total;
+    if (!stylecc_node_restyled(sc, host_id) || !sc->eng.match_log.data) return total;
+    int ei = stylecc_peek_eng(sc, host_id);
+    int off = sc->eng.match_off[ei];
+    int n = sc->eng.match_n[ei];
+    MatchHit* hits = sc->eng.match_log.data;
+    size_t nlog = sc->eng.match_log.len;
+    size_t w = 0;
+    for (int k = 0; k < n && w < cap; k++) {
+        int idx = off + k;
+        if (idx < 0 || (size_t)idx >= nlog) continue;
+        int r = hits[idx].rule;
+        uint32_t hr = (r >= 0 && r < STYLECC_HOST_RULES) ? sc->rule_host[r] : 0;
+        if (!hr) continue;
+        out[w].host_node = host_id;
+        out[w].rule_id = (int)hr;
+        out[w].pelem = hits[idx].pelem;
+        w++;
+    }
+    return total;
 }
 
 size_t stylecc_dirty_count(StyleCC* sc) {
@@ -4815,6 +4979,118 @@ size_t stylecc_take_dirty(StyleCC* sc, uint32_t* out, size_t cap) {
     return total;
 }
 
+static uint64_t stylecc_mix_u32(uint64_t h, uint32_t x) {
+    h ^= x;
+    h *= 0x100000001b3ULL;
+    return h;
+}
+
+static uint64_t stylecc_mix_f32(uint64_t h, float f) {
+    uint32_t bits = 0;
+    memcpy(&bits, &f, sizeof bits);
+    return stylecc_mix_u32(h, bits);
+}
+
+/* ABI display: inline=0, block=1, inline-block=2, none=3. Unknown → 255. */
+static uint8_t stylecc_pack_display(Engine* e, int d) {
+    if (d == A_inline) return 0;
+    if (d == A_block) return 1;
+    if (d == A_inline_block) return 2;
+    if (d == A_none) return 3;
+    if (d < 0 || d >= e->natoms) return 255;
+    CCSlice t = e->atoms[d];
+    if (t.eq_cstr("inline") || t.eq_cstr("inline flow")) return 0;
+    if (t.eq_cstr("block") || t.eq_cstr("block flow")) return 1;
+    if (t.eq_cstr("inline-block") || t.eq_cstr("inline flow-root")) return 2;
+    if (t.eq_cstr("none")) return 3;
+    return 255;
+}
+
+static void stylecc_note_display_atom(Engine* e, int d, uint8_t packed) {
+    static int seen[64];
+    static int nseen;
+    static int logged;
+    int i;
+    if (packed != 255 && logged >= 16) return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == d) return;
+    if (nseen < 64) seen[nseen++] = d;
+    CCSlice t = (d >= 0 && d < e->natoms) ? e->atoms[d] : cc_slice_empty();
+    fprintf(stderr, "stylecc display atom=%d packed=%u text=%.*s\n",
+            d, (unsigned)packed, (int)t.len, t.ptr ? t.ptr : "");
+    logged++;
+}
+
+static void stylecc_fill_used(StyleCC* sc, int ei, StyleCCUsed* out) {
+    memset(out, 0, sizeof(*out));
+    out->host_node = sc->host_of_eng[ei];
+    Node* n = &sc->eng.nodes[ei];
+    if (n->sty.background) {
+        Sty_background const* bg = (Sty_background const*)n->sty.background;
+        CssColor c = bg->background_color;
+        out->r = c.r;
+        out->g = c.g;
+        out->b = c.b;
+        out->a = (c.kw == CKW_RGB) ? c.a : 255;
+        if (c.kw == CKW_CURRENT || c.kw == CKW_NONE || c.kw == CKW_AUTO)
+            out->a = 255;
+        out->bgra = ((uint32_t)out->a << 24) | ((uint32_t)out->r << 16) | ((uint32_t)out->g << 8) | (uint32_t)out->b;
+    }
+    if (n->sty.box) {
+        int d = ((Sty_box const*)n->sty.box)->display;
+        out->display = stylecc_pack_display(&sc->eng, d);
+        stylecc_note_display_atom(&sc->eng, d, out->display);
+    }
+    if (n->sty.position) {
+        Sty_position const* pos = (Sty_position const*)n->sty.position;
+        out->height_auto = (uint8_t)(pos->height.kw == LKW_AUTO);
+        out->min_width_auto = (uint8_t)(pos->min_width.kw == LKW_AUTO);
+        out->height_px = pos->height.px;
+        out->min_width_px = pos->min_width.px;
+    } else {
+        out->height_auto = 1;
+        out->min_width_auto = 1;
+    }
+    if (n->sty.font) {
+        Sty_font const* font = (Sty_font const*)n->sty.font;
+        out->font_size_px = font->font_size.px;
+        out->line_height_normal = (uint8_t)(font->line_height.kw == LKW_NORMAL);
+        out->line_height_px = font->line_height.px;
+    }
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h = stylecc_mix_u32(h, out->bgra);
+    h = stylecc_mix_u32(h, out->display);
+    h = stylecc_mix_u32(h, ((uint32_t)out->height_auto << 16) | ((uint32_t)out->min_width_auto << 8) | out->line_height_normal);
+    h = stylecc_mix_f32(h, out->height_px);
+    h = stylecc_mix_f32(h, out->min_width_px);
+    h = stylecc_mix_f32(h, out->font_size_px);
+    h = stylecc_mix_f32(h, out->line_height_px);
+    out->digest = h;
+}
+
+size_t stylecc_used_count(StyleCC* sc) {
+    return sc ? (size_t)sc->eng.last_used : 0;
+}
+
+size_t stylecc_take_used(StyleCC* sc, uint32_t* out, size_t cap) {
+    if (!sc) return 0;
+    size_t total = (size_t)sc->eng.last_used;
+    size_t n = 0;
+    for (size_t i = 0; i < total; i++) {
+        int ei = sc->eng.used_ids[i];
+        if (out && n < cap) out[n++] = sc->host_of_eng[ei];
+    }
+    return total;
+}
+
+int stylecc_consume_node_used(StyleCC* sc, uint32_t host_id, StyleCCUsed* out) {
+    if (!sc || !out) return -1;
+    int ei = stylecc_peek_eng(sc, host_id);
+    if (ei < 0) return -1;
+    stylecc_fill_used(sc, ei, out);
+    return 0;
+}
+
 void stylecc_note_drop(StyleCC* sc, char const* reason) {
     (void)reason;
     if (sc) sc->drops++;
@@ -4827,10 +5103,14 @@ uint64_t stylecc_drop_count(StyleCC* sc) {
 int stylecc_load_fixture(StyleCC* sc, char const* text, size_t len) {
     if (!sc || !text) return -1;
     @errhandler(CCError e) { (void)e; return -1; }
-    /* Host engines already allocated; fixture path is for ABI tests only.
-     * Re-init from scratch. */
+    /* Host engines already allocated; fixture path is for ABI tests only. */
+    cc_arena_destroy(&sc->eng.store);
     memset(&sc->eng, 0, sizeof(sc->eng));
     sc->eng.store = cc_arena_heap(megabytes(128));
+    if (!cc_arena_valid(sc->eng.store) ||
+        !Engine_init_host(&sc->eng, STYLECC_HOST_NODES, STYLECC_HOST_RULES) ||
+        !stylecc_bind_maps(sc))
+        return -1;
     sc->eng.load_fixture(cc_slice_from_buffer((void*)text, len)) !>;
     sc->eng.record_matches = 1;
     sc->indexed = 1;

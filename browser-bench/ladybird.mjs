@@ -4,6 +4,7 @@
 //   node ladybird.mjs [--bin PATH] [--iterations N] [--suite NAME] [--json OUT] [--stall SEC] [--headed]
 //                     [--conservative]   # StyleBenchConservative's _runTest (see conservative.mjs)
 //                     [--internals]      # + Ladybird's own style clock per step (implies --conservative)
+//                     [--dump-computed [FILE]]  # getComputedStyle + box of sample + new leaves (implies --conservative)
 //
 // Playwright cannot drive Ladybird, so this works the way Ladybird's own perf harness
 // (LadybirdBrowser/web-benchmarks) does: serve StyleBench, but swap the stock
@@ -36,7 +37,13 @@ const stallSec = parseInt(opt('stall', '600'), 10); // Ladybird can take minutes
 const headed = !!opt('headed', false);
 const port = parseInt(opt('port', '8766'), 10);
 const internals = !!opt('internals', false);
-const conservative = !!opt('conservative', false) || internals;
+const dumpComputedArg = (() => {
+  const i = args.indexOf('--dump-computed');
+  if (i < 0) return null;
+  const v = args[i + 1];
+  return v === undefined || v.startsWith('--') ? true : v;
+})();
+const conservative = !!opt('conservative', false) || internals || !!dumpComputedArg;
 
 if (!fs.existsSync(bin)) {
   console.error(`Ladybird binary not found at ${bin}\nbuild it:  cd ladybird && BUILD_PRESET=Distribution ./Meta/ladybird.py build ladybird`);
@@ -61,6 +68,42 @@ var lbSample = function (w) { var c = w.internals.getStyleInvalidationCounters()
 var lbDelta = function (a, b) { var o = {}; for (var k of LB_KEYS) o[k] = b[k] - a[k]; return o; };
 var lbFlush = function (w, d) { window._unusedBackgroundColorValue = w.getComputedStyle(d.body).backgroundColor; window._unusedHeightValue = d.body.getBoundingClientRect().height; };
 var lbPost = function (path, body) { var x = new XMLHttpRequest(); x.open("POST", path); x.setRequestHeader("Content-Type", "application/json"); x.send(JSON.stringify(body)); };
+var lbPath = function (el, root) {
+    var p = [];
+    for (var n = el; n && n !== root; n = n.parentElement) {
+        var i = 0, s = n.previousElementSibling;
+        while (s) { i++; s = s.previousElementSibling; }
+        p.unshift(i);
+    }
+    return p.join('/');
+};
+var lbDumpEl = function (w, el, root) {
+    var cs = w.getComputedStyle(el);
+    var r = el.getBoundingClientRect();
+    return {
+        path: lbPath(el, root), tag: el.tagName, id: el.id, className: String(el.className),
+        display: cs.display, height: cs.height, minWidth: cs.minWidth, backgroundColor: cs.backgroundColor,
+        fontSize: cs.fontSize, lineHeight: cs.lineHeight,
+        x: r.x, y: r.y, w: r.width, h: r.height
+    };
+};
+var lbDumpEnabled = ${dumpComputedArg ? 'true' : 'false'};
+var lbDump = function (w, d, suite, test, before) {
+    if (!lbDumpEnabled) return;
+    var want = test === 'init' || test === 'Adding classes - 0' || test === 'Adding leaf elements - 0';
+    if (!want) return;
+    var root = d.getElementById('testroot');
+    var all = root.querySelectorAll('*');
+    var sample = [], stride = Math.max(1, Math.floor(all.length / 32));
+    for (var i = 0; i < all.length && sample.length < 32; i += stride) sample.push(lbDumpEl(w, all[i], root));
+    var added = [];
+    if (before) {
+        for (var i = 0; i < all.length; i++) {
+            if (!before.has(all[i])) added.push(lbDumpEl(w, all[i], root));
+        }
+    }
+    lbPost('/ComputedDump', { suite: suite, test: test, live: all.length, sample: sample, added: added });
+};
 // Initial resolution: flush right after createBenchmark() returns, in the same task, before the
 // setTimeout that precedes the first step gives Ladybird a rendering opportunity. (SimplePromise
 // runs its callbacks synchronously, so this is still inside prepare's task.)
@@ -73,6 +116,7 @@ BenchmarkState.prototype.prepareCurrentSuite = function (runner, frame) {
             var s0 = lbSample(w); var t0 = performance.now();
             lbFlush(w, d);
             var t1 = performance.now(); var s1 = lbSample(w);
+            lbDump(w, d, suite.name, 'init', null);
             lbPost("/SuitePrepared", { suite: suite.name, wall: t1 - t0, init: lbDelta(s0, s1), live: d.getElementById('testroot').querySelectorAll('*').length });
             promise.resolve(result);
         });
@@ -89,8 +133,10 @@ BenchmarkRunner.prototype._runTest = function (suite, test, prepareReturnValue, 
     var s1 = lbSample(w);
     self._writeMark(suite.name + '.' + test.name + '-start');
     var startTime = now();
+    var before = test.name.indexOf('Adding leaf elements') === 0 ? new Set(d.getElementById('testroot').querySelectorAll('*')) : null;
     test.run(prepareReturnValue, w, d);
     lbFlush(w, d);
+    lbDump(w, d, suite.name, test.name, before);
     var endTime = now();
     var s2 = lbSample(w);
     self._writeMark(suite.name + '.' + test.name + '-sync-end');
@@ -127,6 +173,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
 const list = [];
 const steps = []; // --internals: one entry per step per iteration
 const prepared = []; // --internals: one entry per suite per iteration (initial resolution)
+const computedDumps = [];
 let ua = '';
 let lastProgress = Date.now();
 let finished = false;
@@ -146,6 +193,7 @@ const server = http.createServer((req, res) => {
       else if (urlPath === '/BenchmarkComplete') { ua = j.ua || ''; finished = true; }
       else if (urlPath === '/StepCounters') steps.push({ iter: list.length, ...j });
       else if (urlPath === '/SuitePrepared') prepared.push({ iter: list.length, ...j });
+      else if (urlPath === '/ComputedDump') computedDumps.push({ iter: list.length, ...j });
       else if (urlPath === '/PageError') console.error(`page error: ${j.message} (${j.source}:${j.line})`);
       res.writeHead(200); res.end();
     });
@@ -189,7 +237,13 @@ if (!list.length) { console.error('no iterations completed'); process.exit(1); }
 if (ua) console.log(`userAgent: ${ua}`);
 report(list, label);
 if (internals) reportInternals(steps, prepared);
-if (jsonOut) { fs.writeFileSync(jsonOut, JSON.stringify({ label, ua, iterations, measuredValuesList: list, ...(internals ? { steps, prepared } : {}) }, null, 1)); console.log(`\nwrote ${jsonOut}`); }
+if (jsonOut) { fs.writeFileSync(jsonOut, JSON.stringify({ label, ua, iterations, measuredValuesList: list, ...(internals ? { steps, prepared } : {}), ...(computedDumps.length ? { computedDumps } : {}) }, null, 1)); console.log(`\nwrote ${jsonOut}`); }
+if (dumpComputedArg && computedDumps.length) {
+  const out = dumpComputedArg === true ? path.join(here, 'results', 'computed-dump.json') : dumpComputedArg;
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, JSON.stringify({ label, env: { OWN_TAKE: process.env.STYLECC_OWN_TAKE || '', FORWARD: process.env.STYLECC_FORWARD || '' }, dumps: computedDumps }, null, 1));
+  console.log(`wrote computed dump ${out} (${computedDumps.length} snapshots)`);
+}
 
 // Per suite, per iteration: StyleBench's sync clock next to Ladybird's own update_style clock for the
 // same steps, split into the Rust engine (transaction setup + planning) and the C++ recompute; plus the

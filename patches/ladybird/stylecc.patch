@@ -1,0 +1,2102 @@
+diff --git a/Libraries/LibWeb/CMakeLists.txt b/Libraries/LibWeb/CMakeLists.txt
+index 227b3a76..cd3cce3d 100644
+--- a/Libraries/LibWeb/CMakeLists.txt
++++ b/Libraries/LibWeb/CMakeLists.txt
+@@ -1254,10 +1254,15 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
+     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
+ endforeach()
+ 
++set(libweb_rust_features style-recording)
++option(LIBWEB_STYLE_ENGINE_CC "Link Concurrent-C StyleEngine host (stylo-cc libstylecc)" OFF)
++if (LIBWEB_STYLE_ENGINE_CC)
++    list(APPEND libweb_rust_features stylecc)
++endif()
+ import_rust_crate(
+     MANIFEST_PATH Rust/Cargo.toml
+     CRATE_NAME libweb_rust
+-    FEATURES style-recording
++    FEATURES ${libweb_rust_features}
+     FFI_HEADERS
+         HTML/Parser/RustFFI.h
+         RustFFI.h
+@@ -1275,6 +1280,13 @@ import_rust_crate(
+         Painting/PaintingRustFFI.h
+         Painting/DisplayListCommandsGenerated.h
+ )
++if (LIBWEB_STYLE_ENGINE_CC)
++    message(STATUS "LibWeb StyleEngine: Concurrent-C (stylecc) enabled — link libstylecc.a from STYLECC_ROOT")
++    if (NOT DEFINED STYLECC_ROOT)
++        get_filename_component(STYLECC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
++    endif()
++    target_link_libraries(libweb_rust INTERFACE "${STYLECC_ROOT}/lib/libstylecc.a")
++endif()
+ build_rust_binary(
+     MANIFEST_PATH Rust/Cargo.toml
+     CRATE_NAME libweb_rust
+diff --git a/Libraries/LibWeb/CSS/UpdateStyle.cpp b/Libraries/LibWeb/CSS/UpdateStyle.cpp
+index 96a0ce9f..be924278 100644
+--- a/Libraries/LibWeb/CSS/UpdateStyle.cpp
++++ b/Libraries/LibWeb/CSS/UpdateStyle.cpp
+@@ -21,6 +21,7 @@
+ #include <LibWeb/HTML/LocalNavigable.h>
+ #include <LibWeb/HTML/NavigableContainer.h>
+ #include <LibWeb/Layout/Box.h>
++#include <LibWeb/Painting/BoxViews.h>
+ 
+ namespace Web::CSS {
+ 
+@@ -278,7 +279,9 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
+             if (!element)
+                 continue;
+ 
+-            if (reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Materialize && !element->has_style())
++            if (reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Materialize
++                && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Install
++                && !element->has_style())
+                 continue;
+             // An earlier display:none reaction in this batch can clear the style of a materialization gap after the
+             // inheritance closure was built. The gap must then rematerialize rather than letting its descendants
+@@ -326,7 +329,34 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
+             bool const needs_full_custom_property_recompute = needs_custom_property_recompute && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function() || cascade_reads_custom_properties);
+             bool const materializes_inherited_style_reaction = needs_inherited_style_recompute && !needs_regular_style_recompute && !needs_full_custom_property_recompute;
+             bool const can_use_inherited_style_group_swap = materializes_inherited_style_reaction && !needs_custom_property_recompute;
+-            if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::None) {
++            if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Install) {
++                if (reaction.old_style_record == 0) {
++                    if (!element->unsafe_layout_node()) {
++                        // Same as rematch of an unstyled element: full() rebuilds from Parent.
++                        // set_needs_layout_tree_rebuild then keeps NodeInsertBefore when the insert
++                        // marker is still set. BoxPresenceChange is excluded from that early return
++                        // and cannot insert inline-block into an inline-block parent in place.
++                        invalidation = RequiredInvalidationAfterStyleChange::full();
++                    } else {
++                        invalidation = RequiredInvalidationAfterStyleChange::rebuild_layout_tree_from(LayoutTreeRebuildRoot::BoxPresenceChange);
++                    }
++                } else {
++                    auto packed = document.style_computer().style_engine().compare_style_records(
++                        StyleRecordID { reaction.old_style_record },
++                        StyleRecordID { reaction.new_style_record },
++                        true,
++                        false);
++                    invalidation = decode_style_invalidation(packed);
++                }
++                element->set_computed_style({}, StyleRecordID { reaction.new_style_record });
++                if (!invalidation.needs_layout_tree_rebuild()) {
++                    if (auto* layout_node = element->unsafe_layout_node()) {
++                        layout_node->apply_style(element->style_record_identity());
++                        if (Painting::has_committed_box(*layout_node))
++                            Painting::repaint_after_style_change(*layout_node, invalidation);
++                    }
++                }
++            } else if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::None) {
+                 VERIFY(!needs_regular_style_recompute);
+                 VERIFY(needs_inherited_style_recompute);
+                 VERIFY(!needs_custom_property_recompute);
+@@ -432,7 +462,8 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
+             u8 common_child_reaction = 0;
+             if (needs_custom_property_recompute || did_change_custom_properties)
+                 common_child_reaction |= StyleEngine::InheritedCustomProperties;
+-            if (invalidation.needs_layout_tree_rebuild())
++            if (invalidation.needs_layout_tree_rebuild()
++                && invalidation.layout_tree_rebuild_root() != LayoutTreeRebuildRoot::BoxPresenceChange)
+                 common_child_reaction |= StyleEngine::RecomputeStyle;
+             if ((reaction.reaction & StyleEngine::RecomputeDescendantStyles) || invalidation.recompute_descendant_styles)
+                 common_child_reaction |= StyleEngine::RecomputeDescendantStyles;
+diff --git a/Libraries/LibWeb/Rust/Cargo.toml b/Libraries/LibWeb/Rust/Cargo.toml
+index eabc4110..52581bf3 100644
+--- a/Libraries/LibWeb/Rust/Cargo.toml
++++ b/Libraries/LibWeb/Rust/Cargo.toml
+@@ -14,6 +14,7 @@ required-features = ["style-replay"]
+ [features]
+ style-recording = []
+ style-replay = ["style-recording"]
++stylecc = []
+ 
+ # After changing dependencies, regenerate the Flatpak sources:
+ #   python3 Meta/CMake/flatpak/generate-cargo-sources.py
+diff --git a/Libraries/LibWeb/Rust/build.rs b/Libraries/LibWeb/Rust/build.rs
+index 1cee39ed..b316892e 100644
+--- a/Libraries/LibWeb/Rust/build.rs
++++ b/Libraries/LibWeb/Rust/build.rs
+@@ -3267,5 +3267,19 @@ fn main() -> Result<(), Box<dyn Error>> {
+         Path::new("Painting/DisplayListCommandsGenerated.h"),
+     );
+ 
++    if env::var_os("CARGO_FEATURE_STYLECC").is_some() {
++        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
++        // Libraries/LibWeb/Rust → stylo-cc repo root
++        let stylo_cc = manifest_dir
++            .join("../../../../")
++            .canonicalize()
++            .unwrap_or_else(|_| manifest_dir.join("../../../.."));
++        let lib_dir = stylo_cc.join("lib");
++        println!("cargo:rustc-link-search=native={}", lib_dir.display());
++        println!("cargo:rustc-link-lib=static=stylecc");
++        println!("cargo:rerun-if-env-changed=STYLECC_FORWARD");
++        println!("cargo:rerun-if-changed={}", lib_dir.join("libstylecc.a").display());
++    }
++
+     Ok(())
+ }
+diff --git a/Libraries/LibWeb/Rust/src/bin/style_replay.rs b/Libraries/LibWeb/Rust/src/bin/style_replay.rs
+index 47695a35..dd43901f 100644
+--- a/Libraries/LibWeb/Rust/src/bin/style_replay.rs
++++ b/Libraries/LibWeb/Rust/src/bin/style_replay.rs
+@@ -2045,6 +2045,7 @@ fn read_style_transaction_outputs(
+                 gap: match payload.read_u8()? {
+                     0 => FfiStyleDeltaGap::None,
+                     1 => FfiStyleDeltaGap::Materialize,
++                    2 => FfiStyleDeltaGap::Install,
+                     tag => return Err(format!("unknown style delta gap tag {tag}").into()),
+                 },
+             });
+diff --git a/Libraries/LibWeb/Rust/src/css/computed_longhand_table.rs b/Libraries/LibWeb/Rust/src/css/computed_longhand_table.rs
+index 1809085d..3106a6ab 100644
+--- a/Libraries/LibWeb/Rust/src/css/computed_longhand_table.rs
++++ b/Libraries/LibWeb/Rust/src/css/computed_longhand_table.rs
+@@ -309,6 +309,115 @@ impl ComputedLonghandTable {
+         table
+     }
+ 
++    /// True when the CSSOM font-size slot is already the used px length.
++    /// Overlay must not skip a real used-size change, including 16px.
++    pub(crate) fn overlay_font_size_already_used(source: &Self, font_size_px: f64) -> bool {
++        let Some(StyleValueData::Length { value, unit }) =
++            source.get(property_id::FONT_SIZE).map(RetainedStyleValueData::data)
++        else {
++            return false;
++        };
++        *unit == crate::css::style_compute::px_length_unit()
++            && crate::css::css_pixels::CssPixels::nearest_value_for(*value)
++                == crate::css::css_pixels::CssPixels::nearest_value_for(font_size_px)
++    }
++
++    /// Frozen copy with the CSSOM font-size slot set to used px.
++    /// getComputedStyle reads the longhand table, not the FontValues CssPixels prefix.
++    pub(crate) fn overlay_copy_with_used_font(source: &ComputedLonghandTable, font_size_px: f64) -> Self {
++        let px = crate::css::style_compute::px_length_unit();
++        let font_size =
++            crate::css::style_value::RetainedStyleValueData::from_owned(crate::css::style_value::StyleValueData::Length {
++                value: font_size_px,
++                unit: px,
++            });
++        let mut table = Self::new();
++        table.copy_from(source);
++        table.set(property_id::FONT_SIZE, font_size.clone(), -1);
++        table.set_inherited(property_id::FONT_SIZE, false);
++        table.inheritance_dependent.retain(|(property, _)| *property != property_id::FONT_SIZE);
++        table.rebuild_inheritance_dependent_view();
++        table.set_raw_cascaded_font_size(Some(font_size));
++        table.freeze();
++        table
++    }
++
++    fn overlay_px(px: f64) -> RetainedStyleValueData {
++        RetainedStyleValueData::from_owned(crate::css::style_value::StyleValueData::Length {
++            value: px,
++            unit: crate::css::style_compute::px_length_unit(),
++        })
++    }
++
++    /// New-leaf CSSOM table: initial non-inherited longhands, inherited from the parent,
++    /// then the used display / sizing / font that groups overlay. getComputedStyle reads
++    /// this table; leaving display as `inline` while groups say inline-block is a CSSOM lie.
++    pub(crate) fn overlay_new_leaf_used(
++        parent: &Self,
++        display: crate::css::display::FfiDisplay,
++        height_auto: bool,
++        height_px: f32,
++        min_width_auto: bool,
++        min_width_px: f32,
++        font_size_px: f64,
++        line_height_px: f64,
++    ) -> Self {
++        let source = Self::with_initial_values_and_inherited_from(parent);
++        let mut table = Self::new();
++        table.copy_from(&source);
++        table.set(
++            property_id::DISPLAY,
++            RetainedStyleValueData::from_owned(crate::css::style_value::StyleValueData::Display {
++                raw: display.encoded(),
++            }),
++            -1,
++        );
++        table.set_inherited(property_id::DISPLAY, false);
++        if !height_auto {
++            table.set(property_id::HEIGHT, Self::overlay_px(height_px as f64), -1);
++            table.set_inherited(property_id::HEIGHT, false);
++        }
++        if !min_width_auto {
++            table.set(property_id::MIN_WIDTH, Self::overlay_px(min_width_px as f64), -1);
++            table.set_inherited(property_id::MIN_WIDTH, false);
++        }
++        let font_size = Self::overlay_px(font_size_px);
++        table.set(property_id::FONT_SIZE, font_size.clone(), -1);
++        table.set_inherited(property_id::FONT_SIZE, false);
++        table.set(property_id::LINE_HEIGHT, Self::overlay_px(line_height_px), -1);
++        table.set_inherited(property_id::LINE_HEIGHT, false);
++        table.inheritance_dependent.retain(|(property, _)| {
++            *property != property_id::FONT_SIZE && *property != property_id::LINE_HEIGHT
++        });
++        table.rebuild_inheritance_dependent_view();
++        table.set_raw_cascaded_font_size(Some(font_size));
++        table.freeze();
++        table
++    }
++
++    /// Completely filled initial longhands. `new()` leaves slots null, and
++    /// `compare_style_records` dereferences every longhand pointer. The table is
++    /// thread-local because style values are not Sync.
++    fn with_initial_values_and_inherited_from(parent: &Self) -> Self {
++        thread_local! {
++            static INITIAL: ComputedLonghandTable = {
++                let mut table = ComputedLonghandTable::new();
++                for property_id in FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID {
++                    let pointer = crate::css::style_compute::initial_value_data(property_id);
++                    let value = unsafe {
++                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
++                            pointer,
++                        ))
++                    };
++                    table.set(property_id, value, -1);
++                }
++                table.freeze();
++                table
++            };
++        }
++        INITIAL.with(|initial| initial.with_inherited_values_from(parent))
++    }
++
+     pub(crate) fn with_inherited_values_from(&self, inherited_source: &ComputedLonghandTable) -> Self {
+         self.with_inherited_values_and_flags_from(inherited_source, &self.important_bits, &self.inherited_bits)
+     }
+diff --git a/Libraries/LibWeb/Rust/src/css/style/bridge.rs b/Libraries/LibWeb/Rust/src/css/style/bridge.rs
+index 115622be..4c3b2cb3 100644
+--- a/Libraries/LibWeb/Rust/src/css/style/bridge.rs
++++ b/Libraries/LibWeb/Rust/src/css/style/bridge.rs
+@@ -107,6 +107,8 @@ pub struct FfiAnimationInvalidation {
+ pub enum FfiStyleDeltaGap {
+     None,
+     Materialize,
++    /// CC-owned used style already interned as a style record; C++ installs, no rematch.
++    Install,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -935,7 +937,10 @@ pub extern "C" fn style_engine_create(device_class: FfiDeviceClass) -> *mut c_vo
+             payload.write_u32_slice(output_masks);
+         }
+     });
+-    Box::into_raw(engine).cast()
++    let raw = Box::into_raw(engine).cast();
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::attach(raw);
++    raw
+ }
+ 
+ /// Installs the C++ ownership callbacks used by live process-global raw atoms.
+@@ -1000,6 +1005,8 @@ pub extern "C" fn style_engine_verification_gate_bits() -> u8 {
+ /// `engine` must be a pointer returned by `style_engine_create` and not yet destroyed.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn style_engine_destroy(engine: *mut c_void) {
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::detach(engine);
+     let mut engine = unsafe { Box::from_raw(engine.cast::<StyleEngine>()) };
+     engine.end_recording();
+ }
+@@ -1015,6 +1022,15 @@ pub unsafe extern "C" fn style_engine_allocate_style_nodes(engine: *mut c_void,
+         unsafe { std::slice::from_raw_parts_mut(out, count) }
+     };
+     engine.allocate_style_nodes(out);
++    #[cfg(feature = "stylecc")]
++    {
++        let raw = engine as *mut StyleEngine as *mut c_void;
++        for &id in out.iter() {
++            if id != 0 {
++                super::stylecc_host::ensure_node(raw, id);
++            }
++        }
++    }
+     engine.record_boundary_call(EventKind::AllocateStyleNodes, |payload| payload.write_u32_slice(out));
+ }
+ 
+@@ -1081,6 +1097,8 @@ pub unsafe extern "C" fn style_engine_discard_viewport_dependent_nodes(engine: *
+ /// records for the duration of the call.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn style_engine_apply_transaction(engine: *mut c_void, transaction: &FfiStyleInputTransaction) {
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::mirror_apply_transaction(engine, transaction);
+     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+     // SAFETY: the caller vouches that each pointer covers its stated count for this call.
+     let tree = unsafe { borrow(transaction.tree_deltas, transaction.tree_delta_count) };
+@@ -1245,6 +1263,12 @@ pub unsafe extern "C" fn style_engine_add_style_rule(
+     };
+     let rule = engine.add_style_rule_in_scope(SheetID(sheet - 1), before, &compiled, namespaces, &scope);
+     let result = rule.0 + 1;
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::mirror_add_style_rule(
++        engine as *mut StyleEngine as *mut c_void,
++        result,
++        compiled.as_slice(),
++    );
+     engine.record_boundary_call(EventKind::AddStyleRule, |payload| {
+         payload.write_u32(sheet);
+         payload.write_u32(before_rule);
+@@ -1788,6 +1812,10 @@ pub unsafe extern "C" fn style_engine_consume_published_match_answer(
+     let Some(node) = StyleNodeID::from_raw(node) else {
+         return usize::MAX;
+     };
++    #[cfg(feature = "stylecc")]
++    if let Some(n) = super::stylecc_host::consume_published(engine, node.raw(), out, capacity) {
++        return n;
++    }
+     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+     let result = engine
+         .consume_published_match_answer_with(
+@@ -1846,6 +1874,10 @@ pub unsafe extern "C" fn style_engine_match_element(
+     let Some(node) = StyleNodeID::from_raw(node) else {
+         return usize::MAX;
+     };
++    #[cfg(feature = "stylecc")]
++    if let Some(n) = super::stylecc_host::consume_published(engine, node.raw(), out, capacity) {
++        return n;
++    }
+     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+     let result = match compact_for_cascade {
+         true => engine.match_element_for_cascade(node),
+@@ -2679,13 +2711,19 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+             let operators = unsafe { std::slice::from_raw_parts(operators, count) };
+             let values = unsafe { std::slice::from_raw_parts(values, count) };
+             let original_values = unsafe { std::slice::from_raw_parts(original_values, count) };
+-            properties
++            #[cfg(feature = "stylecc")]
++            let mut css_texts: Vec<String> = Vec::with_capacity(count);
++            let declared: Vec<DeclaredProperty> = properties
+                 .iter()
+                 .copied()
+                 .zip(important.iter().copied())
+                 .zip(operators.iter().copied())
+                 .zip(values.iter().copied().zip(original_values.iter().copied()))
+                 .map(|(((property, important), operator), (value, original_value))| {
++                    #[cfg(feature = "stylecc")]
++                    {
++                        css_texts.push(super::stylecc_host::pick_cc_decl_text(original_value, value));
++                    }
+                     let value = unsafe { engine.intern_specified_value(value.cast()) };
+                     unsafe { engine.alias_specified_value(original_value.cast(), value) };
+                     DeclaredProperty {
+@@ -2695,7 +2733,20 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+                         value,
+                     }
+                 })
+-                .collect()
++                .collect();
++            #[cfg(feature = "stylecc")]
++            {
++                let props: Vec<u16> = declared.iter().map(|d| d.property).collect();
++                let imps: Vec<bool> = declared.iter().map(|d| d.important).collect();
++                super::stylecc_host::mirror_set_rule_declared_properties(
++                    engine as *mut StyleEngine as *mut c_void,
++                    rule,
++                    &props,
++                    &imps,
++                    &css_texts,
++                );
++            }
++            declared
+         }
+     };
+     engine.set_rule_declared_properties_with_operators(RuleID(rule - 1), &declared, declarations_are_complete);
+@@ -2716,6 +2767,8 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
+ pub unsafe extern "C" fn style_engine_intern_atom(engine: *mut c_void, raw: usize) -> u32 {
+     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+     let result = engine.intern_atom(raw).0;
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::register_atom(engine as *mut StyleEngine as *mut c_void, result, raw);
+     let token = engine.recording_atom_pointer_token(raw);
+     engine.record_boundary_call(EventKind::InternAtom, |payload| {
+         payload.write_u64(token.expect("an enabled recorder must tokenize the pointer"));
+@@ -2738,19 +2791,53 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
+     let Some(root) = StyleNodeID::from_raw(root) else {
+         return FfiStyleTransactionView::default();
+     };
++    #[cfg(feature = "stylecc")]
++    super::stylecc_host::set_viewport(engine, computation_inputs.viewport_width);
+     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+     engine.document_style_computation_inputs = Some(computation_inputs);
+     engine.clear_ffi_style_transaction_output();
+     let mut output = FfiStyleTransactionOutput::default();
+-    output.scoped = engine.take_style_transaction(root, |transaction_version, program_version, answers| {
+-        assert!(
+-            output.answers.is_empty(),
+-            "a style transaction emitted more than one batch"
+-        );
++    #[cfg(feature = "stylecc")]
++    if let Some(cc_answers) =
++        super::stylecc_host::owning_answers(engine as *mut StyleEngine as *mut c_void, computation_inputs)
++    {
++        // CC owns cascade. Drain the journal without Rust matching, overlay used values onto
++        // interned style records, emit Install (or Materialize fallback) tickets.
++        let (transaction_version, program_version) = engine.apply_inputs_without_planning();
+         output.transaction_version = transaction_version.0;
+         output.program_version = program_version.0;
+-        output.answers.extend_from_slice(answers);
+-    });
++        output.scoped = true;
++        let dirty: Vec<u32> = cc_answers.iter().map(|d| d.style_node).collect();
++        let host = engine as *mut StyleEngine as *mut c_void;
++        let interned = engine.publish_cc_owned_batch(host, &dirty);
++        if interned.interned {
++            output.answers.extend(interned.deltas);
++        } else {
++            output.answers.extend(cc_answers);
++        }
++    } else {
++        output.scoped = engine.take_style_transaction(root, |transaction_version, program_version, answers| {
++            assert!(
++                output.answers.is_empty(),
++                "a style transaction emitted more than one batch"
++            );
++            output.transaction_version = transaction_version.0;
++            output.program_version = program_version.0;
++            output.answers.extend_from_slice(answers);
++        });
++    }
++    #[cfg(not(feature = "stylecc"))]
++    {
++        output.scoped = engine.take_style_transaction(root, |transaction_version, program_version, answers| {
++            assert!(
++                output.answers.is_empty(),
++                "a style transaction emitted more than one batch"
++            );
++            output.transaction_version = transaction_version.0;
++            output.program_version = program_version.0;
++            output.answers.extend_from_slice(answers);
++        });
++    }
+     output.reclaimed_style_atoms = std::mem::take(&mut engine.reclaimed_style_atoms)
+         .into_iter()
+         .map(|reclaimed| FfiReclaimedStyleAtom {
+diff --git a/Libraries/LibWeb/Rust/src/css/style/flush.rs b/Libraries/LibWeb/Rust/src/css/style/flush.rs
+index 5c0e93a1..38203076 100644
+--- a/Libraries/LibWeb/Rust/src/css/style/flush.rs
++++ b/Libraries/LibWeb/Rust/src/css/style/flush.rs
+@@ -9,6 +9,32 @@ use super::*;
+ const MIN_SHARED_CASCADE_COMPLETION_BATCH: usize = 16;
+ 
+ impl StyleEngine {
++    /// Drain the journal onto the committed snapshot without selector matching.
++    ///
++    /// Leaves `published_match_answers` in place so a CC-owned Materialize batch can still
++    /// terminate non-dirty nodes from the previous catalog. Wholesale replace after a full
++    /// take discarded that catalog and hung `update_style`.
++    #[cfg(feature = "stylecc")]
++    pub fn apply_inputs_without_planning(&mut self) -> (StyleTransactionVersion, ProgramVersion) {
++        self.discard_prepared_batch_matching_traversal();
++        for input in std::mem::take(&mut self.deferred_element_style_inputs) {
++            self.record_input(input.key, input.old, input.new);
++        }
++        self.deferred_element_style_input_memory
++            .resize_required_to(&mut self.memory, 0);
++        let transaction = self.take_transaction();
++        let transaction_version = self.next_style_transaction_version;
++        self.next_style_transaction_version = StyleTransactionVersion(
++            self.next_style_transaction_version
++                .0
++                .checked_add(1)
++                .expect("style transaction version space exhausted"),
++        );
++        let program_version = self.program.version();
++        self.release_transaction_and_sweep_atoms(transaction);
++        (transaction_version, program_version)
++    }
++
+     pub fn take_style_transaction(
+         &mut self,
+         root: StyleNodeID,
+diff --git a/Libraries/LibWeb/Rust/src/css/style/matching.rs b/Libraries/LibWeb/Rust/src/css/style/matching.rs
+index 9c12f27f..fb69b1b7 100644
+--- a/Libraries/LibWeb/Rust/src/css/style/matching.rs
++++ b/Libraries/LibWeb/Rust/src/css/style/matching.rs
+@@ -3121,6 +3121,418 @@ impl StyleEngine {
+         identity
+     }
+ 
++    /// Overlay CC used values onto interned Ladybird groups. Matching stays internal.
++    /// An existing node seeds from its own record. A new leaf takes inherited groups
++    /// from the parent and non-inherited groups from the interned initial payloads, then
++    /// patches used fields. The longhand table is initial values with inherited slots
++    /// copied from the parent. Unchanged used digest is a stop. Overlay fails fall back
++    /// to Materialize.
++    #[cfg(feature = "stylecc")]
++    pub fn publish_cc_owned_batch(&mut self, host: *mut std::ffi::c_void, dirty: &[u32]) -> super::stylecc_host::CcOwnedPublish {
++        const BACKGROUND_GROUP: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_BACKGROUND;
++        const SIZING_GROUP: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_SIZING;
++        const BOX_GROUP: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_BOX;
++        const FONT_GROUP: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_FONT;
++        const INHERITED_GROUP_COUNT: usize = FONT_GROUP + 1;
++        fn materialize_gap(raw: u32, old_style_record: u64) -> PublishedStyleDeltaRecord {
++            PublishedStyleDeltaRecord {
++                style_node: raw,
++                match_answer: 0,
++                old_style_record,
++                new_style_record: 0,
++                damage: FfiStyleDeltaDamage::None,
++                reaction: transaction::STYLE_REACTION_PUBLISHED_STYLE | transaction::STYLE_REACTION_RECOMPUTE_STYLE,
++                inherited_style_groups: 0,
++                pseudo_kind: u8::MAX,
++                gap: FfiStyleDeltaGap::Materialize,
++            }
++        }
++        fn ffi_display(atom: u8) -> Option<crate::css::display::FfiDisplay> {
++            match atom {
++                0 => Some(crate::css::display::FfiDisplay::inline()),
++                1 => Some(crate::css::display::FfiDisplay::block()),
++                2 => Some(crate::css::display::FfiDisplay::inline_block()),
++                3 => Some(crate::css::display::FfiDisplay::none()),
++                _ => None,
++            }
++        }
++        fn set_computed_size(size: &mut crate::css::computed_value_types::ComputedSize, is_auto: bool, px: f32) {
++            // Assignment drops the previous handle. A manual release here double-frees it and
++            // can free the newly allocated length when the allocator reuses that slot.
++            if is_auto {
++                size.kind = crate::css::computed_value_types::ComputedSizeKind::Auto;
++                size.value = crate::css::computed_value_types::ComputedStyleValueHandle::empty();
++            } else {
++                size.kind = crate::css::computed_value_types::ComputedSizeKind::Length;
++                size.value = crate::css::computed_value_types::ComputedStyleValueHandle::length(px as f64);
++            }
++        }
++        fn size_matches_used(
++            size: &crate::css::computed_value_types::ComputedSize,
++            is_auto: u8,
++            px: f32,
++        ) -> bool {
++            if is_auto != 0 {
++                size.is_auto()
++            } else if size.is_length() {
++                size.length_percentage().absolute_length_to_px()
++                    == crate::css::css_pixels::CssPixels::nearest_value_for(px as f64)
++            } else {
++                false
++            }
++        }
++        struct OverlayClones {
++            groups: Vec<(usize, *mut std::ffi::c_void)>,
++        }
++        impl Drop for OverlayClones {
++            fn drop(&mut self) {
++                for &(index, payload) in &self.groups {
++                    crate::css::computed_values::release_group_payload(index, payload);
++                }
++            }
++        }
++        impl OverlayClones {
++            fn clone_into(
++                &mut self,
++                payloads: &mut [*const std::ffi::c_void],
++                index: usize,
++            ) -> Option<*mut std::ffi::c_void> {
++                let cloned = unsafe { crate::css::computed_values::rust_style_group_clone(index, payloads[index]) };
++                if cloned.is_null() {
++                    return None;
++                }
++                payloads[index] = cloned;
++                self.groups.push((index, cloned));
++                Some(cloned)
++            }
++        }
++        struct TableGuard(*const crate::css::computed_longhand_table::ComputedLonghandTable);
++        impl Drop for TableGuard {
++            fn drop(&mut self) {
++                if !self.0.is_null() {
++                    unsafe {
++                        crate::css::computed_longhand_table::rust_computed_longhand_table_release(self.0.cast_mut());
++                    }
++                }
++            }
++        }
++        let Some(pulled) = super::stylecc_host::pull_used_for(host, dirty) else {
++            return super::stylecc_host::CcOwnedPublish::failed();
++        };
++        let (changed, _, _) = {
++            let sets = &self.computed_group_sets;
++            super::stylecc_host::split_used_stops(host, pulled, |raw| {
++                StyleNodeID::from_raw(raw)
++                    .and_then(|node| sets.assigned_style_record(node))
++                    .is_some()
++            })
++        };
++        let mut interned_by_seed_used = std::collections::HashMap::<(u64, u64), u64>::new();
++        let mut interned_box = std::collections::HashMap::<u32, *const std::ffi::c_void>::new();
++        let mut interned_sizing = std::collections::HashMap::<(u8, u32, u8, u32), *const std::ffi::c_void>::new();
++        let mut interned_table = std::collections::HashMap::<
++            (u64, u32, u8, u32, u8, u32, u32, u32),
++            *const crate::css::computed_longhand_table::ComputedLonghandTable,
++        >::new();
++        let mut deltas = Vec::with_capacity(changed.len());
++        for (raw, used) in changed {
++            let Some(node) = StyleNodeID::from_raw(raw) else {
++                continue;
++            };
++            let Some(display) = ffi_display(used.display) else {
++                deltas.push(materialize_gap(raw, 0));
++                continue;
++            };
++            let own_id = self.computed_group_sets.assigned_style_record(node);
++            let seed_id = own_id.or_else(|| {
++                self.tree
++                    .flat_tree_parent(node)
++                    .and_then(|parent| self.computed_group_sets.assigned_style_record(parent))
++            });
++            let Some(seed_id) = seed_id else {
++                deltas.push(materialize_gap(raw, 0));
++                continue;
++            };
++            let old_raw = own_id.map_or(0, |id| id.raw());
++            let seed_raw = seed_id.raw();
++            if let Some(&cached) = interned_by_seed_used.get(&(seed_raw, used.digest)) {
++                let copied = self.style_record_view(cached).and_then(|view| {
++                    if view.payloads.len() <= BOX_GROUP
++                        || view.longhand_table.is_null()
++                        || view.animation_overlay_identity != 0
++                    {
++                        return None;
++                    }
++                    Some((
++                        view.payloads.to_vec(),
++                        view.longhand_table,
++                        view.dependency_flags,
++                        view.pseudo_element_styles,
++                        view.counter_style_environment_identity,
++                    ))
++                });
++                if let Some((
++                    payloads,
++                    longhand_table,
++                    dependency_flags,
++                    pseudo_element_styles,
++                    counter_style_environment_identity,
++                )) = copied
++                {
++                    let publication = self.publish_computed_groups(
++                        super::computed::ComputedStyleTarget::new(node, u8::MAX),
++                        &payloads,
++                        INHERITED_GROUP_COUNT,
++                        0,
++                        super::computed::ComputedMetadataInput {
++                            pseudo_element_styles,
++                            dependency_flags,
++                            counter_style_environment_identity,
++                            animation_overlay_identity: 0,
++                            animated_overlay: std::ptr::null(),
++                            animation_overlay_payloads: &[],
++                            longhand_table,
++                        },
++                    );
++                    let new_raw = publication.style_record_identity.raw();
++                    if old_raw != 0 && new_raw == old_raw {
++                        continue;
++                    }
++                    deltas.push(PublishedStyleDeltaRecord {
++                        style_node: raw,
++                        match_answer: 0,
++                        old_style_record: old_raw,
++                        new_style_record: new_raw,
++                        damage: FfiStyleDeltaDamage::Full,
++                        reaction: transaction::STYLE_REACTION_PUBLISHED_STYLE,
++                        inherited_style_groups: 0,
++                        pseudo_kind: u8::MAX,
++                        gap: FfiStyleDeltaGap::Install,
++                    });
++                    continue;
++                }
++            }
++            let Some(view) = self.style_record_view(seed_raw) else {
++                deltas.push(materialize_gap(raw, old_raw));
++                continue;
++            };
++            if view.payloads.len() <= BOX_GROUP
++                || view.longhand_table.is_null()
++                || view.animation_overlay_identity != 0
++            {
++                deltas.push(materialize_gap(raw, old_raw));
++                continue;
++            }
++            let is_new_leaf = own_id.is_none();
++            let mut payloads = view.payloads.to_vec();
++            let parent_box_ptr = payloads[BOX_GROUP];
++            let parent_sizing_ptr = payloads[SIZING_GROUP];
++            if is_new_leaf {
++                for index in INHERITED_GROUP_COUNT..payloads.len() {
++                    let initial = crate::css::computed_values::default_group_payload(index);
++                    if !initial.is_null() {
++                        payloads[index] = initial;
++                    }
++                }
++            }
++            let parent_table = unsafe { view.longhand_table.as_ref() }.expect("retained style record longhand table");
++            let font_px = crate::css::css_pixels::CssPixels::nearest_value_for(used.font_size_px as f64);
++            let line_px = crate::css::css_pixels::CssPixels::nearest_value_for(used.line_height_px as f64);
++            let seed_bg = unsafe {
++                &*payloads[BACKGROUND_GROUP].cast::<crate::css::computed_value_types::BackgroundValues>()
++            };
++            let seed_box = unsafe { &*payloads[BOX_GROUP].cast::<crate::css::computed_value_types::BoxValues>() };
++            let seed_sizing =
++                unsafe { &*payloads[SIZING_GROUP].cast::<crate::css::computed_value_types::SizingValues>() };
++            let seed_font = unsafe { &*payloads[FONT_GROUP].cast::<crate::css::computed_value_types::FontValues>() };
++            let need_bg = seed_bg.background_color != used.bgra;
++            let need_box = seed_box.display != display || seed_box.display_before_box_type_transformation != display;
++            let need_sizing = !size_matches_used(&seed_sizing.height, used.height_auto, used.height_px)
++                || !size_matches_used(&seed_sizing.min_width, used.min_width_auto, used.min_width_px);
++            let need_font = seed_font.font_size != font_px || seed_font.line_height_used != line_px;
++            let need_table = !crate::css::computed_longhand_table::ComputedLonghandTable::overlay_font_size_already_used(
++                parent_table,
++                used.font_size_px as f64,
++            );
++            let table_key = (
++                seed_raw,
++                display.encoded(),
++                used.height_auto,
++                used.height_px.to_bits(),
++                used.min_width_auto,
++                used.min_width_px.to_bits(),
++                used.font_size_px.to_bits(),
++                used.line_height_px.to_bits(),
++            );
++            let (longhand_table, _table_guard) = if is_new_leaf {
++                if let Some(&shared) = interned_table.get(&table_key) {
++                    (shared, None)
++                } else {
++                    let table = crate::css::computed_longhand_table::ComputedLonghandTable::overlay_new_leaf_used(
++                        parent_table,
++                        display,
++                        used.height_auto != 0,
++                        used.height_px,
++                        used.min_width_auto != 0,
++                        used.min_width_px,
++                        used.font_size_px as f64,
++                        used.line_height_px as f64,
++                    );
++                    let ptr = table.into_raw_shared();
++                    (ptr, Some(TableGuard(ptr)))
++                }
++            } else if need_table {
++                let patched_table =
++                    crate::css::computed_longhand_table::ComputedLonghandTable::overlay_copy_with_used_font(
++                        parent_table,
++                        used.font_size_px as f64,
++                    );
++                let patched_table = patched_table.into_raw_shared();
++                (patched_table, Some(TableGuard(patched_table)))
++            } else {
++                (view.longhand_table, None)
++            };
++            let dependency_flags = if is_new_leaf { 0 } else { view.dependency_flags };
++            let pseudo_element_styles = if is_new_leaf { 0 } else { view.pseudo_element_styles };
++            let counter_style_environment_identity = view.counter_style_environment_identity;
++            let mut clones = OverlayClones { groups: Vec::with_capacity(4) };
++            if need_bg {
++                let Some(bg) = clones.clone_into(&mut payloads, BACKGROUND_GROUP) else {
++                    deltas.push(materialize_gap(raw, old_raw));
++                    continue;
++                };
++                unsafe {
++                    (*bg.cast::<crate::css::computed_value_types::BackgroundValues>()).background_color = used.bgra;
++                }
++            }
++            if need_box {
++                let key = display.encoded();
++                if let Some(&shared) = interned_box.get(&key) {
++                    payloads[BOX_GROUP] = shared;
++                } else {
++                    let Some(box_group) = clones.clone_into(&mut payloads, BOX_GROUP) else {
++                        deltas.push(materialize_gap(raw, old_raw));
++                        continue;
++                    };
++                    unsafe {
++                        let box_values = &mut *box_group.cast::<crate::css::computed_value_types::BoxValues>();
++                        box_values.display = display;
++                        box_values.display_before_box_type_transformation = display;
++                    }
++                    if is_new_leaf
++                        && crate::css::computed_values::style_group_payloads_equal(
++                            BOX_GROUP,
++                            payloads[BOX_GROUP],
++                            parent_box_ptr,
++                        )
++                    {
++                        payloads[BOX_GROUP] = parent_box_ptr;
++                    }
++                }
++            }
++            if need_sizing {
++                let key = (
++                    used.height_auto,
++                    used.height_px.to_bits(),
++                    used.min_width_auto,
++                    used.min_width_px.to_bits(),
++                );
++                if let Some(&shared) = interned_sizing.get(&key) {
++                    payloads[SIZING_GROUP] = shared;
++                } else {
++                    let Some(sizing) = clones.clone_into(&mut payloads, SIZING_GROUP) else {
++                        deltas.push(materialize_gap(raw, old_raw));
++                        continue;
++                    };
++                    unsafe {
++                        let sizing_values = &mut *sizing.cast::<crate::css::computed_value_types::SizingValues>();
++                        set_computed_size(&mut sizing_values.height, used.height_auto != 0, used.height_px);
++                        set_computed_size(
++                            &mut sizing_values.min_width,
++                            used.min_width_auto != 0,
++                            used.min_width_px,
++                        );
++                    }
++                    if is_new_leaf
++                        && crate::css::computed_values::style_group_payloads_equal(
++                            SIZING_GROUP,
++                            payloads[SIZING_GROUP],
++                            parent_sizing_ptr,
++                        )
++                    {
++                        payloads[SIZING_GROUP] = parent_sizing_ptr;
++                    }
++                }
++            }
++            if need_font {
++                let Some(font) = clones.clone_into(&mut payloads, FONT_GROUP) else {
++                    deltas.push(materialize_gap(raw, old_raw));
++                    continue;
++                };
++                unsafe {
++                    let font_values = &mut *font.cast::<crate::css::computed_value_types::FontValues>();
++                    font_values.font_size = font_px;
++                    font_values.line_height_used = line_px;
++                    // CSSOM serializes FONT_SIZE from the longhand table. Pointing
++                    // font_size_value at a synthesized Length is unnecessary for
++                    // getComputedStyle and can trip layout when mixed with keyword handles.
++                }
++            }
++            let target = super::computed::ComputedStyleTarget::new(node, u8::MAX);
++            let metadata = super::computed::ComputedMetadataInput {
++                pseudo_element_styles,
++                dependency_flags,
++                counter_style_environment_identity,
++                animation_overlay_identity: 0,
++                animated_overlay: std::ptr::null(),
++                animation_overlay_payloads: &[],
++                longhand_table,
++            };
++            let publication = self.publish_computed_groups(
++                target,
++                &payloads,
++                INHERITED_GROUP_COUNT,
++                0,
++                metadata,
++            );
++            let new_raw = publication.style_record_identity.raw();
++            interned_by_seed_used.insert((seed_raw, used.digest), new_raw);
++            if let Some(view) = self.style_record_view(new_raw) {
++                interned_box.entry(display.encoded()).or_insert(view.payloads[BOX_GROUP]);
++                interned_sizing
++                    .entry((
++                        used.height_auto,
++                        used.height_px.to_bits(),
++                        used.min_width_auto,
++                        used.min_width_px.to_bits(),
++                    ))
++                    .or_insert(view.payloads[SIZING_GROUP]);
++                if is_new_leaf {
++                    interned_table.entry(table_key).or_insert(view.longhand_table);
++                }
++            }
++            if old_raw != 0 && new_raw == old_raw {
++                continue;
++            }
++            deltas.push(PublishedStyleDeltaRecord {
++                style_node: raw,
++                match_answer: 0,
++                old_style_record: old_raw,
++                new_style_record: new_raw,
++                damage: FfiStyleDeltaDamage::Full,
++                reaction: transaction::STYLE_REACTION_PUBLISHED_STYLE,
++                inherited_style_groups: 0,
++                pseudo_kind: u8::MAX,
++                gap: FfiStyleDeltaGap::Install,
++            });
++        }
++        super::stylecc_host::stop_serving(host);
++        super::stylecc_host::CcOwnedPublish {
++            interned: true,
++            deltas,
++        }
++    }
++
+     pub fn match_element(&mut self, node: StyleNodeID) -> Result<Vec<RuleMatch>, Incomplete> {
+         self.match_element_for_purpose(node, false)
+     }
+@@ -3676,6 +4088,10 @@ impl StyleEngine {
+     /// A contextual answer has no identity and must still consume its complete payload. A shared
+     /// identity lets a downstream cache answer before copying that payload across the bridge.
+     pub fn published_match_answer_signature(&mut self, node: StyleNodeID) -> Option<u32> {
++        #[cfg(feature = "stylecc")]
++        if super::stylecc_host::serves_published(self as *mut StyleEngine as *mut std::ffi::c_void, node.raw()) {
++            return None;
++        }
+         let cascade_input = self.published_match_answers.lookup(node)?.cascade_input?;
+         self.published_match_answers.mark_observed(node);
+         self.counters.bump(Counter::PublishedMatchAnswerIdentityReads);
+diff --git a/Libraries/LibWeb/Rust/src/css/style/mod.rs b/Libraries/LibWeb/Rust/src/css/style/mod.rs
+index 1b6c8c15..01794048 100644
+--- a/Libraries/LibWeb/Rust/src/css/style/mod.rs
++++ b/Libraries/LibWeb/Rust/src/css/style/mod.rs
+@@ -53,6 +53,8 @@ macro_rules! define_id {
+ mod atoms;
+ pub mod batch_matcher;
+ pub mod bridge;
++#[cfg(feature = "stylecc")]
++pub mod stylecc_host;
+ mod capacity;
+ pub mod cascade;
+ mod catalog;
+diff --git a/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs b/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs
+new file mode 100644
+index 00000000..ac0f4c00
+--- /dev/null
++++ b/Libraries/LibWeb/Rust/src/css/style/stylecc_host.rs
+@@ -0,0 +1,1120 @@
++/*
++ * Concurrent-C StyleEngine host for Ladybird (stylo-cc seam).
++ *
++ * With feature `stylecc`, every StyleEngine owns a StyleCC mirror. Transactions
++ * and StyleBench-shaped rules update both. Default: Rust still owns take
++ * (mirror-only). Set STYLECC_OWN_TAKE=1 to let CC own cascade: skip Rust
++ * take, overlay used values onto interned style records, Install without rematch.
++ * STYLECC_FORWARD=1 forces mirror-only.
++ */
++
++use super::bridge::{
++    FfiDocumentStyleComputationInputs, FfiFeatureKind, FfiFeatureValueKind, FfiRuleMatch, FfiStateFact,
++    FfiStyleDelta, FfiStyleDeltaDamage, FfiStyleDeltaGap, FfiStyleInputTransaction,
++};
++use crate::css::css_enums::keyword;
++use crate::css::property_metadata::property_name;
++use crate::css::selector::{
++    AttributeMatchType, Combinator, CompiledSelector, NamespaceType, SimpleSelector,
++};
++use crate::css::style_compute::LENGTH_UNIT_NAMES;
++use crate::css::style_value::StyleValueData;
++use std::collections::{HashMap, HashSet};
++use std::ffi::{c_char, c_void};
++use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
++use std::sync::{LazyLock, Mutex, OnceLock};
++
++const RECOMPUTE_STYLE: u8 = 1 << 1;
++const STYLECC_ORIGIN_AUTHOR: i32 = 1;
++const STYLECC_COMB_DESC: u8 = 0;
++const STYLECC_COMB_CHILD: u8 = 1;
++const STYLECC_COMB_NEXT: u8 = 2;
++const STYLECC_COMB_SUBSEQ: u8 = 3;
++const STYLECC_PE_NONE: u8 = 0;
++const STYLECC_FEAT_CLASS: i32 = 2;
++
++#[repr(C)]
++struct StyleCC {
++    _private: [u8; 0],
++}
++
++#[repr(C)]
++struct StyleCCCompound {
++    type_atom: u32,
++    id_atom: u32,
++    class_atoms: *const u32,
++    nclass: usize,
++    attr_name_atoms: *const u32,
++    attr_value_atoms: *const u32,
++    attr_equals: *const u8,
++    nattr: usize,
++    pos_mask: u32,
++    pelem: u8,
++}
++
++#[repr(C)]
++struct StyleCCDecl {
++    prop: *const c_char,
++    prop_len: usize,
++    value: *const c_char,
++    value_len: usize,
++    important: u8,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct StyleCCMatch {
++    host_node: u32,
++    rule_id: i32,
++    pelem: u8,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct StyleCCUsed {
++    pub host_node: u32,
++    pub r: u8,
++    pub g: u8,
++    pub b: u8,
++    pub a: u8,
++    pub bgra: u32,
++    pub display: u8,
++    pub height_auto: u8,
++    pub min_width_auto: u8,
++    pub line_height_normal: u8,
++    pub height_px: f32,
++    pub min_width_px: f32,
++    pub font_size_px: f32,
++    pub line_height_px: f32,
++    pub digest: u64,
++}
++
++unsafe extern "C" {
++    fn stylecc_create() -> *mut StyleCC;
++    fn stylecc_destroy(eng: *mut StyleCC);
++    fn stylecc_intern(eng: *mut StyleCC, s: *const c_char, len: usize) -> u32;
++    fn stylecc_ensure_node(eng: *mut StyleCC, host_id: u32) -> i32;
++    fn stylecc_set_connected(
++        eng: *mut StyleCC,
++        host_id: u32,
++        connected: i32,
++        parent_host: u32,
++        sibling_index: i32,
++    ) -> i32;
++    fn stylecc_apply_feature(
++        eng: *mut StyleCC,
++        host_id: u32,
++        feature_kind: i32,
++        name_atom: u32,
++        value_atom: u32,
++        present: i32,
++    ) -> i32;
++    fn stylecc_set_viewport_width(eng: *mut StyleCC, width_px: i32);
++    fn stylecc_add_rule(
++        eng: *mut StyleCC,
++        compounds: *const StyleCCCompound,
++        ncomp: usize,
++        combs: *const u8,
++        origin: i32,
++        mq_row: i32,
++        pelem: u8,
++    ) -> i32;
++    fn stylecc_set_rule_decls(
++        eng: *mut StyleCC,
++        rule_id: i32,
++        decls: *const StyleCCDecl,
++        ndecl: usize,
++    ) -> i32;
++    fn stylecc_set_rule_host_id(eng: *mut StyleCC, rule_id: i32, host_rule_id: u32);
++    fn stylecc_index_rules(eng: *mut StyleCC) -> i32;
++    fn stylecc_style_all(eng: *mut StyleCC) -> i32;
++    fn stylecc_style_dirty(eng: *mut StyleCC) -> i32;
++    fn stylecc_mark_dirty(eng: *mut StyleCC, host_id: u32);
++    #[allow(dead_code)]
++    fn stylecc_dirty_count(eng: *mut StyleCC) -> usize;
++    #[allow(dead_code)]
++    fn stylecc_take_dirty(eng: *mut StyleCC, out: *mut u32, cap: usize) -> usize;
++    fn stylecc_used_count(eng: *mut StyleCC) -> usize;
++    fn stylecc_take_used(eng: *mut StyleCC, out: *mut u32, cap: usize) -> usize;
++    fn stylecc_consume_node_used(eng: *mut StyleCC, host_id: u32, out: *mut StyleCCUsed) -> i32;
++    fn stylecc_node_restyled(eng: *mut StyleCC, host_id: u32) -> i32;
++    fn stylecc_consume_node_matches(
++        eng: *mut StyleCC,
++        host_id: u32,
++        out: *mut StyleCCMatch,
++        cap: usize,
++    ) -> usize;
++    fn stylecc_note_drop(eng: *mut StyleCC, reason: *const c_char);
++    fn stylecc_drop_count(eng: *mut StyleCC) -> u64;
++}
++
++struct HostState {
++    cc: *mut StyleCC,
++    /// Ladybird StyleAtomID → StyleCC atom.
++    atom_map: HashMap<u32, u32>,
++    /// Parent host id → ordered element children (for sibling_index).
++    children: HashMap<u32, Vec<u32>>,
++    /// Child → parent (for disconnect cleanup).
++    parent_of: HashMap<u32, u32>,
++    live: HashSet<u32>,
++    pending_dirty: HashSet<u32>,
++    first_style: bool,
++    rules_dirty: bool,
++    /// CC rule ids belonging to each host rule (selector list → many CC rules).
++    host_to_cc_rules: HashMap<u32, Vec<i32>>,
++    /// Decls that arrived before `add_style_rule` stored a CC mapping.
++    pending_rule_decls: HashMap<u32, (Vec<u16>, Vec<bool>, Vec<String>)>,
++    deltas: Vec<FfiStyleDelta>,
++    hover_atom: u32,
++    /// Last owning take is serving CC used/match consume; overlay reads CC buckets.
++    serve_matches: bool,
++    /// Per-node digest of last CC used style. Unchanged used values are a stop.
++    last_used_digest: HashMap<u32, u64>,
++}
++
++unsafe impl Send for HostState {}
++
++static HOSTS: LazyLock<Mutex<HashMap<usize, HostState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
++static OWN_TAKE: OnceLock<bool> = OnceLock::new();
++static OWN_MODE: OnceLock<&'static str> = OnceLock::new();
++
++/// Consume/signature must not take HOSTS: StyleBench materializes thousands of nodes per step.
++static SERVE_ENGINE: AtomicUsize = AtomicUsize::new(0);
++static SERVE_CC: AtomicPtr<StyleCC> = AtomicPtr::new(std::ptr::null_mut());
++static SERVE_ON: AtomicBool = AtomicBool::new(false);
++
++fn key(engine: *mut c_void) -> usize {
++    engine as usize
++}
++
++fn own_take() -> bool {
++    *OWN_TAKE.get_or_init(|| {
++        std::env::var_os("STYLECC_OWN_TAKE").is_some() && std::env::var_os("STYLECC_FORWARD").is_none()
++    })
++}
++
++/// Bisect OWN_TAKE hang without rebuild churn:
++///   STYLECC_OWN_MODE=index      — index_rules only, keep Rust answers
++///   STYLECC_OWN_MODE=dirty      — + style_dirty/take_dirty, keep Rust answers
++///   STYLECC_OWN_MODE=full|unset — used-style overlay; skip Rust matching on that batch
++fn own_mode() -> &'static str {
++    *OWN_MODE.get_or_init(|| match std::env::var("STYLECC_OWN_MODE").ok().as_deref() {
++        Some("index") => "index",
++        Some("dirty") => "dirty",
++        _ => "full",
++    })
++}
++
++fn publish_serve(engine: *mut c_void, cc: *mut StyleCC, on: bool) {
++    let e = key(engine);
++    if on {
++        SERVE_CC.store(cc, Ordering::Release);
++        SERVE_ENGINE.store(e, Ordering::Release);
++        SERVE_ON.store(true, Ordering::Release);
++    } else if SERVE_ENGINE.load(Ordering::Acquire) == e {
++        SERVE_ON.store(false, Ordering::Release);
++    }
++}
++
++fn serve_cc(engine: *mut c_void) -> Option<*mut StyleCC> {
++    if !own_take() || !SERVE_ON.load(Ordering::Acquire) {
++        return None;
++    }
++    if SERVE_ENGINE.load(Ordering::Acquire) != key(engine) {
++        return None;
++    }
++    let cc = SERVE_CC.load(Ordering::Acquire);
++    if cc.is_null() {
++        None
++    } else {
++        Some(cc)
++    }
++}
++
++fn write_ffi_matches(node: u32, tmp: &[StyleCCMatch], out: *mut FfiRuleMatch, n: usize) {
++    for (i, m) in tmp.iter().take(n).enumerate() {
++        unsafe {
++            *out.add(i) = FfiRuleMatch {
++                node,
++                rule: m.rule_id as u32,
++                semantic_declaration: 0,
++                pseudo_element: if m.pelem == 0 { u32::MAX } else { u32::from(m.pelem) },
++                scope_host: 0,
++                scope_proximity: u32::MAX,
++            };
++        }
++    }
++}
++
++fn utf16_to_utf8(units: &[u16]) -> String {
++    String::from_utf16_lossy(units)
++}
++
++fn format_css_number(value: f64) -> String {
++    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e15 {
++        format!("{}", value as i64)
++    } else {
++        format!("{value}")
++    }
++}
++
++fn fly_raw_to_utf8(raw: usize) -> Option<String> {
++    if raw == 0 {
++        return None;
++    }
++    // SAFETY: raw is a live Utf16FlyString identity from C++ / RetainedUtf16FlyString.
++    match unsafe { ak::utf16_string_units(&raw) } {
++        ak::Utf16StringUnits::Ascii(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
++        ak::Utf16StringUnits::Utf16(units) => Some(String::from_utf16_lossy(units)),
++    }
++}
++
++fn intern_utf8(cc: *mut StyleCC, s: &str) -> u32 {
++    if s.is_empty() {
++        return 0;
++    }
++    unsafe { stylecc_intern(cc, s.as_ptr() as *const c_char, s.len()) }
++}
++
++pub fn attach(engine: *mut c_void) {
++    let cc = unsafe { stylecc_create() };
++    if cc.is_null() {
++        eprintln!("stylecc_host: stylecc_create failed");
++        return;
++    }
++    let hover_atom = intern_utf8(cc, ":hover");
++    HOSTS.lock().unwrap().insert(
++        key(engine),
++        HostState {
++            cc,
++            atom_map: HashMap::new(),
++            children: HashMap::new(),
++            parent_of: HashMap::new(),
++            live: HashSet::new(),
++            pending_dirty: HashSet::new(),
++            first_style: true,
++            rules_dirty: false,
++            host_to_cc_rules: HashMap::new(),
++            pending_rule_decls: HashMap::new(),
++            deltas: Vec::new(),
++            hover_atom,
++            serve_matches: false,
++            last_used_digest: HashMap::new(),
++        },
++    );
++}
++
++pub fn detach(engine: *mut c_void) {
++    publish_serve(engine, std::ptr::null_mut(), false);
++    if let Some(state) = HOSTS.lock().unwrap().remove(&key(engine)) {
++        unsafe { stylecc_destroy(state.cc) };
++    }
++}
++
++/// Called from `style_engine_intern_atom` so feature deltas share real text with rules.
++pub fn register_atom(engine: *mut c_void, style_atom: u32, raw: usize) {
++    if style_atom == 0 {
++        return;
++    }
++    let mut hosts = HOSTS.lock().unwrap();
++    let Some(state) = hosts.get_mut(&key(engine)) else {
++        return;
++    };
++    if state.atom_map.contains_key(&style_atom) {
++        return;
++    }
++    let Some(text) = fly_raw_to_utf8(raw) else {
++        return;
++    };
++    let a = intern_utf8(state.cc, &text);
++    if a != 0 {
++        state.atom_map.insert(style_atom, a);
++    }
++}
++
++fn map_atom(state: &mut HostState, ladybird_atom: u32) -> u32 {
++    if ladybird_atom == 0 {
++        return 0;
++    }
++    if let Some(&a) = state.atom_map.get(&ladybird_atom) {
++        return a;
++    }
++    // Fallback only if register_atom never saw this id (should be rare).
++    let s = format!("a{ladybird_atom}");
++    let a = intern_utf8(state.cc, &s);
++    state.atom_map.insert(ladybird_atom, a);
++    a
++}
++
++fn intern_selector_units(state: &mut HostState, units: &[u16]) -> u32 {
++    let s = utf16_to_utf8(units);
++    intern_utf8(state.cc, &s)
++}
++
++fn remove_from_parent(state: &mut HostState, node: u32) {
++    if let Some(parent) = state.parent_of.remove(&node) {
++        if let Some(kids) = state.children.get_mut(&parent) {
++            kids.retain(|&n| n != node);
++        }
++    }
++}
++
++fn sibling_index_after(state: &HostState, parent: u32, prev_sib: u32) -> i32 {
++    let Some(kids) = state.children.get(&parent) else {
++        return if prev_sib == 0 { 0 } else { -1 };
++    };
++    if prev_sib == 0 {
++        return 0;
++    }
++    match kids.iter().position(|&n| n == prev_sib) {
++        Some(i) => (i + 1) as i32,
++        None => -1,
++    }
++}
++
++fn insert_child_local(state: &mut HostState, parent: u32, node: u32, prev_sib: u32) {
++    remove_from_parent(state, node);
++    let kids = state.children.entry(parent).or_default();
++    let idx = if prev_sib == 0 {
++        0
++    } else {
++        kids.iter().position(|&n| n == prev_sib).map(|i| i + 1).unwrap_or(kids.len())
++    };
++    if idx >= kids.len() {
++        kids.push(node);
++    } else {
++        kids.insert(idx, node);
++    }
++    state.parent_of.insert(node, parent);
++}
++
++pub fn mirror_apply_transaction(engine: *mut c_void, transaction: &FfiStyleInputTransaction) {
++    let mut hosts = HOSTS.lock().unwrap();
++    let Some(state) = hosts.get_mut(&key(engine)) else {
++        return;
++    };
++    let tree = unsafe {
++        if transaction.tree_delta_count == 0 {
++            &[]
++        } else {
++            std::slice::from_raw_parts(transaction.tree_deltas, transaction.tree_delta_count)
++        }
++    };
++    for d in tree {
++        if d.new_connected {
++            let parent = if d.new_relations.parent == 0 {
++                u32::MAX
++            } else {
++                d.new_relations.parent
++            };
++            let prev = d.new_relations.previous_element_sibling;
++            let sib_idx = if parent == u32::MAX {
++                -1
++            } else {
++                let idx = sibling_index_after(state, parent, prev);
++                insert_child_local(state, parent, d.node, prev);
++                idx
++            };
++            unsafe {
++                stylecc_set_connected(state.cc, d.node, 1, parent, sib_idx);
++            }
++            state.live.insert(d.node);
++            state.pending_dirty.insert(d.node);
++        } else if d.old_connected && !d.new_connected {
++            remove_from_parent(state, d.node);
++            unsafe {
++                stylecc_set_connected(state.cc, d.node, 0, u32::MAX, -1);
++            }
++            state.live.remove(&d.node);
++            state.last_used_digest.remove(&d.node);
++            state.pending_dirty.insert(d.node);
++        }
++    }
++    let feats = unsafe {
++        if transaction.local_feature_delta_count == 0 {
++            &[]
++        } else {
++            std::slice::from_raw_parts(
++                transaction.local_feature_deltas,
++                transaction.local_feature_delta_count,
++            )
++        }
++    };
++    for f in feats {
++        let kind = match f.feature_kind {
++            FfiFeatureKind::TagName | FfiFeatureKind::FoldedTagName => 0,
++            FfiFeatureKind::Id => 1,
++            FfiFeatureKind::Class => 2,
++            FfiFeatureKind::Attribute => 3,
++            FfiFeatureKind::Emptiness => continue,
++        };
++        let present = !matches!(f.new_kind, FfiFeatureValueKind::Absent);
++        let name = map_atom(state, f.name_atom);
++        let value = map_atom(state, f.new_atom);
++        unsafe {
++            stylecc_apply_feature(state.cc, f.node, kind, name, value, i32::from(present));
++            stylecc_mark_dirty(state.cc, f.node);
++        }
++        state.pending_dirty.insert(f.node);
++    }
++    let states = unsafe {
++        if transaction.state_delta_count == 0 {
++            &[]
++        } else {
++            std::slice::from_raw_parts(transaction.state_deltas, transaction.state_delta_count)
++        }
++    };
++    for s in states {
++        if s.fact != FfiStateFact::Hover {
++            continue;
++        }
++        let hover = state.hover_atom;
++        unsafe {
++            stylecc_apply_feature(
++                state.cc,
++                s.node,
++                STYLECC_FEAT_CLASS,
++                hover,
++                0,
++                i32::from(s.new_value),
++            );
++            stylecc_mark_dirty(state.cc, s.node);
++        }
++        state.pending_dirty.insert(s.node);
++    }
++    let inputs = unsafe {
++        if transaction.element_style_input_count == 0 {
++            &[]
++        } else {
++            std::slice::from_raw_parts(
++                transaction.element_style_inputs,
++                transaction.element_style_input_count,
++            )
++        }
++    };
++    for input in inputs {
++        unsafe {
++            stylecc_mark_dirty(state.cc, input.style_node);
++        }
++        state.pending_dirty.insert(input.style_node);
++    }
++}
++
++pub fn set_viewport(engine: *mut c_void, width_px: f64) {
++    let hosts = HOSTS.lock().unwrap();
++    if let Some(state) = hosts.get(&key(engine)) {
++        unsafe {
++            stylecc_set_viewport_width(state.cc, width_px as i32);
++        }
++    }
++}
++
++fn note_drop(state: &HostState, reason: &str) {
++    unsafe {
++        stylecc_note_drop(state.cc, reason.as_ptr() as *const c_char);
++    }
++}
++
++/// Translate one StyleBench-shaped selector into a StyleCC rule. Returns CC rule id or None.
++fn try_add_compiled_selector(state: &mut HostState, sel: &CompiledSelector) -> Option<i32> {
++    if sel.target_pseudo_element.is_some() {
++        note_drop(state, "pseudo-element\0");
++        return None;
++    }
++    let n = sel.compound_selectors.len();
++    if n == 0 || n > 16 {
++        note_drop(state, "compounds\0");
++        return None;
++    }
++    let mut class_storage: Vec<Vec<u32>> = Vec::with_capacity(n);
++    let mut attr_name_storage: Vec<Vec<u32>> = Vec::with_capacity(n);
++    let mut attr_value_storage: Vec<Vec<u32>> = Vec::with_capacity(n);
++    let mut attr_eq_storage: Vec<Vec<u8>> = Vec::with_capacity(n);
++    let mut compounds: Vec<StyleCCCompound> = Vec::with_capacity(n);
++    let mut combs: Vec<u8> = Vec::new();
++
++    for (i, compound) in sel.compound_selectors.iter().enumerate() {
++        if i > 0 {
++            let comb = match compound.combinator {
++                Combinator::Descendant => STYLECC_COMB_DESC,
++                Combinator::ImmediateChild => STYLECC_COMB_CHILD,
++                Combinator::NextSibling => STYLECC_COMB_NEXT,
++                Combinator::SubsequentSibling => STYLECC_COMB_SUBSEQ,
++                Combinator::None => STYLECC_COMB_DESC,
++                Combinator::Column | Combinator::PseudoElement => {
++                    note_drop(state, "combinator\0");
++                    return None;
++                }
++            };
++            combs.push(comb);
++        } else if !matches!(compound.combinator, Combinator::None) {
++            note_drop(state, "leading-combinator\0");
++            return None;
++        }
++
++        let mut type_atom = 0u32;
++        let mut id_atom = 0u32;
++        let mut classes: Vec<u32> = Vec::new();
++        let mut attr_names: Vec<u32> = Vec::new();
++        let mut attr_values: Vec<u32> = Vec::new();
++        let mut attr_eq: Vec<u8> = Vec::new();
++
++        for simple in compound.simple_selectors.iter() {
++            match simple {
++                SimpleSelector::Universal(qname) => {
++                    if !matches!(qname.namespace_type, NamespaceType::Default | NamespaceType::Any | NamespaceType::None)
++                    {
++                        note_drop(state, "ns\0");
++                        return None;
++                    }
++                }
++                SimpleSelector::TagName(qname) => {
++                    if !matches!(qname.namespace_type, NamespaceType::Default | NamespaceType::None) {
++                        note_drop(state, "ns\0");
++                        return None;
++                    }
++                    type_atom = intern_selector_units(state, &qname.lowercase_name);
++                }
++                SimpleSelector::Id(name) => {
++                    id_atom = intern_selector_units(state, &name.name);
++                }
++                SimpleSelector::Class(name) => {
++                    classes.push(intern_selector_units(state, &name.name));
++                }
++                SimpleSelector::Attribute(attr) => {
++                    if !matches!(
++                        attr.qualified_name.namespace_type,
++                        NamespaceType::Default | NamespaceType::None
++                    ) {
++                        note_drop(state, "attr-ns\0");
++                        return None;
++                    }
++                    match attr.match_type {
++                        AttributeMatchType::HasAttribute => {
++                            attr_names.push(intern_selector_units(state, &attr.qualified_name.lowercase_name));
++                            attr_values.push(0);
++                            attr_eq.push(0);
++                        }
++                        AttributeMatchType::ExactValue => {
++                            attr_names.push(intern_selector_units(state, &attr.qualified_name.lowercase_name));
++                            attr_values.push(intern_selector_units(state, &attr.value));
++                            attr_eq.push(1);
++                        }
++                        _ => {
++                            note_drop(state, "attr-op\0");
++                            return None;
++                        }
++                    }
++                }
++                SimpleSelector::PseudoClass(_)
++                | SimpleSelector::PseudoElement(_)
++                | SimpleSelector::Nesting
++                | SimpleSelector::Invalid(_) => {
++                    note_drop(state, "simple\0");
++                    return None;
++                }
++            }
++        }
++
++        class_storage.push(classes);
++        attr_name_storage.push(attr_names);
++        attr_value_storage.push(attr_values);
++        attr_eq_storage.push(attr_eq);
++        let ci = class_storage.len() - 1;
++        compounds.push(StyleCCCompound {
++            type_atom,
++            id_atom,
++            class_atoms: class_storage[ci].as_ptr(),
++            nclass: class_storage[ci].len(),
++            attr_name_atoms: attr_name_storage[ci].as_ptr(),
++            attr_value_atoms: attr_value_storage[ci].as_ptr(),
++            attr_equals: attr_eq_storage[ci].as_ptr(),
++            nattr: attr_name_storage[ci].len(),
++            pos_mask: 0,
++            pelem: STYLECC_PE_NONE,
++        });
++    }
++
++    let combs_ptr = if combs.is_empty() {
++        std::ptr::null()
++    } else {
++        combs.as_ptr()
++    };
++    let rid = unsafe {
++        stylecc_add_rule(
++            state.cc,
++            compounds.as_ptr(),
++            compounds.len(),
++            combs_ptr,
++            STYLECC_ORIGIN_AUTHOR,
++            -1,
++            STYLECC_PE_NONE,
++        )
++    };
++    if rid < 0 {
++        note_drop(state, "add_rule\0");
++        return None;
++    }
++    state.rules_dirty = true;
++    // Keep class/attr vectors alive through the FFI call — they are already consumed.
++    let _ = (class_storage, attr_name_storage, attr_value_storage, attr_eq_storage);
++    Some(rid)
++}
++
++pub fn mirror_add_style_rule(engine: *mut c_void, host_rule: u32, selectors: &[&CompiledSelector]) {
++    if host_rule == 0 || selectors.is_empty() {
++        return;
++    }
++    let mut hosts = HOSTS.lock().unwrap();
++    let Some(state) = hosts.get_mut(&key(engine)) else {
++        return;
++    };
++    let mut cc_ids = Vec::new();
++    for sel in selectors {
++        let rid = try_add_compiled_selector(state, sel);
++        if let Some(rid) = rid {
++            unsafe {
++                stylecc_set_rule_host_id(state.cc, rid, host_rule);
++            }
++            cc_ids.push(rid);
++        }
++    }
++    if !cc_ids.is_empty() {
++        state.host_to_cc_rules.insert(host_rule, cc_ids);
++        if let Some((properties, important, value_texts)) = state.pending_rule_decls.remove(&host_rule) {
++            install_cc_rule_decls(state, host_rule, &properties, &important, &value_texts);
++        }
++    }
++}
++
++/// CSS text for a specified value, as CC `take_decl` wants it: typed
++/// length/keyword cells first (same tokens StyleBench feeds), then authored
++/// source for unresolved values, otherwise serialization.
++pub fn css_text_for_style_value(value: *const c_void) -> String {
++    if value.is_null() {
++        return String::new();
++    }
++    let data = unsafe { &*value.cast::<StyleValueData>() };
++    match data {
++        StyleValueData::Length { value, unit } => {
++            let unit_name = LENGTH_UNIT_NAMES
++                .get(*unit as usize)
++                .copied()
++                .unwrap_or("px");
++            return format!("{}{unit_name}", format_css_number(*value));
++        }
++        StyleValueData::Percentage { value } => {
++            return format!("{}%", format_css_number(*value));
++        }
++        StyleValueData::Keyword { keyword: code } => {
++            if let Some(name) = keyword::NAMES.get(*code as usize) {
++                return (*name).to_string();
++            }
++        }
++        StyleValueData::Display { .. } => {
++            return crate::css::serialize::serialize_style_value_to_utf16(data)
++                .map(|units| String::from_utf16_lossy(&units))
++                .unwrap_or_default();
++        }
++        StyleValueData::Number { value } => return format_css_number(*value),
++        StyleValueData::Integer { value } => return value.to_string(),
++        StyleValueData::Unresolved { .. } => {
++            if let Some(src) = data.unresolved_authored_source() {
++                let text = match src {
++                    crate::css::css_tokenizer::TokenizerInput::Ascii(units) => {
++                        String::from_utf8_lossy(units).into_owned()
++                    }
++                    crate::css::css_tokenizer::TokenizerInput::Utf16(units) => String::from_utf16_lossy(units),
++                };
++                if !text.is_empty() {
++                    return text;
++                }
++            }
++        }
++        _ => {}
++    }
++    crate::css::serialize::serialize_style_value_to_utf16(data)
++        .map(|units| String::from_utf16_lossy(&units))
++        .unwrap_or_default()
++}
++
++fn cc_decl_text_ok(text: &str) -> bool {
++    let t = text.trim();
++    if t.is_empty() {
++        return false;
++    }
++    matches!(
++        t,
++        "auto"
++            | "normal"
++            | "none"
++            | "initial"
++            | "max-content"
++            | "min-content"
++            | "fit-content"
++            | "bolder"
++            | "lighter"
++            | "inline"
++            | "block"
++            | "inline-block"
++            | "contents"
++            | "flow-root"
++            | "flex"
++            | "grid"
++            | "list-item"
++            | "table"
++    ) || t.ends_with("px")
++        || t.ends_with("em")
++        || t.ends_with("rem")
++        || t.ends_with('%')
++        || t.bytes().all(|c| c.is_ascii_digit() || c == b'.' || c == b'-' || c == b'+')
++}
++
++/// Specified CSS text `take_decl` can parse. Prefer a typed length/keyword on
++/// either the original or canonical pointer; skip host-only keywords (`larger`).
++pub fn pick_cc_decl_text(original: *const c_void, canonical: *const c_void) -> String {
++    let orig = css_text_for_style_value(original);
++    let canon = css_text_for_style_value(canonical);
++    if cc_decl_text_ok(&orig) {
++        orig
++    } else if cc_decl_text_ok(&canon) {
++        canon
++    } else if !orig.is_empty() {
++        orig
++    } else {
++        canon
++    }
++}
++
++fn install_cc_rule_decls(
++    state: &mut HostState,
++    host_rule: u32,
++    properties: &[u16],
++    important: &[bool],
++    value_texts: &[String],
++) {
++    let Some(cc_ids) = state.host_to_cc_rules.get(&host_rule).cloned() else {
++        return;
++    };
++    let mut names: Vec<String> = Vec::with_capacity(properties.len());
++    let mut values: Vec<String> = Vec::with_capacity(properties.len());
++    let mut decls: Vec<StyleCCDecl> = Vec::with_capacity(properties.len());
++    for (i, &prop) in properties.iter().enumerate() {
++        let text = value_texts.get(i).map(String::as_str).unwrap_or("");
++        let pname = property_name(prop);
++        if text.is_empty() {
++            continue;
++        }
++        names.push(property_name(prop).to_string());
++        values.push(text.to_string());
++        let name_ref = names.last().unwrap();
++        let value_ref = values.last().unwrap();
++        decls.push(StyleCCDecl {
++            prop: name_ref.as_ptr() as *const c_char,
++            prop_len: name_ref.len(),
++            value: value_ref.as_ptr() as *const c_char,
++            value_len: value_ref.len(),
++            important: u8::from(important.get(i).copied().unwrap_or(false)),
++        });
++    }
++    if decls.is_empty() {
++        return;
++    }
++    for rid in cc_ids {
++        unsafe {
++            let _ = stylecc_set_rule_decls(state.cc, rid, decls.as_ptr(), decls.len());
++        }
++    }
++    state.rules_dirty = true;
++    let _ = (names, values);
++}
++
++/// Install specified longhands on the mirrored CC rules. Values are CSS text CC can parse.
++pub fn mirror_set_rule_declared_properties(
++    engine: *mut c_void,
++    host_rule: u32,
++    properties: &[u16],
++    important: &[bool],
++    value_texts: &[String],
++) {
++    if host_rule == 0 || properties.is_empty() {
++        return;
++    }
++    let mut hosts = HOSTS.lock().unwrap();
++    let Some(state) = hosts.get_mut(&key(engine)) else {
++        return;
++    };
++    if !state.host_to_cc_rules.contains_key(&host_rule) {
++        state.pending_rule_decls.insert(
++            host_rule,
++            (properties.to_vec(), important.to_vec(), value_texts.to_vec()),
++        );
++        return;
++    }
++    install_cc_rule_decls(state, host_rule, properties, important, value_texts);
++}
++
++pub fn owning_answers(
++    engine: *mut c_void,
++    computation_inputs: FfiDocumentStyleComputationInputs,
++) -> Option<Vec<FfiStyleDelta>> {
++    if !own_take() {
++        return None;
++    }
++    let mode = own_mode();
++    let mut hosts = HOSTS.lock().unwrap();
++    let state = hosts.get_mut(&key(engine))?;
++    state.serve_matches = false;
++    publish_serve(engine, state.cc, false);
++    let cc = state.cc;
++    unsafe {
++        stylecc_set_viewport_width(cc, computation_inputs.viewport_width as i32);
++    }
++    if state.rules_dirty {
++        // Drop HOSTS across index: if CC ever re-entered the host we would deadlock.
++        state.rules_dirty = false;
++        drop(hosts);
++        let rc = unsafe { stylecc_index_rules(cc) };
++        if rc != 0 {
++            eprintln!("stylecc_host: index_rules failed ({rc})");
++        }
++        if mode == "index" {
++            return None;
++        }
++        hosts = HOSTS.lock().unwrap();
++        let Some(state) = hosts.get_mut(&key(engine)) else {
++            return None;
++        };
++        if state.first_style {
++            state.first_style = false;
++            drop(hosts);
++            // Warm used style (match + inherit) without Install. Ladybird rematch
++            // owns this pass. style_all is serial in the host engine (no_parallel).
++            let rc = unsafe { stylecc_style_all(cc) };
++            if rc != 0 {
++                eprintln!("stylecc_host: style_all warm failed ({rc})");
++            }
++            return None;
++        }
++        let pending: Vec<u32> = state.pending_dirty.drain().collect();
++        let live_cap = state.live.len().saturating_mul(2).max(1024);
++        drop(hosts);
++        return owning_answers_dirty(engine, cc, pending, live_cap, mode);
++    }
++    if state.first_style {
++        state.first_style = false;
++        drop(hosts);
++        let rc = unsafe { stylecc_style_all(cc) };
++        if rc != 0 {
++            eprintln!("stylecc_host: style_all warm failed ({rc})");
++        }
++        return None;
++    }
++    if mode == "index" {
++        return None;
++    }
++    let pending: Vec<u32> = state.pending_dirty.drain().collect();
++    let live_cap = state.live.len().saturating_mul(2).max(1024);
++    drop(hosts);
++    owning_answers_dirty(engine, cc, pending, live_cap, mode)
++}
++
++fn owning_answers_dirty(
++    engine: *mut c_void,
++    cc: *mut StyleCC,
++    pending: Vec<u32>,
++    live_cap: usize,
++    mode: &str,
++) -> Option<Vec<FfiStyleDelta>> {
++    for n in pending {
++        unsafe {
++            stylecc_mark_dirty(cc, n);
++        }
++    }
++    let rc = unsafe { stylecc_style_dirty(cc) };
++    if rc != 0 {
++        eprintln!("stylecc_host: style_dirty failed ({rc})");
++        return None;
++    }
++    let n = unsafe { stylecc_used_count(cc) };
++    if n == 0 || n > live_cap {
++        return None;
++    }
++    let mut buf = vec![0u32; n];
++    let got = unsafe { stylecc_take_used(cc, buf.as_mut_ptr(), buf.len()) };
++    buf.truncate(got.min(buf.len()));
++    if mode == "dirty" {
++        return None;
++    }
++    let mut hosts = HOSTS.lock().unwrap();
++    let state = hosts.get_mut(&key(engine))?;
++    state.serve_matches = true;
++    publish_serve(engine, cc, true);
++    Some(materialize_deltas(state, buf))
++}
++
++fn materialize_deltas(state: &mut HostState, nodes: Vec<u32>) -> Vec<FfiStyleDelta> {
++    let mut deltas = Vec::with_capacity(nodes.len());
++    for node in nodes {
++        if node == 0 {
++            continue;
++        }
++        // Must match UpdateStyle.cpp make_materialize_gap_delta: Materialize + damage None.
++        // damage Full trips the gap contract and, with a wholesale answer replace, can leave
++        // update_style reaction passes without a PublishedStyle termination path.
++        deltas.push(FfiStyleDelta {
++            style_node: node,
++            match_answer: 0,
++            old_style_record: 0,
++            new_style_record: 0,
++            damage: FfiStyleDeltaDamage::None,
++            reaction: RECOMPUTE_STYLE,
++            inherited_style_groups: 0,
++            pseudo_kind: u8::MAX,
++            gap: FfiStyleDeltaGap::Materialize,
++        });
++    }
++    state.deltas = deltas.clone();
++    deltas
++}
++
++pub fn serves_published(engine: *mut c_void, host_id: u32) -> bool {
++    let Some(cc) = serve_cc(engine) else {
++        return false;
++    };
++    unsafe { stylecc_node_restyled(cc, host_id) != 0 }
++}
++
++pub fn pull_used_for(engine: *mut c_void, nodes: &[u32]) -> Option<Vec<(u32, StyleCCUsed)>> {
++    let cc = serve_cc(engine)?;
++    let mut out = Vec::with_capacity(nodes.len());
++    for &node in nodes {
++        if node == 0 {
++            continue;
++        }
++        let mut used = StyleCCUsed {
++            host_node: 0,
++            r: 0,
++            g: 0,
++            b: 0,
++            a: 0,
++            bgra: 0,
++            display: 0,
++            height_auto: 0,
++            min_width_auto: 0,
++            line_height_normal: 0,
++            height_px: 0.0,
++            min_width_px: 0.0,
++            font_size_px: 0.0,
++            line_height_px: 0.0,
++            digest: 0,
++        };
++        if unsafe { stylecc_consume_node_used(cc, node, &mut used) } != 0 {
++            continue;
++        }
++        used.host_node = node;
++        out.push((node, used));
++    }
++    Some(out)
++}
++
++pub fn split_used_stops(
++    engine: *mut c_void,
++    pulled: Vec<(u32, StyleCCUsed)>,
++    has_published: impl Fn(u32) -> bool,
++) -> (Vec<(u32, StyleCCUsed)>, usize, usize) {
++    let mut hosts = HOSTS.lock().unwrap();
++    let Some(state) = hosts.get_mut(&key(engine)) else {
++        return (pulled, 0, 0);
++    };
++    let mut changed = Vec::with_capacity(pulled.len());
++    let mut stopped = 0usize;
++    let mut recycled = 0usize;
++    for (node, used) in pulled {
++        let digest_matches = state.last_used_digest.get(&node) == Some(&used.digest);
++        if digest_matches && has_published(node) {
++            stopped += 1;
++            continue;
++        }
++        if digest_matches {
++            recycled += 1;
++        }
++        state.last_used_digest.insert(node, used.digest);
++        changed.push((node, used));
++    }
++    (changed, stopped, recycled)
++}
++
++pub fn stop_serving(engine: *mut c_void) {
++    publish_serve(engine, std::ptr::null_mut(), false);
++}
++
++pub struct CcOwnedPublish {
++    pub interned: bool,
++    pub deltas: Vec<FfiStyleDelta>,
++}
++
++impl CcOwnedPublish {
++    pub fn failed() -> Self {
++        Self {
++            interned: false,
++            deltas: Vec::new(),
++        }
++    }
++}
++
++pub fn consume_published(
++    engine: *mut c_void,
++    node: u32,
++    out: *mut FfiRuleMatch,
++    capacity: usize,
++) -> Option<usize> {
++    let cc = serve_cc(engine)?;
++    if unsafe { stylecc_node_restyled(cc, node) == 0 } {
++        return None;
++    }
++    const STACK: usize = 32;
++    let mut stack = [StyleCCMatch {
++        host_node: 0,
++        rule_id: 0,
++        pelem: 0,
++    }; STACK];
++    let fill_cap = capacity.min(STACK);
++    let n = unsafe { stylecc_consume_node_matches(cc, node, stack.as_mut_ptr(), fill_cap) };
++    if n > capacity {
++        return Some(n);
++    }
++    if n <= STACK {
++        write_ffi_matches(node, &stack, out, n);
++        return Some(n);
++    }
++    let mut tmp = vec![
++        StyleCCMatch {
++            host_node: 0,
++            rule_id: 0,
++            pelem: 0,
++        };
++        n
++    ];
++    let _ = unsafe { stylecc_consume_node_matches(cc, node, tmp.as_mut_ptr(), tmp.len()) };
++    write_ffi_matches(node, &tmp, out, n);
++    Some(n)
++}
++
++pub fn drop_count(engine: *mut c_void) -> u64 {
++    let hosts = HOSTS.lock().unwrap();
++    hosts
++        .get(&key(engine))
++        .map(|s| unsafe { stylecc_drop_count(s.cc) })
++        .unwrap_or(0)
++}
++
++pub fn ensure_node(engine: *mut c_void, host_id: u32) {
++    let mut hosts = HOSTS.lock().unwrap();
++    if let Some(state) = hosts.get_mut(&key(engine)) {
++        unsafe {
++            stylecc_ensure_node(state.cc, host_id);
++        }
++        state.live.insert(host_id);
++    }
++}
+diff --git a/Tests/LibWeb/TestStyleEngineBridge.cpp b/Tests/LibWeb/TestStyleEngineBridge.cpp
+index 28f8a7fb..6c64a044 100644
+--- a/Tests/LibWeb/TestStyleEngineBridge.cpp
++++ b/Tests/LibWeb/TestStyleEngineBridge.cpp
+@@ -120,4 +120,8 @@ TEST_CASE(direct_inherited_style_deltas_only_absorb_covered_reactions)
+ 
+     auto materialized_delta = make_style_delta(FfiStyleDeltaGap::Materialize, StyleEngine::InheritedStyle, 0b0010);
+     EXPECT(StyleEngine::published_style_delta_can_absorb_reaction(materialized_delta, StyleEngine::InheritedStyle | StyleEngine::InheritedCustomProperties, 0b0110));
++
++    auto install_delta = make_style_delta(FfiStyleDeltaGap::Install, StyleEngine::PublishedStyle, 0);
++    EXPECT(StyleEngine::published_style_delta_can_absorb_reaction(install_delta, StyleEngine::PublishedStyle, 0));
++    EXPECT(!StyleEngine::published_style_delta_can_absorb_reaction(install_delta, StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle, 0));
+ }

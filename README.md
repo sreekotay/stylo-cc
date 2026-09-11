@@ -278,7 +278,12 @@ git submodule update --init --depth 1
 
 ## Run
 
+From `real_projects/stylo-cc/` after submodules + `ccc` on PATH (or
+`make` resolving `../../cc/bin/ccc`). First time: `make longhands` if
+`engine/longhands.cch` is missing.
+
 ```bash
+make cc-run           # tiny fixture: build + run CC engine only
 make fixture          # tiny suite (compile / cmp loop)
 make compare          # tiny + tiny-sibling/structural/nth/ba/media + fixtures/local: both runners, cmp styles
 make compare-local    # only fixtures/local (no StyleBench regenerate)

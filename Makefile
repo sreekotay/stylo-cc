@@ -4,7 +4,7 @@ STYLO ?= stylo
 CARGO ?= cargo
 RECEIPTS ?= receipts
 FIXTURES ?= fixtures
-CCC ?= ccc
+CCC ?= $(shell test -x ../../cc/bin/ccc && echo ../../cc/bin/ccc || echo ../../out/cc/bin/ccc)
 
 .PHONY: longhands setup fixture fixture-default fixture-sibling-tiny fixture-structural-tiny fixture-nth-tiny fixture-ba-tiny fixture-media-tiny stylo-run cc-run compare compare-local compare-sibling compare-structural compare-nth compare-ba compare-media bench-style bench-sibling bench-structural bench-nth bench-ba bench-media libstylecc test-abi test build release bench help
 
